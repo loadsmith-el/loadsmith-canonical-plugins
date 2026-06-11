@@ -29,6 +29,12 @@
       "versions": {
         "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/parquet-v0.1.0/loadsmith-plugin.yaml"
       }
+    },
+    "postgres": {
+      "latest": "0.1.0",
+      "versions": {
+        "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.1.0/loadsmith-plugin.yaml"
+      }
     }
   }
 }
