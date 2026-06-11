@@ -1,0 +1,48 @@
+[package]
+name    = "loadsmith-postgres"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# A "connector" package: one crate, a shared lib (conn/types/copy), and two
+# separate binaries (source + destination) — the endorsed reuse level (see
+# rejected-ideas.md: NOT a merged read/write driver).
+[package.metadata.loadsmith]
+name     = "postgres"
+summary  = "PostgreSQL source and destination (TLS via rustls)"
+protocol = "^1"
+provides = [
+    { kind = "source",      bin = "loadsmith-source-postgres" },
+    { kind = "destination", bin = "loadsmith-destination-postgres" },
+]
+
+[lib]
+name = "loadsmith_postgres"
+
+[[bin]]
+name = "loadsmith-source-postgres"
+path = "src/bin/source.rs"
+
+[[bin]]
+name = "loadsmith-destination-postgres"
+path = "src/bin/destination.rs"
+
+[dependencies]
+tokio                          = { workspace = true }
+anyhow                         = { workspace = true }
+tracing                        = { workspace = true }
+serde                          = { workspace = true }
+serde_json                     = { workspace = true }
+async-trait                    = { workspace = true }
+arrow                          = { workspace = true }
+arrow-array                    = { workspace = true }
+arrow-schema                   = { workspace = true }
+tokio-postgres                 = { workspace = true }
+postgres-types                 = { workspace = true, features = ["with-chrono-0_4"] }
+chrono                         = { version = "0.4", features = ["serde"] }
+bytes                          = "1"
+futures-util                   = "0.3"
+tokio-postgres-rustls-improved = { version = "0.16", default-features = false }
+loadsmith-plugin-sdk           = { workspace = true }
+loadsmith-arrow                = { workspace = true }
+loadsmith-tls                  = { workspace = true }

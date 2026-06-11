@@ -1,0 +1,26 @@
+[package]
+name    = "loadsmith-sink-local-copy"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[package.metadata.loadsmith]
+name     = "local-copy"
+summary  = "Local-copy sink — delivers finalized objects to a local directory"
+protocol = "^1"
+provides = [
+    { kind = "sink", bin = "loadsmith-sink-local-copy" },
+]
+
+[[bin]]
+name = "loadsmith-sink-local-copy"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }

@@ -1,0 +1,29 @@
+[package]
+name    = "loadsmith-config-provider-file"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Install metadata read by the loadsmith-canonical-plugins CI to emit the
+# published `loadsmith-plugin.yaml`. `version` above is the single source of
+# truth; the CI fills in per-platform artifact URLs + sha256 at release time.
+[package.metadata.loadsmith]
+name     = "file"
+summary  = "File config provider — resolves config values from files"
+protocol = "^1"
+provides = [
+    { kind = "config-provider", bin = "loadsmith-config-provider-file" },
+]
+
+[[bin]]
+name = "loadsmith-config-provider-file"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }

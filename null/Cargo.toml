@@ -1,0 +1,27 @@
+[package]
+name    = "loadsmith-destination-null"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[package.metadata.loadsmith]
+name     = "null"
+summary  = "Null destination — discards every batch (throughput testing)"
+protocol = "^1"
+provides = [
+    { kind = "destination", bin = "loadsmith-destination-null" },
+]
+
+[[bin]]
+name = "loadsmith-destination-null"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+arrow-array          = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }

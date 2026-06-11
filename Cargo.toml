@@ -1,0 +1,43 @@
+# loadsmith-canonical-plugins — the official, supported plugin set for Loadsmith.
+#
+# A Cargo workspace with one member per plugin package (a "connector" when it
+# provides more than one role). Each member declares its install metadata in
+# `[package.metadata.loadsmith]`; CI builds it per-platform, publishes a GitHub
+# Release, and emits the published `loadsmith-plugin.yaml` (with artifact URLs +
+# checksums) into the index that `loadsmith install` reads.
+#
+# The SDK crates come from the loadsmith repo as **git deps pinned by rev**
+# (the protocol/SDK is still green — bump the rev here to re-pin every plugin).
+
+[workspace]
+resolver = "2"
+members = [
+    "file",
+    "jsonl",
+    "parquet",
+    "null",
+    "local-copy",
+    "postgres",
+]
+
+[workspace.package]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Pinned Loadsmith SDK (bump `rev` to move every plugin to a newer SDK).
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "e01863f55057507f50aa9c5e341744360b994e54" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "e01863f55057507f50aa9c5e341744360b994e54" }
+loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "e01863f55057507f50aa9c5e341744360b994e54" }
+
+# Common deps (versions mirror the loadsmith workspace).
+tokio          = { version = "1", features = ["full"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+anyhow         = "1"
+tracing        = "0.1"
+async-trait    = "0.1"
+arrow          = "54"
+arrow-array    = "54"
+arrow-schema   = "54"
+tokio-postgres = "0.7"
+postgres-types = { version = "0.2" }

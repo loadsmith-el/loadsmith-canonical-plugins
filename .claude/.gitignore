@@ -1,0 +1,4 @@
+# Local, machine-specific Claude Code state — never shared.
+# Everything else in .claude/ (skills, commands, shared settings) IS tracked.
+settings.local.json
+scheduled_tasks.lock
