@@ -1,5 +1,11 @@
 {
   "plugins": {
+    "jsonl": {
+      "latest": "0.1.0",
+      "versions": {
+        "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/jsonl-v0.1.0/loadsmith-plugin.yaml"
+      }
+    },
     "null": {
       "latest": "0.1.0",
       "versions": {
