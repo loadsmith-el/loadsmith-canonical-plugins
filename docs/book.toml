@@ -1,0 +1,16 @@
+[book]
+title = "Loadsmith Canonical Plugins"
+authors = ["Paulo Junior"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+no-section-label = false
+git-repository-url = "https://github.com/loadsmith-el/loadsmith-canonical-plugins"
+edit-url-template = "https://github.com/loadsmith-el/loadsmith-canonical-plugins/edit/main/docs/src/{path}"
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true

@@ -1,5 +1,7 @@
 # loadsmith-canonical-plugins
 
+> 📖 **Full documentation:** <https://loadsmith-el.github.io/loadsmith-canonical-plugins/>
+
 The **official, supported plugin set** for [Loadsmith](../loadsmith) — the
 plugins `loadsmith install <name>` resolves from the canonical index. ("Canonical"
 mirrors `loadsmith-lab-canonical-data`: it marks the blessed set apart from
