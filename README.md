@@ -2,7 +2,7 @@
 
 > 📖 **Full documentation:** <https://loadsmith-el.github.io/loadsmith-canonical-plugins/>
 
-The **official, supported plugin set** for [Loadsmith](../loadsmith) — the
+The **official, supported plugin set** for [Loadsmith](https://github.com/loadsmith-el/loadsmith) — the
 plugins `loadsmith install <name>` resolves from the canonical index. ("Canonical"
 mirrors `loadsmith-lab-canonical-data`: it marks the blessed set apart from
 third-party/local plugins the installer also accepts.)
@@ -31,7 +31,7 @@ destination). Each plugin is a self-describing directory:
 
 ## How a plugin is distributed
 
-The SDK comes from the [loadsmith](../loadsmith) repo as a **git dependency
+The SDK comes from the [loadsmith](https://github.com/loadsmith-el/loadsmith) repo as a **git dependency
 pinned by rev** (the protocol/SDK is still evolving — bump the rev in the root
 `[workspace.dependencies]` to move every plugin to a newer SDK).
 
