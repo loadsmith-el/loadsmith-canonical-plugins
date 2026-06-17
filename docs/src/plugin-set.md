@@ -14,6 +14,10 @@ destination).
 | `local-copy` | sink | Delivers staged files to a local destination directory. |
 | `file` | config-provider | Loads pipeline config from a file. |
 
+> **Configuring a plugin?** Every plugin's `config:` fields — connection
+> options, TLS, commit modes, incremental, output paths — are documented in the
+> [Configuration Reference](./config/overview.md).
+
 ## Roles, briefly
 
 Loadsmith plugins fall into four kinds, each a distinct stage in a pipeline:

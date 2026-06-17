@@ -9,3 +9,16 @@
 - [Distribution & Releases](./distribution.md)
 - [Installing Plugins](./installing.md)
 - [Building & Verifying Locally](./building.md)
+
+---
+
+# Configuration Reference
+
+- [Overview](./config/overview.md)
+- [Postgres](./config/postgres.md)
+- [MySQL](./config/mysql.md)
+- [JSONL](./config/jsonl.md)
+- [Parquet](./config/parquet.md)
+- [Null](./config/null.md)
+- [Local-copy sink](./config/local-copy.md)
+- [File config provider](./config/file.md)
