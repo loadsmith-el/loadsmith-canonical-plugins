@@ -7,6 +7,7 @@ destination).
 | Package | Provides | Notes |
 |---|---|---|
 | `postgres` | source + destination | Server-side cursor source; `atomic` / `staged_merge` destination. TLS via rustls. |
+| `mysql` | source + destination | Streaming source with incremental watermark; `atomic` / `staged_merge` (ON DUPLICATE KEY) destination. TLS via rustls. |
 | `jsonl` | destination | Newline-delimited JSON output. |
 | `parquet` | destination | Single-file or chunked Parquet output. |
 | `null` | destination | Discards rows — for read/pump throughput testing. |

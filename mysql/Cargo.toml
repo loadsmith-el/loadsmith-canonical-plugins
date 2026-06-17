@@ -1,0 +1,48 @@
+[package]
+name    = "loadsmith-mysql"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# A "connector" package: one crate, a shared lib (conn/types), and two separate
+# binaries (source + destination) — the endorsed reuse level (see
+# rejected-ideas.md: NOT a merged read/write driver). Mirrors `postgres`.
+[package.metadata.loadsmith]
+name     = "mysql"
+summary  = "MySQL source and destination (TLS via rustls)"
+protocol = "^1"
+provides = [
+    { kind = "source",      bin = "loadsmith-source-mysql" },
+    { kind = "destination", bin = "loadsmith-destination-mysql" },
+]
+
+[lib]
+name = "loadsmith_mysql"
+
+[[bin]]
+name = "loadsmith-source-mysql"
+path = "src/bin/source.rs"
+
+[[bin]]
+name = "loadsmith-destination-mysql"
+path = "src/bin/destination.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+arrow                = { workspace = true }
+arrow-array          = { workspace = true }
+arrow-schema         = { workspace = true }
+chrono               = { version = "0.4", features = ["serde"] }
+futures-util         = "0.3"
+# Pure-Rust MySQL driver. `minimal-rust` drops the C zlib backend; rustls TLS
+# uses the *process-default* CryptoProvider (no embedded ring/aws-lc) — the
+# loadsmith-tls `install_provider()` rustcrypto provider serves it.
+mysql_async          = { version = "0.37", default-features = false, features = ["minimal-rust", "default-rustls-no-provider"] }
+loadsmith-plugin-sdk = { workspace = true }
+loadsmith-arrow      = { workspace = true }
+loadsmith-tls        = { workspace = true }

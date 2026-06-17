@@ -18,7 +18,13 @@ members = [
     "null",
     "local-copy",
     "postgres",
+    "mysql",
 ]
+
+# Oracle is shipped OUT OF CANON (native ODPI-C) in loadsmith-oracle-plugins,
+# pending a multi-packet fix in the pure-Rust oracle-rs driver — so no oracle
+# member and no oracle-rs `[patch.crates-io]` here. See that repo's ROADMAP for
+# the condition to bring Oracle back to the canonical pure-Rust set.
 
 [workspace.package]
 license = "Apache-2.0"

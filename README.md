@@ -22,6 +22,7 @@ destination). Each plugin is a self-describing directory:
 | Package | Provides |
 |---|---|
 | `postgres` | source + destination (TLS via rustls) |
+| `mysql` | source + destination (TLS via rustls) |
 | `jsonl` | destination |
 | `parquet` | destination |
 | `null` | destination (throughput testing) |
