@@ -1,0 +1,60 @@
+[package]
+name    = "loadsmith-sharepoint"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# A source-only connector: it reads files (xlsx/csv) or SharePoint List items from
+# Microsoft Graph, applies in-plugin tabular transforms, and emits Arrow. There is
+# no destination — SharePoint is read-only here (mirrors the Python `sp-bulk`).
+[package.metadata.loadsmith]
+name     = "sharepoint"
+summary  = "SharePoint source via Microsoft Graph (files + lists; TLS via rustls)"
+protocol = "^1"
+provides = [
+    { kind = "source", bin = "loadsmith-source-sharepoint" },
+]
+
+[lib]
+name = "loadsmith_sharepoint"
+
+[[bin]]
+name = "loadsmith-source-sharepoint"
+path = "src/bin/source.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+# preserve_order: keep list-item field order as Graph returns it (source-faithful
+# column order) instead of serde_json's default alphabetical Map.
+serde_json           = { workspace = true, features = ["preserve_order"] }
+async-trait          = { workspace = true }
+arrow                = { workspace = true }
+arrow-array          = { workspace = true }
+arrow-schema         = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }
+loadsmith-arrow      = { workspace = true }
+loadsmith-tls        = { workspace = true }
+
+# Spreadsheet/CSV parsing — pure Rust (multi-arch posture: no native deps).
+calamine              = { version = "0.26", features = ["dates"] }
+csv                   = "1.3"
+encoding_rs           = "0.8"
+chrono                = { version = "0.4", features = ["serde"] }
+unicode-normalization = "0.1"
+
+# Microsoft Graph HTTP client. rustls with the *installed* crypto provider
+# (rustls-rustcrypto, set via loadsmith-tls::install_provider) + webpki roots — the
+# `-no-provider` feature avoids pulling ring/aws-lc-rs (banned: native-per-arch crypto).
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
+    "http2",
+    "json",
+    "rustls-tls-webpki-roots-no-provider",
+] }
+
+[dev-dependencies]
+httpmock        = "0.7"
+rust_xlsxwriter = "0.79"

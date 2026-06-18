@@ -17,6 +17,7 @@
 - [Overview](./config/overview.md)
 - [Postgres](./config/postgres.md)
 - [MySQL](./config/mysql.md)
+- [SharePoint](./config/sharepoint.md)
 - [JSONL](./config/jsonl.md)
 - [Parquet](./config/parquet.md)
 - [Null](./config/null.md)

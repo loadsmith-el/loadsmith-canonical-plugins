@@ -19,6 +19,7 @@ members = [
     "local-copy",
     "postgres",
     "mysql",
+    "sharepoint",
 ]
 
 # Oracle is shipped OUT OF CANON (native ODPI-C) in loadsmith-oracle-plugins,
