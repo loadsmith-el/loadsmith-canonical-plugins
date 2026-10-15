@@ -18,6 +18,12 @@
         "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/local-copy-v0.1.0/loadsmith-plugin.yaml"
       }
     },
+    "mysql": {
+      "latest": "0.1.0",
+      "versions": {
+        "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/mysql-v0.1.0/loadsmith-plugin.yaml"
+      }
+    },
     "null": {
       "latest": "0.1.0",
       "versions": {
