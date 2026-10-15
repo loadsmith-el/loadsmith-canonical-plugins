@@ -23,6 +23,7 @@ destination). Each plugin is a self-describing directory:
 |---|---|
 | `postgres` | source + destination (TLS via rustls) |
 | `mysql` | source + destination (TLS via rustls) |
+| `oracle` | source + destination (pure-Rust `oracledb` thin driver, no client libs; TLS via rustls) |
 | `sharepoint` | source (Microsoft Graph: files + lists; TLS via rustls) |
 | `jsonl` | destination |
 | `parquet` | destination |

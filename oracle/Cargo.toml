@@ -1,0 +1,49 @@
+[package]
+name    = "loadsmith-oracle"
+version = "0.2.0"
+edition = "2021"
+license.workspace = true
+
+# A "connector" package: one crate, a shared lib (conn/types), and two separate
+# binaries (source + destination) — mirrors the canonical `postgres`/`mysql`
+# layout. Driver: Oracle's pure-Rust thin driver `oracledb` (no client libs).
+[package.metadata.loadsmith]
+name     = "oracle"
+summary  = "Oracle source and destination (pure-Rust oracledb thin driver; TLS via rustls)"
+protocol = "^1"
+provides = [
+    { kind = "source",      bin = "loadsmith-source-oracle" },
+    { kind = "destination", bin = "loadsmith-destination-oracle" },
+]
+
+[lib]
+name = "loadsmith_oracle"
+
+[[bin]]
+name = "loadsmith-source-oracle"
+path = "src/bin/source.rs"
+
+[[bin]]
+name = "loadsmith-destination-oracle"
+path = "src/bin/destination.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+arrow                = { workspace = true }
+arrow-array          = { workspace = true }
+arrow-schema         = { workspace = true }
+chrono               = { version = "0.4", features = ["serde"] }
+# Oracle's official pure-Rust thin driver (no client libraries). Pinned exactly:
+# it's a beta. NOTE: it depends on rustls with default features, which compiles
+# aws-lc-sys (C, build-time only). It's never USED: loadsmith-tls installs
+# rustls-rustcrypto as the process provider, like postgres/mysql. It stops being
+# built once upstream makes the rustls provider optional (oracle/rust-oracledb#34).
+oracledb             = "=26.0.0-beta.4"
+loadsmith-tls        = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }
+loadsmith-arrow      = { workspace = true }

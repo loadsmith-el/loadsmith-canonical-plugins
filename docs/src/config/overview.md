@@ -28,6 +28,8 @@ These pages cover only what goes *inside* each plugin's `config:`.
 |---|---|---|
 | `postgres` | source + destination | [Postgres](./postgres.md) |
 | `mysql` | source + destination | [MySQL](./mysql.md) |
+| `oracle` | source + destination | [Oracle](./oracle.md) |
+| `sharepoint` | source | [SharePoint](./sharepoint.md) |
 | `jsonl` | destination | [JSONL](./jsonl.md) |
 | `parquet` | destination | [Parquet](./parquet.md) |
 | `null` | destination | [Null](./null.md) |
@@ -46,7 +48,8 @@ per-plugin pages link back to them.
 The database connectors (`postgres`, `mysql`) take an optional `tls:` block with
 an identical shape — it comes from the engine's `loadsmith-tls` crate (pure-Rust
 `rustls` + `rustls-rustcrypto`, no OpenSSL/`native-tls`). Omitting it means no
-TLS (`mode: disable`).
+TLS (`mode: disable`). (`oracle` takes its own TCPS block instead; see
+[Oracle](./oracle.md#tls-tcps).)
 
 | Field | Type | Description |
 |---|---|---|

@@ -40,9 +40,27 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build (native ${{ matrix.arch }})
-        run: cargo build --release --manifest-path "${{ needs.meta.outputs.name }}/Cargo.toml"
+      - name: Build + test in rust:1-bookworm (native ${{ matrix.arch }})
+        # Native per-arch build, but inside rust:1-bookworm so the binaries link
+        # against glibc <= 2.36 (the loadsmith:slim base is bookworm). The bare
+        # runner is ubuntu-24.04 (glibc 2.39); any C in the dependency tree (e.g.
+        # oracledb's aws-lc-sys) can then pull GLIBC_2.38 symbols and the plugin
+        # won't start on slim. That is what broke the out-of-canon oracle-v0.1.0.
+        run: |
+          name="${{ needs.meta.outputs.name }}"
+          docker run --rm -u "$(id -u):$(id -g)" -e CARGO_HOME=/tmp/cargo \
+            -v "$PWD":/src -w /src rust:1-bookworm sh -c "
+              cargo build --release --manifest-path $name/Cargo.toml &&
+              cargo test  --release --manifest-path $name/Cargo.toml"
+      - name: Check glibc floor (must run on bookworm / glibc 2.36)
+        run: |
+          mapfile -t bins < <(python3 ci/release.py bins "${{ needs.meta.outputs.name }}")
+          for b in "${bins[@]}"; do
+            max=$(objdump -T "target/release/$b" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+            echo "$b needs $max"
+            [ "$(printf '%s\nGLIBC_2.36\n' "$max" | sort -V | tail -1)" = "GLIBC_2.36" ] \
+              || { echo "::error::$b requires $max (> GLIBC_2.36)"; exit 1; }
+          done
       - name: Package
         id: pkg
         run: |
