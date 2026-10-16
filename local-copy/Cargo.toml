@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-sink-local-copy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license.workspace = true
 
@@ -24,3 +24,4 @@ serde                = { workspace = true }
 serde_json           = { workspace = true }
 async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { workspace = true }
+mimalloc             = { workspace = true }

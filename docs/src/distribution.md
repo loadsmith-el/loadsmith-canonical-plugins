@@ -24,11 +24,25 @@ To release a plugin:
 
 The `release-plugin.yml` workflow then:
 
-- builds the plugin natively for `linux/amd64` + `linux/arm64`;
+- builds the plugin natively for `linux/amd64` + `linux/arm64` as **static musl
+  binaries** (see below) and fails if any binary is dynamically linked;
 - publishes a per-plugin **GitHub Release** with the archives + sha256;
 - generates the published `loadsmith-plugin.yaml` (artifact URLs + checksums
   filled in) — the generator is `ci/release.py` (stdlib-only);
 - updates the canonical `index.json` that `loadsmith plugin install` reads.
+
+### Static musl binaries
+
+Release builds run in `rust:1-alpine`, whose host target is
+`*-unknown-linux-musl`, so every plugin binary is fully static: no libc, no
+dynamic loader. One archive per architecture runs on any Linux, whether that is
+the glibc `loadsmith:slim` image, a distroless/static image or a bare host, and
+there is no glibc version floor to track.
+
+Every binary sets [mimalloc](https://github.com/microsoft/mimalloc) as its
+global allocator (`#[global_allocator]` at the top of each `main`), because
+musl's own allocator is slow under the many small allocations of Arrow batch
+building. A new plugin binary should do the same.
 
 ### Two operational gotchas
 

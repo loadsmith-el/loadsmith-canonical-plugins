@@ -2,9 +2,9 @@ name: Release plugin
 
 # Per-plugin, independently versioned releases. Tag a plugin as
 # `<name>-v<version>` (e.g. `postgres-v1.0.0`, matching its Cargo.toml version)
-# and this builds it natively for amd64 + arm64, publishes a GitHub Release with
-# the archives + checksums + the published loadsmith-plugin.yaml, and updates the
-# index.json that `loadsmith install` reads.
+# and this builds it natively for amd64 + arm64 as static musl binaries,
+# publishes a GitHub Release with the archives + checksums + the published
+# loadsmith-plugin.yaml, and updates the index.json that `loadsmith install` reads.
 
 on:
   push:
@@ -40,26 +40,29 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build + test in rust:1-bookworm (native ${{ matrix.arch }})
-        # Native per-arch build, but inside rust:1-bookworm so the binaries link
-        # against glibc <= 2.36 (the loadsmith:slim base is bookworm). The bare
-        # runner is ubuntu-24.04 (glibc 2.39); any C in the dependency tree (e.g.
-        # oracledb's aws-lc-sys) can then pull GLIBC_2.38 symbols and the plugin
-        # won't start on slim. That is what broke the out-of-canon oracle-v0.1.0.
+      - name: Build + test in rust:1-alpine (native ${{ matrix.arch }}, static musl)
+        # Native per-arch build inside rust:1-alpine, whose host target is
+        # *-unknown-linux-musl: every binary is fully static (no libc, no loader),
+        # so one artifact runs on any Linux — the glibc loadsmith:slim image, the
+        # distroless/static ones, a bare host. That retires the old glibc-floor
+        # problem (a build on the ubuntu-24.04 runner pulled GLIBC_2.38 symbols
+        # via oracledb's aws-lc-sys and wouldn't start on bookworm). Each binary
+        # sets mimalloc as its global allocator; musl's own is slow for Arrow.
         run: |
           name="${{ needs.meta.outputs.name }}"
           docker run --rm -u "$(id -u):$(id -g)" -e CARGO_HOME=/tmp/cargo \
-            -v "$PWD":/src -w /src rust:1-bookworm sh -c "
+            -v "$PWD":/src -w /src rust:1-alpine sh -c "
               cargo build --release --manifest-path $name/Cargo.toml &&
               cargo test  --release --manifest-path $name/Cargo.toml"
-      - name: Check glibc floor (must run on bookworm / glibc 2.36)
+      - name: Check the binaries are fully static
         run: |
           mapfile -t bins < <(python3 ci/release.py bins "${{ needs.meta.outputs.name }}")
           for b in "${bins[@]}"; do
-            max=$(objdump -T "target/release/$b" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
-            echo "$b needs $max"
-            [ "$(printf '%s\nGLIBC_2.36\n' "$max" | sort -V | tail -1)" = "GLIBC_2.36" ] \
-              || { echo "::error::$b requires $max (> GLIBC_2.36)"; exit 1; }
+            file "target/release/$b"
+            # A static binary has no dynamic section, hence no NEEDED entries.
+            if readelf -d "target/release/$b" | grep -q NEEDED; then
+              echo "::error::$b is dynamically linked"; exit 1
+            fi
           done
       - name: Package
         id: pkg

@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-sharepoint"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license.workspace = true
 
@@ -39,7 +39,7 @@ loadsmith-arrow      = { workspace = true }
 loadsmith-tls        = { workspace = true }
 
 # Spreadsheet/CSV parsing — pure Rust (multi-arch posture: no native deps).
-calamine              = { version = "0.26", features = ["dates"] }
+calamine              = { version = "0.36", features = ["dates"] }
 csv                   = "1.3"
 encoding_rs           = "0.8"
 chrono                = { version = "0.4", features = ["serde"] }
@@ -54,7 +54,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls-webpki-roots-no-provider",
 ] }
+mimalloc             = { workspace = true }
 
 [dev-dependencies]
 httpmock        = "0.7"
-rust_xlsxwriter = "0.79"
+rust_xlsxwriter = "0.99"

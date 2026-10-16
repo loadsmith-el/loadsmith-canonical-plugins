@@ -39,7 +39,8 @@ pinned by rev** (the protocol/SDK is still evolving — bump the rev in the root
 
 Each plugin declares its install metadata in `[package.metadata.loadsmith]`
 (the `[package] version` is the single source of truth for the version). CI
-builds each plugin for `linux/amd64` + `linux/arm64`, publishes a per-plugin
+builds each plugin for `linux/amd64` + `linux/arm64` (static musl binaries
+that run on any Linux), publishes a per-plugin
 **GitHub Release** with the archives + sha256, and generates the published
 `loadsmith-plugin.yaml` (artifact URLs + checksums filled in) + the index that
 `loadsmith install` reads.

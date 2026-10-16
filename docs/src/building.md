@@ -18,8 +18,9 @@ correctly. The **real** validation lives in
 [`loadsmith-lab`](https://loadsmith-el.github.io/loadsmith-lab/) (a sibling
 repo), which runs a plugin against a real seeded service and checks the output.
 
-Point the lab at a local plugin build — it compiles the crate in a
-`rust:bookworm` container:
+Point the lab at a local plugin build. It compiles the crate in a
+`rust:1-alpine` container, so it gets the same static musl binary a release
+ships:
 
 ```bash
 cd ../loadsmith-lab

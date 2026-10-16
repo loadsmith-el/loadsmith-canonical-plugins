@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-postgres"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license.workspace = true
 
@@ -46,3 +46,4 @@ tokio-postgres-rustls-improved = { version = "0.17", default-features = false }
 loadsmith-plugin-sdk           = { workspace = true }
 loadsmith-arrow                = { workspace = true }
 loadsmith-tls                  = { workspace = true }
+mimalloc                       = { workspace = true }

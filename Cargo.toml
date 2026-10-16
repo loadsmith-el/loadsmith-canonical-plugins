@@ -44,3 +44,5 @@ arrow-array    = "54"
 arrow-schema   = "54"
 tokio-postgres = "0.7"
 postgres-types = { version = "0.2" }
+# Global allocator for every plugin binary (see the #[global_allocator] in each bin).
+mimalloc       = { version = "0.1", default-features = false }

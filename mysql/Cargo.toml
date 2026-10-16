@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-mysql"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license.workspace = true
 
@@ -46,3 +46,4 @@ mysql_async          = { version = "0.37", default-features = false, features = 
 loadsmith-plugin-sdk = { workspace = true }
 loadsmith-arrow      = { workspace = true }
 loadsmith-tls        = { workspace = true }
+mimalloc             = { workspace = true }
