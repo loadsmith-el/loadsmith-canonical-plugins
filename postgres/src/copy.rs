@@ -71,13 +71,18 @@ fn cell_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
                 .unwrap()
                 .checked_add_signed(chrono::Duration::days(days as i64))
                 .ok_or_else(|| anyhow::anyhow!("date32 out of range: {days}"))?;
-            date.format("%Y-%m-%d").to_string()
+            pg_date(date, "")
         }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
             let ms = downcast::<TimestampMillisecondArray>(array).value(row);
             let dt = chrono::DateTime::from_timestamp_millis(ms)
-                .ok_or_else(|| anyhow::anyhow!("timestamp out of range: {ms}"))?;
-            dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.f").to_string()
+                .ok_or_else(|| anyhow::anyhow!("timestamp out of range: {ms}"))?
+                .naive_utc();
+            // A zone-aware value is a UTC instant: send it with an explicit
+            // offset so a timestamptz column stores the right instant whatever
+            // the session TimeZone (a plain timestamp column ignores it).
+            let offset = if tz.is_some() { "+00" } else { "" };
+            pg_date(dt.date(), &format!(" {}{offset}", dt.format("%H:%M:%S%.f")))
         }
         DataType::Binary => {
             let bytes = downcast::<BinaryArray>(array).value(row);
@@ -93,6 +98,16 @@ fn cell_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
         other => bail!("postgres destination does not support Arrow type {other:?} yet"),
     };
     Ok(Some(text))
+}
+
+/// Formats a date the way Postgres reads it — years before 1 AD as `YYYY-MM-DD
+/// BC` (astronomical year 0 = 1 BC) — with `time` (already formatted, may be
+/// empty) inserted before the era suffix.
+fn pg_date(date: chrono::NaiveDate, time: &str) -> String {
+    use chrono::Datelike;
+    let y = date.year();
+    let (year, era) = if y <= 0 { (1 - y, " BC") } else { (y, "") };
+    format!("{year:04}-{:02}-{:02}{time}{era}", date.month(), date.day())
 }
 
 fn downcast<T: 'static>(array: &dyn Array) -> &T {
@@ -126,5 +141,23 @@ mod tests {
         let col = Arc::new(BooleanArray::from(vec![true, false]));
         let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
         assert_eq!(batch_to_copy_text(&batch).unwrap(), "t\nf\n");
+    }
+
+    #[test]
+    fn renders_temporal_with_bc_and_utc_offset() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("tstz", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), true),
+        ]));
+        // 0044-03-15 BC / 0044-03-15 12:00:00 BC / 2024-01-15 12:30:45.123 UTC
+        let d = Arc::new(Date32Array::from(vec![-735_160]));
+        let ts = Arc::new(TimestampMillisecondArray::from(vec![-63_517_780_800_000]));
+        let tstz = Arc::new(TimestampMillisecondArray::from(vec![1_705_321_845_123]).with_timezone("UTC"));
+        let batch = RecordBatch::try_new(schema, vec![d, ts, tstz]).unwrap();
+        assert_eq!(
+            batch_to_copy_text(&batch).unwrap(),
+            "0044-03-15 BC\t0044-03-15 12:00:00 BC\t2024-01-15 12:30:45.123+00\n"
+        );
     }
 }

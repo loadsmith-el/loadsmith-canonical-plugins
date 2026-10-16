@@ -28,9 +28,9 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Pinned Loadsmith SDK (bump `rev` to move every plugin to a newer SDK).
-loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "e01863f55057507f50aa9c5e341744360b994e54" }
-loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "e01863f55057507f50aa9c5e341744360b994e54" }
-loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "e01863f55057507f50aa9c5e341744360b994e54" }
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "9258040b7ba2fdf5c7670b91a9a4fc78b8977444" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "9258040b7ba2fdf5c7670b91a9a4fc78b8977444" }
+loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "9258040b7ba2fdf5c7670b91a9a4fc78b8977444" }
 
 # Common deps (versions mirror the loadsmith workspace).
 tokio          = { version = "1", features = ["full"] }

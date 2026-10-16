@@ -69,12 +69,22 @@ State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.h
 | `REAL`, `FLOAT4` | `Float32` | |
 | `DOUBLE PRECISION`, `FLOAT8` | `Float64` | |
 | `BOOLEAN` | `Boolean` | |
-| `DATE` | `Date32` | |
-| `TIMESTAMP`, `TIMESTAMPTZ` | `Timestamp(Millisecond, None)` | |
+| `DATE` | `Date32` | BC dates supported; `infinity`/`-infinity` are rejected with a clear error (map them in the query, e.g. `NULLIF(col, 'infinity')`). |
+| `TIMESTAMP` | `Timestamp(Millisecond, None)` | Sub-millisecond digits are truncated. BC and `infinity` as for `DATE`. |
+| `TIMESTAMPTZ` | `Timestamp(Millisecond, "UTC")` | The session zone's offset (incl. local-mean-time `+HH:MM:SS`) is parsed and the value normalized to UTC, so the session `TimeZone` doesn't change the instant. |
 | `BYTEA` | `Binary` | |
 | `anytype[]` (arrays) | `List(inner)` | Inner type follows the same mapping; `NULL` elements preserved. |
 | `hstore` | `Utf8` (JSON) | `"k"=>"v"` → `{"k":"v"}`; null values become JSON `null`. |
 | Everything else (`NUMERIC`, `TEXT`, `UUID`, `TIME`, …) | `Utf8` | Text as returned by the Postgres text protocol. |
+
+Rows are read over the text protocol, so the source pins the two output
+settings its decoder depends on — `DateStyle = 'ISO'` (output style only; your
+DMY/MDY input order is kept) and `bytea_output = 'hex'` — after any `session`
+GUCs you set. `TimeZone` is left as you configure it.
+
+On the destination side, `Timestamp` values with a zone are written with an
+explicit `+00` offset (correct for a `timestamptz` column whatever the session
+`TimeZone`), and BC dates in Postgres's `YYYY-MM-DD BC` form.
 
 ### Source examples
 

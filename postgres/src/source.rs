@@ -182,6 +182,15 @@ impl SourcePlugin for PostgresSourcePlugin {
 
         // ── Connect (shared TLS/connection layer) ──────────────────────────
         let client = crate::conn::connect(&cfg.conn).await?;
+        // Rows come back over the text protocol; pin the output formats the
+        // decoder parses (after any user `session` GUCs, so they can't break it).
+        // DateStyle 'ISO' only sets the output style, keeping the user's
+        // DMY/MDY input order. TimeZone is deliberately left alone: timestamptz
+        // offsets are parsed, and changing it would alter the query's semantics.
+        client
+            .batch_execute("SET DateStyle = 'ISO'; SET bytea_output = 'hex'")
+            .await
+            .context("pinning DateStyle/bytea_output")?;
 
         // ── Schema inference via prepare() ────────────────────────────────
         // The incremental wrapper (`SELECT * FROM (<query>) …`) preserves the

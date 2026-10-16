@@ -8,7 +8,7 @@ use arrow_array::{
     ArrayRef, ListArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use postgres_types::Kind;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,7 +46,10 @@ pub fn pg_type_to_arrow(pg_type: &PgType) -> DataType {
         "float8" => DataType::Float64,
         "bool" => DataType::Boolean,
         "date" => DataType::Date32,
-        "timestamp" | "timestamptz" => DataType::Timestamp(TimeUnit::Millisecond, None),
+        "timestamp" => DataType::Timestamp(TimeUnit::Millisecond, None),
+        // An absolute instant: decoded to UTC, and tagged so downstream (e.g.
+        // Parquet) keeps it zone-aware.
+        "timestamptz" => DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
         "bytea" => DataType::Binary,
         _ => DataType::Utf8,
     }
@@ -93,264 +96,120 @@ fn build_column_text(
     col_idx: usize,
     field: &Field,
 ) -> Result<ArrayRef> {
-    let col_name = field.name();
+    let values: Vec<Option<&str>> = rows.iter().map(|r| r.get(col_idx)).collect();
     match field.data_type() {
-        DataType::Int32 => {
-            let mut b = Int32Builder::with_capacity(rows.len());
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<i32>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}: int32 parse '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Int64 => {
-            let mut b = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<i64>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}: int64 parse '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Float32 => {
-            let mut b = Float32Builder::with_capacity(rows.len());
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<f32>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}: float32 parse '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Float64 => {
-            let mut b = Float64Builder::with_capacity(rows.len());
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<f64>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}: float64 parse '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Boolean => {
-            let mut b = BooleanBuilder::with_capacity(rows.len());
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some("t") | Some("true") => b.append_value(true),
-                    Some("f") | Some("false") => b.append_value(false),
-                    Some(v) => bail!("col {col_name}: unexpected bool value '{v}'"),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Date32 => {
-            let mut b = Date32Builder::with_capacity(rows.len());
-            let epoch = unix_epoch();
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => {
-                        let d = NaiveDate::parse_from_str(v, "%Y-%m-%d")
-                            .map_err(|e| anyhow::anyhow!("col {col_name}: date parse '{v}': {e}"))?;
-                        b.append_value(d.signed_duration_since(epoch).num_days() as i32);
-                    }
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let mut b = TimestampMillisecondBuilder::with_capacity(rows.len());
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => {
-                        let ms = parse_timestamp_millis(v)
-                            .map_err(|e| anyhow::anyhow!("col {col_name}: ts parse '{v}': {e}"))?;
-                        b.append_value(ms);
-                    }
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Binary => {
-            let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(parse_bytea_hex(v)?),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::Utf8 => {
-            let is_hstore = field
-                .metadata()
-                .get(HSTORE_TYPE_KEY)
-                .map(String::as_str)
-                == Some(HSTORE_TYPE_VALUE);
-
-            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
-            for row in rows {
-                match row.get(col_idx) {
-                    None => b.append_null(),
-                    Some(v) => {
-                        if is_hstore {
-                            b.append_value(parse_hstore_to_json(v)
-                                .map_err(|e| anyhow::anyhow!("col {col_name}: hstore parse: {e}"))?)
-                        } else {
-                            b.append_value(v)
-                        }
-                    }
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-
-        DataType::List(inner_field) => {
-            build_list_column_text(rows, col_idx, inner_field.clone(), col_name)
-        }
-
-        other => bail!("unsupported arrow type: {other:?}"),
+        DataType::List(inner_field) => build_list(&values, inner_field.clone(), field.name()),
+        _ => build_values(&values, field, field.name()),
     }
 }
 
 /// Builds a `ListArray` column from Postgres text-protocol array notation (`{1,2,3}`).
-fn build_list_column_text(
-    rows: &[tokio_postgres::SimpleQueryRow],
-    col_idx: usize,
-    inner_field: Arc<Field>,
-    col_name: &str,
-) -> Result<ArrayRef> {
-    let mut lengths: Vec<usize> = Vec::with_capacity(rows.len());
-    let mut is_valid: Vec<bool> = Vec::with_capacity(rows.len());
-    let mut all_items: Vec<Option<String>> = Vec::new();
+/// The elements go through [`build_values`] with the list's item field, so arrays
+/// decode exactly like scalar columns of the same type.
+fn build_list(values: &[Option<&str>], inner_field: Arc<Field>, col_name: &str) -> Result<ArrayRef> {
+    let mut lengths: Vec<usize> = Vec::with_capacity(values.len());
+    let mut is_valid: Vec<bool> = Vec::with_capacity(values.len());
+    let mut items: Vec<Option<String>> = Vec::new();
 
-    for row in rows {
-        match row.get(col_idx) {
+    for v in values {
+        match v {
             None => {
                 lengths.push(0);
                 is_valid.push(false);
             }
             Some(text) => {
-                let items = parse_pg_array_text(text);
-                lengths.push(items.len());
+                let parsed = parse_pg_array_text(text);
+                lengths.push(parsed.len());
                 is_valid.push(true);
-                all_items.extend(items);
+                items.extend(parsed);
             }
         }
     }
 
-    let child = build_flat_scalars(&all_items, inner_field.data_type(), col_name)?;
+    let item_refs: Vec<Option<&str>> = items.iter().map(Option::as_deref).collect();
+    let child = build_values(&item_refs, &inner_field, &format!("{col_name}[]"))?;
     let offsets = OffsetBuffer::from_lengths(lengths);
     let nulls = Some(NullBuffer::from(is_valid.as_slice()));
-    Ok(Arc::new(ListArray::new(inner_field, offsets, child, nulls)))
+    ListArray::try_new(inner_field, offsets, child, nulls)
+        .map_err(|e| anyhow::anyhow!("col {col_name}: list build: {e}"))
+        .map(|a| Arc::new(a) as ArrayRef)
 }
 
-/// Builds a flat Arrow array from `Vec<Option<String>>` text values using the given type.
-fn build_flat_scalars(
-    values: &[Option<String>],
-    dtype: &DataType,
-    col_name: &str,
-) -> Result<ArrayRef> {
-    match dtype {
-        DataType::Int32 => {
-            let mut b = Int32Builder::with_capacity(values.len());
+/// Builds a flat Arrow array of `field`'s (scalar) type from Postgres text values.
+fn build_values(values: &[Option<&str>], field: &Field, col_name: &str) -> Result<ArrayRef> {
+    macro_rules! parsed {
+        ($builder:ty, $parse:expr) => {{
+            let mut b = <$builder>::with_capacity(values.len());
             for v in values {
                 match v {
                     None => b.append_null(),
-                    Some(s) => b.append_value(
-                        s.parse::<i32>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}[]: int32 '{s}': {e}"))?,
+                    Some(v) => b.append_value(
+                        $parse(*v).map_err(|e| anyhow::anyhow!("col {col_name}: '{v}': {e}"))?,
                     ),
                 }
             }
-            Ok(Arc::new(b.finish()))
-        }
-        DataType::Int64 => {
-            let mut b = Int64Builder::with_capacity(values.len());
+            Arc::new(b.finish()) as ArrayRef
+        }};
+    }
+
+    Ok(match field.data_type() {
+        DataType::Int32 => parsed!(Int32Builder, |v: &str| v.parse::<i32>()),
+        DataType::Int64 => parsed!(Int64Builder, |v: &str| v.parse::<i64>()),
+        DataType::Float32 => parsed!(Float32Builder, |v: &str| v.parse::<f32>()),
+        DataType::Float64 => parsed!(Float64Builder, |v: &str| v.parse::<f64>()),
+        DataType::Boolean => parsed!(BooleanBuilder, parse_bool),
+        DataType::Date32 => parsed!(Date32Builder, parse_date_days),
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+            let with_offset = tz.is_some();
+            let mut b = TimestampMillisecondBuilder::with_capacity(values.len());
             for v in values {
                 match v {
                     None => b.append_null(),
-                    Some(s) => b.append_value(
-                        s.parse::<i64>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}[]: int64 '{s}': {e}"))?,
+                    Some(v) => b.append_value(
+                        parse_timestamp_millis(v, with_offset)
+                            .map_err(|e| anyhow::anyhow!("col {col_name}: '{v}': {e}"))?,
                     ),
                 }
             }
-            Ok(Arc::new(b.finish()))
+            Arc::new(b.finish().with_timezone_opt(tz.clone())) as ArrayRef
         }
-        DataType::Float32 => {
-            let mut b = Float32Builder::with_capacity(values.len());
+        DataType::Binary => {
+            let mut b = BinaryBuilder::with_capacity(values.len(), values.len() * 16);
             for v in values {
                 match v {
                     None => b.append_null(),
-                    Some(s) => b.append_value(
-                        s.parse::<f32>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}[]: float32 '{s}': {e}"))?,
+                    Some(v) => b.append_value(
+                        parse_bytea_hex(v).map_err(|e| anyhow::anyhow!("col {col_name}: bytea: {e}"))?,
                     ),
                 }
             }
-            Ok(Arc::new(b.finish()))
+            Arc::new(b.finish()) as ArrayRef
         }
-        DataType::Float64 => {
-            let mut b = Float64Builder::with_capacity(values.len());
+        DataType::Utf8 => {
+            let is_hstore = field.metadata().get(HSTORE_TYPE_KEY).map(String::as_str)
+                == Some(HSTORE_TYPE_VALUE);
+            let mut b = StringBuilder::with_capacity(values.len(), values.len() * 32);
             for v in values {
                 match v {
                     None => b.append_null(),
-                    Some(s) => b.append_value(
-                        s.parse::<f64>()
-                            .map_err(|e| anyhow::anyhow!("col {col_name}[]: float64 '{s}': {e}"))?,
+                    Some(v) if is_hstore => b.append_value(
+                        parse_hstore_to_json(v)
+                            .map_err(|e| anyhow::anyhow!("col {col_name}: hstore parse: {e}"))?,
                     ),
+                    Some(v) => b.append_value(v),
                 }
             }
-            Ok(Arc::new(b.finish()))
+            Arc::new(b.finish()) as ArrayRef
         }
-        DataType::Boolean => {
-            let mut b = BooleanBuilder::with_capacity(values.len());
-            for v in values {
-                match v.as_deref() {
-                    None => b.append_null(),
-                    Some("t") | Some("true") => b.append_value(true),
-                    Some("f") | Some("false") => b.append_value(false),
-                    Some(s) => bail!("col {col_name}[]: unexpected bool '{s}'"),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-        _ => {
-            let mut b = StringBuilder::with_capacity(values.len(), values.len() * 16);
-            for v in values {
-                match v {
-                    None => b.append_null(),
-                    Some(s) => b.append_value(s),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
+        other => bail!("col {col_name}: unsupported arrow type {other:?}"),
+    })
+}
+
+fn parse_bool(v: &str) -> Result<bool> {
+    match v {
+        "t" | "true" => Ok(true),
+        "f" | "false" => Ok(false),
+        _ => bail!("unexpected bool value"),
     }
 }
 
@@ -511,11 +370,89 @@ fn read_quoted_hstore(
     Ok(s)
 }
 
-/// Parses postgres timestamp text ("YYYY-MM-DD HH:MM:SS[.ffffff]") → milliseconds since epoch.
-fn parse_timestamp_millis(s: &str) -> Result<i64> {
-    let dt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(dt.and_utc().timestamp_millis())
+/// Rejects `infinity`/`-infinity`, which have no Arrow timestamp/date value.
+fn reject_infinity(s: &str) -> Result<()> {
+    if s.eq_ignore_ascii_case("infinity") || s.eq_ignore_ascii_case("-infinity") {
+        bail!(
+            "'{s}' has no Arrow date/timestamp equivalent; map it in the query \
+             (e.g. NULLIF(col, '{s}') or a sentinel)"
+        );
+    }
+    Ok(())
+}
+
+/// Parses an ISO date (`YYYY-MM-DD`, optionally suffixed ` BC`) into a
+/// proleptic-Gregorian `NaiveDate`. Built from its parts so BC leap days (year
+/// 1 BC = astronomical year 0 is a leap year) are valid.
+fn parse_iso_date(s: &str) -> Result<(NaiveDate, &str)> {
+    let (s, bc) = match s.strip_suffix(" BC") {
+        Some(rest) => (rest, true),
+        None => (s, false),
+    };
+    let (date, rest) = s.split_at(s.find(' ').unwrap_or(s.len()));
+    let mut parts = date.splitn(3, '-');
+    let mut next = |what: &str| -> Result<i32> {
+        parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing {what}"))?
+            .parse::<i32>()
+            .map_err(|e| anyhow::anyhow!("bad {what}: {e}"))
+    };
+    let (y, m, d) = (next("year")?, next("month")?, next("day")?);
+    let year = if bc { 1 - y } else { y };
+    let date = NaiveDate::from_ymd_opt(year, m as u32, d as u32)
+        .ok_or_else(|| anyhow::anyhow!("invalid date"))?;
+    Ok((date, rest.trim_start()))
+}
+
+/// Parses postgres `date` text (DateStyle ISO) → days since the Unix epoch.
+fn parse_date_days(s: &str) -> Result<i32> {
+    reject_infinity(s)?;
+    let (date, rest) = parse_iso_date(s)?;
+    if !rest.is_empty() {
+        bail!("unexpected trailing text '{rest}'");
+    }
+    Ok(date.signed_duration_since(unix_epoch()).num_days() as i32)
+}
+
+/// Parses postgres `timestamp` / `timestamptz` text (DateStyle ISO) → milliseconds
+/// since the Unix epoch (UTC).
+///
+/// `timestamp`: `YYYY-MM-DD HH:MM:SS[.ffffff][ BC]`. `timestamptz` additionally
+/// carries the session zone's UTC offset right after the time — `+HH`, `+HH:MM`
+/// or, for pre-standard-time local mean time, `+HH:MM:SS` — which is subtracted
+/// to get the UTC instant. Fractions below a millisecond are truncated.
+fn parse_timestamp_millis(s: &str, with_offset: bool) -> Result<i64> {
+    reject_infinity(s)?;
+    let (date, time) = parse_iso_date(s)?;
+    let (time, offset_secs) = if with_offset {
+        let at = time
+            .rfind(['+', '-'])
+            .ok_or_else(|| anyhow::anyhow!("timestamptz without a UTC offset"))?;
+        (&time[..at], parse_utc_offset(&time[at..])?)
+    } else {
+        (time, 0)
+    };
+    let time = NaiveTime::parse_from_str(time, "%H:%M:%S%.f").map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(NaiveDateTime::new(date, time).and_utc().timestamp_millis() - offset_secs * 1000)
+}
+
+/// Parses a `+HH[:MM[:SS]]` / `-HH[:MM[:SS]]` UTC offset into seconds.
+fn parse_utc_offset(s: &str) -> Result<i64> {
+    let (sign, digits) = match s.split_at(1) {
+        ("+", rest) => (1, rest),
+        ("-", rest) => (-1, rest),
+        _ => bail!("bad UTC offset '{s}'"),
+    };
+    let mut secs = 0i64;
+    for (i, part) in digits.split(':').enumerate() {
+        if i > 2 {
+            bail!("bad UTC offset '{s}'");
+        }
+        let n: i64 = part.parse().map_err(|_| anyhow::anyhow!("bad UTC offset '{s}'"))?;
+        secs += n * [3600, 60, 1][i];
+    }
+    Ok(sign * secs)
 }
 
 /// Parses postgres bytea hex format ("\\xdeadbeef") → bytes.
@@ -631,8 +568,60 @@ mod tests {
 
     #[test]
     fn parse_timestamp_millis_basic() {
-        let ms = parse_timestamp_millis("2024-01-15 12:30:45.123").unwrap();
-        assert!(ms > 0);
+        let ms = parse_timestamp_millis("2024-01-15 12:30:45.123", false).unwrap();
+        assert_eq!(ms, 1_705_321_845_123);
+    }
+
+    #[test]
+    fn timestamptz_offsets_normalize_to_utc() {
+        let utc = 1_705_321_845_123; // 2024-01-15 12:30:45.123 UTC
+        for s in [
+            "2024-01-15 12:30:45.123+00",
+            "2024-01-15 18:00:45.123+05:30",
+            "2024-01-15 09:30:45.123-03",
+            "2024-01-15 12:30:45.123456+00", // micros truncated
+        ] {
+            assert_eq!(parse_timestamp_millis(s, true).unwrap(), utc, "{s}");
+        }
+        // Local mean time offsets carry seconds (Asia/Kolkata, year 1).
+        assert_eq!(
+            parse_timestamp_millis("0001-01-01 05:53:28+05:53:28", true).unwrap(),
+            -62_135_596_800_000
+        );
+        assert!(parse_timestamp_millis("2024-01-15 12:30:45", true).is_err());
+    }
+
+    #[test]
+    fn bc_and_pre_epoch_values() {
+        // Values cross-checked against Postgres 15 (extract(epoch …)).
+        assert_eq!(parse_date_days("0044-03-15 BC").unwrap(), -735_160);
+        assert_eq!(parse_timestamp_millis("0044-03-15 12:00:00 BC", false).unwrap(), -63_517_780_800_000);
+        assert_eq!(parse_timestamp_millis("1969-12-31 23:59:59.999", false).unwrap(), -1);
+        // 1 BC (astronomical year 0) is a leap year.
+        assert!(parse_date_days("0001-02-29 BC").is_ok());
+    }
+
+    #[test]
+    fn infinity_is_a_clear_error() {
+        let e = parse_timestamp_millis("infinity", false).unwrap_err().to_string();
+        assert!(e.contains("NULLIF"), "{e}");
+        assert!(parse_date_days("-infinity").is_err());
+    }
+
+    #[test]
+    fn temporal_and_binary_arrays_build() {
+        // Previously these fell through to a Utf8 child → ListArray panic.
+        let cases = [
+            (DataType::Date32, "{2024-01-15,NULL}"),
+            (DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), r#"{"2024-01-15 12:30:45+00",NULL}"#),
+            (DataType::Binary, r#"{"\\xdead",NULL}"#),
+        ];
+        for (dt, text) in cases {
+            let inner = Arc::new(Field::new("item", dt.clone(), true));
+            let arr = build_list(&[Some(text), None], inner, "c").unwrap();
+            assert_eq!(arr.len(), 2, "{dt:?}");
+            assert_eq!(arr.null_count(), 1, "{dt:?}");
+        }
     }
 
     #[test]
