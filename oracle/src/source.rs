@@ -176,7 +176,7 @@ impl SourcePlugin for OracleSourcePlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: OracleConfig =
-            serde_json::from_value(config).context("invalid oracle source config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid oracle source config: {e}"))?;
 
         let (conn, cols) = tokio::task::block_in_place(|| -> Result<_> {
             let conn = crate::conn::connect(&cfg.conn)?;

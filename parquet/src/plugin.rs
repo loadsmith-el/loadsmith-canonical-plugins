@@ -193,7 +193,7 @@ impl DestinationPlugin for ParquetPlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: ParquetConfig =
-            serde_json::from_value(config).context("invalid parquet destination config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid parquet destination config: {e}"))?;
 
         // Validate only — no files opened here (that's prepare/write_batch).
         if cfg.prefix.trim().is_empty() {

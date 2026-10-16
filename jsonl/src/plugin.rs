@@ -55,7 +55,7 @@ impl DestinationPlugin for JsonlPlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: JsonlConfig =
-            serde_json::from_value(config).context("invalid jsonl destination config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid jsonl destination config: {e}"))?;
         self.config = Some(cfg);
         Ok(())
     }

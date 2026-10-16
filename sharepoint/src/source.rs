@@ -42,7 +42,7 @@ impl SourcePlugin for SharepointSourcePlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: SharepointConfig =
-            serde_json::from_value(config).context("invalid sharepoint source config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid sharepoint source config: {e}"))?;
         self.batch_size = cfg.batch_size;
 
         let mut graph = GraphClient::new(

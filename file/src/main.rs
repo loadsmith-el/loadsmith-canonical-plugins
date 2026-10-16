@@ -29,7 +29,7 @@ impl ConfigProviderPlugin for FileProvider {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: FileConfig =
-            serde_json::from_value(config).context("invalid file provider config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid file provider config: {e}"))?;
 
         let uri = cfg.uri;
         let path_str = uri

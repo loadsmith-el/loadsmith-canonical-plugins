@@ -45,11 +45,11 @@ per-plugin pages link back to them.
 
 ### The `tls` block
 
-The database connectors (`postgres`, `mysql`) take an optional `tls:` block with
+The database connectors (`postgres`, `mysql`, `oracle`) take an optional `tls:` block with
 an identical shape — it comes from the engine's `loadsmith-tls` crate (pure-Rust
 `rustls` + `rustls-rustcrypto`, no OpenSSL/`native-tls`). Omitting it means no
-TLS (`mode: disable`). (`oracle` takes its own TCPS block instead; see
-[Oracle](./oracle.md#tls-tcps).)
+TLS (`mode: disable`). (`oracle` supports only `disable` and `verify-full`,
+without mTLS; see [Oracle](./oracle.md#tls-tcps).)
 
 | Field | Type | Description |
 |---|---|---|

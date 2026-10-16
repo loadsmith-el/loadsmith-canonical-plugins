@@ -42,7 +42,7 @@ postgres-types                 = { workspace = true, features = ["with-chrono-0_
 chrono                         = { version = "0.4", features = ["serde"] }
 bytes                          = "1"
 futures-util                   = "0.3"
-tokio-postgres-rustls-improved = { version = "0.16", default-features = false }
+tokio-postgres-rustls-improved = { version = "0.17", default-features = false }
 loadsmith-plugin-sdk           = { workspace = true }
 loadsmith-arrow                = { workspace = true }
 loadsmith-tls                  = { workspace = true }

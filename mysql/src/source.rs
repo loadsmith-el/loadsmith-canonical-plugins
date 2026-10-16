@@ -151,7 +151,7 @@ impl SourcePlugin for MysqlSourcePlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: MysqlConfig =
-            serde_json::from_value(config).context("invalid mysql source config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid mysql source config: {e}"))?;
 
         let mut conn = crate::conn::connect(&cfg.conn).await?;
 

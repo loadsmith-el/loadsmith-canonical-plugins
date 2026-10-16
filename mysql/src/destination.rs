@@ -87,7 +87,7 @@ impl DestinationPlugin for MysqlDestPlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: MysqlDestConfig =
-            serde_json::from_value(config).context("invalid mysql destination config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid mysql destination config: {e}"))?;
         if cfg.mode == CommitMode::StagedMerge && cfg.merge_key.is_empty() {
             bail!("mode 'staged_merge' requires a non-empty merge_key");
         }

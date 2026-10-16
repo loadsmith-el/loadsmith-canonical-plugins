@@ -24,7 +24,7 @@ driver supports; the lab validates against Oracle Free).
 | `user` | string | — | Login user. |
 | `password` | string | — | Login password. Supports `{{ env(...) }}`. |
 | `connect_timeout` | duration | `10s` | Connection establishment timeout. |
-| `tls` | object | — | Oracle's own TLS block (see [TLS](#tls-tcps) below). It is **not** the shared `mode`-based [`tls` block](./overview.md#the-tls-block). |
+| `tls` | object | — | The shared [`tls` block](./overview.md#the-tls-block), limited to what the thin driver supports (see [TLS](#tls-tcps) below). |
 
 Every session pins `NLS_NUMERIC_CHARACTERS = '.,'`, and temporal values cross
 the connector through explicit `TO_CHAR`/`TO_*` formats, so data is
@@ -83,25 +83,37 @@ destination:
 
 ## TLS (TCPS)
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | bool | `false` | Connect with `PROTOCOL=TCPS`. |
-| `wallet_dir` | string | — | Directory holding `ewallet.pem`: the trusted CA certificate(s) in PEM. Not needed when the server certificate chains to a public root. |
-| `server_dn_match` | bool | `true` | Accepted for compatibility; not enforced yet (see below). |
-| `distinguished_name` | string | — | Accepted for compatibility; not enforced yet. |
+The `tls` block has the same shape as postgres and mysql (`mode`, `root_cert`,
+`client_cert`, `client_key`), but the thin driver always verifies the
+certificate chain **and** the host name, so only two modes work:
 
-The server certificate is verified against the Mozilla/webpki roots **plus**
-every certificate in `<wallet_dir>/ewallet.pem`, and the hostname is always
-checked against the SAN. For a private CA, a plain `ca.crt` renamed to
-`ewallet.pem` works; you don't need `orapki`. An auto-login binary wallet
-(`cwallet.sso`) is **not** read: export its trusted certificate to PEM once
-(e.g. `orapki wallet export`).
+| `mode` | What it does |
+|---|---|
+| `disable` (default) | Plaintext `PROTOCOL=TCP`. |
+| `verify-full` | `PROTOCOL=TCPS`. Chain and host name are verified against `root_cert` plus the public webpki roots. `root_cert` is optional: leave it out when the server certificate comes from a public CA. |
+| `prefer` / `require` / `verify-ca` | Rejected at startup: the driver can't skip verification. |
+
+`client_cert` / `client_key` (mTLS) are rejected for now: the driver can't
+combine a client identity with a private CA yet (oracle/rust-oracledb#54).
+
+The `host` you connect to **must match the certificate's SAN**. `root_cert` is
+inline PEM, like the other connectors; load it with `{{ file(...) }}`. The
+connector writes it to a private temporary directory for the driver
+(`ewallet.pem`, mode 0600) and deletes it right after connecting. An auto-login
+binary wallet (`cwallet.sso`) can't be used directly: export its trusted
+certificate to PEM once (e.g. `orapki wallet export`).
 
 ```yaml
 tls:
-  enabled: true
-  wallet_dir: /wallet           # holds ewallet.pem with your CA
+  mode: verify-full
+  root_cert: "{{ file('/etc/ssl/oracle-ca.pem') }}"   # omit for a public CA
 ```
+
+> **Migrating from v0.2.** v0.2 used an Oracle-specific block
+> (`enabled` / `wallet_dir` / `server_dn_match` / `distinguished_name`). Those
+> keys are now rejected, so a stale block fails at startup instead of silently
+> connecting in plaintext. Replace `enabled: true` + `wallet_dir: /w` with
+> `mode: verify-full` + `root_cert: "{{ file('/w/ewallet.pem') }}"`.
 
 ## Known limitations (driver beta)
 
@@ -112,8 +124,8 @@ tls:
   `SELECT password_versions FROM dba_users WHERE username = '…'` and re-set the
   password (`ALTER USER … IDENTIFIED BY …`) to issue 11G/12C verifiers
   (oracle/rust-oracledb#6).
-- **DN pinning.** `server_dn_match` / `distinguished_name` aren't enforced; the
-  driver does full hostname verification instead (oracle/rust-oracledb#25).
+- **TLS modes.** Only `disable` and `verify-full` (see above); no mTLS yet
+  (oracle/rust-oracledb#54).
 - **Build-time C.** The driver pulls rustls with default features, so
   `aws-lc-sys` is compiled (it needs `cmake` and a C compiler) even though the
   runtime crypto is `rustls-rustcrypto` (oracle/rust-oracledb#34).

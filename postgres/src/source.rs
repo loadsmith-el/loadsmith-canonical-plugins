@@ -178,7 +178,7 @@ impl SourcePlugin for PostgresSourcePlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: PostgresConfig =
-            serde_json::from_value(config).context("invalid postgres source config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid postgres source config: {e}"))?;
 
         // ── Connect (shared TLS/connection layer) ──────────────────────────
         let client = crate::conn::connect(&cfg.conn).await?;

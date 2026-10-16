@@ -5,15 +5,20 @@
 //! `#[serde(flatten)]`) and call [`connect`], so the connection surface — the
 //! TNS descriptor, connect timeout, and TLS — lives in one place.
 //!
-//! **TLS** goes through rustls inside the driver. The server certificate is
-//! verified against the webpki roots plus every certificate in
-//! `<wallet_dir>/ewallet.pem` — a *PEM wallet*: put your private CA there (a
-//! plain PEM CA file renamed to `ewallet.pem` works; no `orapki`). A binary
-//! `cwallet.sso` is NOT read. The host name is always verified against the
-//! certificate SAN (standard TLS), so `server_dn_match` / `distinguished_name`
-//! are accepted for config compatibility but not enforced by the driver yet
-//! (oracle/rust-oracledb#25). Crypto is the canon's pure-Rust rustls-rustcrypto
-//! provider, installed process-wide by [`connect`] via `loadsmith-tls`.
+//! **TLS** takes the canon's shared `tls` block shape (`mode` / `root_cert` /
+//! `client_cert` / `client_key`, as in postgres and mysql) and maps it onto
+//! what the thin driver can do. The driver always verifies the chain AND the
+//! host name, and only reads a trusted CA from a file (`<dir>/ewallet.pem`), so:
+//! - `disable` → plaintext `PROTOCOL=TCP`;
+//! - `verify-full` → `PROTOCOL=TCPS`; an inline `root_cert` is written to a
+//!   private temp dir as `ewallet.pem` for the connect and removed right after
+//!   (without `root_cert`, the public webpki roots apply);
+//! - `prefer` / `require` / `verify-ca` and mTLS are rejected with a clear error:
+//!   the driver can't skip verification, and can't combine a client identity
+//!   with a private CA yet (oracle/rust-oracledb#54).
+//!
+//! Crypto is the canon's pure-Rust rustls-rustcrypto provider, installed
+//! process-wide by [`connect`] via `loadsmith-tls`.
 //!
 //! **Text↔value conversions are kept NLS-independent at the SQL level** (the
 //! source renders temporal/CLOB columns with `TO_CHAR`, the destination wraps
@@ -22,9 +27,11 @@
 //! NLS — and matches the connector's text-preserving contract with the rest of
 //! Loadsmith.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use loadsmith_tls::TlsMode;
 use oracledb::Connection;
 use serde::Deserialize;
 
@@ -64,25 +71,100 @@ pub struct ConnectionConfig {
     pub connect_timeout: Option<String>,
 }
 
-/// TLS (TCPS). When `enabled`, the connector uses `PROTOCOL=TCPS`; the server is
-/// verified against the webpki roots plus the PEM wallet at [`Self::wallet_dir`].
-#[derive(Debug, Clone, Deserialize)]
+/// The canon's shared `tls` block (same shape as `loadsmith_tls::TlsConfig`),
+/// with `deny_unknown_fields` so a stale pre-0.3 block (`enabled`/`wallet_dir`)
+/// fails loudly instead of silently reading as `mode: disable` (plaintext).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
-    /// Turn on TCPS. When false the block is a no-op (plaintext TCP).
     #[serde(default)]
-    pub enabled: bool,
-    /// Directory holding `ewallet.pem` — the trusted (private) CA certificate(s)
-    /// in PEM. Not needed when the server cert chains to a public (webpki) root.
+    pub mode: TlsMode,
+    /// Trusted CA certificate(s), inline PEM. Optional for `verify-full`: without
+    /// it, the server must chain to a public (webpki) root.
     #[serde(default)]
-    pub wallet_dir: Option<String>,
-    /// `SSL_SERVER_DN_MATCH`. Accepted for compatibility; the thin driver always
-    /// verifies the host name against the certificate SAN (see module docs).
-    #[serde(default = "default_true")]
-    pub server_dn_match: bool,
-    /// Expected server distinguished name (`SSL_SERVER_CERT_DN`). Accepted for
-    /// compatibility; not enforced by the thin driver yet.
+    pub root_cert: Option<String>,
+    /// mTLS client certificate (inline PEM). Not supported by the driver yet.
     #[serde(default)]
-    pub distinguished_name: Option<String>,
+    pub client_cert: Option<String>,
+    /// mTLS client key (inline PEM). Not supported by the driver yet.
+    #[serde(default)]
+    pub client_key: Option<String>,
+}
+
+impl TlsConfig {
+    /// Rejects what the thin driver can't honour. Returns whether TLS is on.
+    fn validate(&self) -> Result<bool> {
+        if self.client_cert.is_some() || self.client_key.is_some() {
+            bail!(
+                "oracle tls: client_cert/client_key (mTLS) are not supported yet by the \
+                 oracledb thin driver (oracle/rust-oracledb#54)"
+            );
+        }
+        match self.mode {
+            TlsMode::Disable => Ok(false),
+            TlsMode::VerifyFull => {
+                if let Some(pem) = &self.root_cert {
+                    if !pem.contains("-----BEGIN CERTIFICATE-----") {
+                        bail!("oracle tls: root_cert contains no PEM certificate");
+                    }
+                    // The driver treats an ewallet.pem holding a private key as a
+                    // client identity, not as trust roots, so never write one.
+                    if pem.contains("PRIVATE KEY") {
+                        bail!("oracle tls: root_cert must hold only certificates, not a private key");
+                    }
+                }
+                Ok(true)
+            }
+            TlsMode::Prefer | TlsMode::Require | TlsMode::VerifyCa => bail!(
+                "oracle tls: mode {:?} is not supported: the oracledb thin driver always \
+                 verifies the certificate chain and host name. Use `verify-full` (with \
+                 `root_cert` for a private CA) or `disable`",
+                self.mode
+            ),
+        }
+    }
+}
+
+/// A private, single-use directory holding `ewallet.pem` (the inline
+/// `root_cert`), removed on drop. The driver only reads trust roots from a file.
+struct TempWallet {
+    dir: PathBuf,
+}
+
+impl TempWallet {
+    fn create(root_cert_pem: &str) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::io::Write;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("loadsmith-oracle-wallet-{}-{nanos}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating temp wallet dir {}", dir.display()))?;
+        let wallet = TempWallet { dir };
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(wallet.dir.join("ewallet.pem"))
+            .context("writing temp ewallet.pem")?;
+        f.write_all(root_cert_pem.as_bytes()).context("writing temp ewallet.pem")?;
+        Ok(wallet)
+    }
+
+    fn location(&self) -> String {
+        self.dir.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempWallet {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 fn default_host() -> String {
@@ -90,9 +172,6 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     1521
-}
-fn default_true() -> bool {
-    true
 }
 
 // ── Duration parsing ──────────────────────────────────────────────────────────
@@ -129,8 +208,8 @@ fn dur_err(s: &str) -> anyhow::Error {
 // ── Connect descriptor ─────────────────────────────────────────────────────────
 
 /// Builds the TNS connect descriptor string passed to `oracledb::Config::set_connect_string`.
-/// Plaintext uses `PROTOCOL=TCP`; TLS uses `PROTOCOL=TCPS` plus a `SECURITY`
-/// section (wallet directory + DN matching).
+/// Plaintext uses `PROTOCOL=TCP`; TLS (`mode: verify-full`) uses `PROTOCOL=TCPS`.
+/// The trust roots go to the driver through `set_wallet_location`, not here.
 pub fn build_descriptor(cfg: &ConnectionConfig) -> Result<String> {
     let connect_data = match (&cfg.service_name, &cfg.sid) {
         (Some(svc), _) => format!("(SERVICE_NAME={svc})"),
@@ -138,7 +217,10 @@ pub fn build_descriptor(cfg: &ConnectionConfig) -> Result<String> {
         (None, None) => bail!("oracle config requires either service_name or sid"),
     };
 
-    let tls_on = cfg.tls.as_ref().map(|t| t.enabled).unwrap_or(false);
+    let tls_on = match &cfg.tls {
+        Some(tls) => tls.validate()?,
+        None => false,
+    };
     let protocol = if tls_on { "TCPS" } else { "TCP" };
 
     let timeout = match &cfg.connect_timeout {
@@ -146,29 +228,10 @@ pub fn build_descriptor(cfg: &ConnectionConfig) -> Result<String> {
         None => 10,
     };
 
-    let security = if tls_on {
-        let tls = cfg.tls.as_ref().unwrap();
-        let mut parts = String::new();
-        parts.push_str(if tls.server_dn_match {
-            "(SSL_SERVER_DN_MATCH=yes)"
-        } else {
-            "(SSL_SERVER_DN_MATCH=no)"
-        });
-        if let Some(dn) = &tls.distinguished_name {
-            parts.push_str(&format!("(SSL_SERVER_CERT_DN=\"{dn}\")"));
-        }
-        if let Some(dir) = &tls.wallet_dir {
-            parts.push_str(&format!("(MY_WALLET_DIRECTORY={dir})"));
-        }
-        format!("(SECURITY={parts})")
-    } else {
-        String::new()
-    };
-
     Ok(format!(
         "(DESCRIPTION=(CONNECT_TIMEOUT={timeout})\
          (ADDRESS=(PROTOCOL={protocol})(HOST={host})(PORT={port}))\
-         (CONNECT_DATA={connect_data}){security})",
+         (CONNECT_DATA={connect_data}))",
         host = cfg.host,
         port = cfg.port,
     ))
@@ -186,9 +249,17 @@ pub fn connect(cfg: &ConnectionConfig) -> Result<Connection> {
         .set_credentials(&cfg.user, &cfg.password)
         .set_connect_string(&descriptor)
         .map_err(|e| anyhow::anyhow!("invalid oracle connect descriptor: {e}"))?;
-    if let Some(dir) = cfg.tls.as_ref().filter(|t| t.enabled).and_then(|t| t.wallet_dir.as_ref()) {
-        config = config.set_wallet_location(dir.as_str());
-    }
+    // build_descriptor validated the block: a root_cert only matters for
+    // verify-full. The driver reads it at connect time; the temp dir is removed
+    // when `_wallet` drops at the end of this function.
+    let _wallet = match cfg.tls.as_ref().filter(|t| t.mode == TlsMode::VerifyFull) {
+        Some(TlsConfig { root_cert: Some(pem), .. }) => {
+            let wallet = TempWallet::create(pem)?;
+            config = config.set_wallet_location(wallet.location());
+            Some(wallet)
+        }
+        _ => None,
+    };
     let conn = oracledb::connect(config).map_err(|e| anyhow::anyhow!("oracle connect failed: {e}"))?;
     // Numbers cross the connector as text, so pin the decimal/group characters on
     // every session. Otherwise a comma-decimal locale (e.g. NLS_LANG=GERMAN…)
@@ -237,15 +308,69 @@ mod tests {
         assert!(build_descriptor(&c).is_err());
     }
 
+    fn tls_cfg(tls: serde_json::Value) -> Result<String> {
+        let c: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "service_name": "FREEPDB1", "user": "lab", "password": "lab", "tls": tls
+        }))?;
+        build_descriptor(&c)
+    }
+
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
     #[test]
-    fn descriptor_tls_uses_tcps_and_wallet() {
-        let c = cfg(serde_json::json!({
-            "service_name": "FREEPDB1", "user": "lab", "password": "lab",
-            "tls": { "enabled": true, "wallet_dir": "/wallet", "server_dn_match": false }
-        }));
-        let d = build_descriptor(&c).unwrap();
+    fn tls_verify_full_uses_tcps() {
+        let d = tls_cfg(serde_json::json!({ "mode": "verify-full", "root_cert": PEM })).unwrap();
         assert!(d.contains("(PROTOCOL=TCPS)"));
-        assert!(d.contains("(MY_WALLET_DIRECTORY=/wallet)"));
-        assert!(d.contains("(SSL_SERVER_DN_MATCH=no)"));
+        assert!(!d.contains("SECURITY"));
+        // root_cert is optional (public webpki roots).
+        assert!(tls_cfg(serde_json::json!({ "mode": "verify-full" })).is_ok());
+    }
+
+    #[test]
+    fn tls_disable_is_plaintext() {
+        let d = tls_cfg(serde_json::json!({ "mode": "disable" })).unwrap();
+        assert!(d.contains("(PROTOCOL=TCP)"));
+    }
+
+    #[test]
+    fn tls_rejects_modes_the_driver_cannot_honour() {
+        for mode in ["prefer", "require", "verify-ca"] {
+            let err = tls_cfg(serde_json::json!({ "mode": mode })).unwrap_err().to_string();
+            assert!(err.contains("not supported"), "{mode}: {err}");
+        }
+    }
+
+    #[test]
+    fn tls_rejects_mtls_and_bad_root_cert() {
+        assert!(tls_cfg(serde_json::json!({
+            "mode": "verify-full", "client_cert": PEM, "client_key": "k"
+        }))
+        .is_err());
+        assert!(tls_cfg(serde_json::json!({ "mode": "verify-full", "root_cert": "nope" })).is_err());
+        let with_key = format!("{PEM}-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n");
+        assert!(tls_cfg(serde_json::json!({ "mode": "verify-full", "root_cert": with_key })).is_err());
+    }
+
+    #[test]
+    fn tls_rejects_the_pre_0_3_block() {
+        // A stale `enabled`/`wallet_dir` block must fail, not silently read as
+        // `mode: disable` (plaintext).
+        let err = tls_cfg(serde_json::json!({ "enabled": true, "wallet_dir": "/wallet" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn temp_wallet_is_private_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = TempWallet::create(PEM).unwrap();
+        let dir = w.dir.clone();
+        let file = dir.join("ewallet.pem");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), PEM);
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(w);
+        assert!(!dir.exists());
     }
 }

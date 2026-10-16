@@ -112,7 +112,7 @@ impl DestinationPlugin for OracleDestPlugin {
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         let cfg: OracleDestConfig =
-            serde_json::from_value(config).context("invalid oracle destination config")?;
+            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid oracle destination config: {e}"))?;
         if cfg.mode == CommitMode::StagedMerge && cfg.merge_key.is_empty() {
             bail!("mode 'staged_merge' requires a non-empty merge_key");
         }
