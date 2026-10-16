@@ -42,7 +42,9 @@ there is no glibc version floor to track.
 Every binary sets [mimalloc](https://github.com/microsoft/mimalloc) as its
 global allocator (`#[global_allocator]` at the top of each `main`), because
 musl's own allocator is slow under the many small allocations of Arrow batch
-building. A new plugin binary should do the same.
+building. A new plugin binary should do the same. The workspace's release
+profile strips the symbol table (`strip = true`), which makes the binaries about
+25% smaller.
 
 ### Two operational gotchas
 
