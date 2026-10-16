@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-config-provider-file"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2333,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-destination-jsonl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-destination-null"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arrow-array",

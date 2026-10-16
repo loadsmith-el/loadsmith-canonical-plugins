@@ -46,3 +46,9 @@ tokio-postgres = "0.7"
 postgres-types = { version = "0.2" }
 # Global allocator for every plugin binary (see the #[global_allocator] in each bin).
 mimalloc       = { version = "0.1", default-features = false }
+
+# Release binaries ship as-is in archives and images: drop the symbol table
+# (~25% smaller; panics still print their message, just without symbolized
+# frames).
+[profile.release]
+strip = true
