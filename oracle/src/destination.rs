@@ -111,10 +111,10 @@ impl DestinationPlugin for OracleDestPlugin {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        let cfg: OracleDestConfig =
-            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid oracle destination config: {e}"))?;
+        // Unknown keys (at any depth, flattened blocks included) follow the
+        // operator's policy: an error by default, a warning with
+        // `--ignore-unknown-keys`.
+        let cfg: OracleDestConfig = config.parse()?;
         if cfg.mode == CommitMode::StagedMerge && cfg.merge_key.is_empty() {
             bail!("mode 'staged_merge' requires a non-empty merge_key");
         }

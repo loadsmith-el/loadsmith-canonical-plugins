@@ -175,10 +175,10 @@ impl SourcePlugin for OracleSourcePlugin {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        let cfg: OracleConfig =
-            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid oracle source config: {e}"))?;
+        // Unknown keys (at any depth, flattened blocks included) follow the
+        // operator's policy: an error by default, a warning with
+        // `--ignore-unknown-keys`.
+        let cfg: OracleConfig = config.parse()?;
 
         let (conn, cols) = tokio::task::block_in_place(|| -> Result<_> {
             let conn = crate::conn::connect(&cfg.conn)?;
@@ -272,6 +272,23 @@ mod tests {
         assert_eq!(cfg.conn.user, "lab");
         assert_eq!(cfg.batch_size, 1000);
         assert!(cfg.incremental.is_none());
+    }
+
+    #[test]
+    fn unknown_keys_are_found_in_the_flattened_connection_block() {
+        use loadsmith_plugin_sdk::{PluginConfig, UnknownKeys};
+        let block = serde_json::json!({
+            "service_name": "FREEPDB1", "user": "lab", "password": "lab",
+            "query": "SELECT 1 FROM dual",
+            "servce_name": "X",
+            "batch_sise": 10
+        });
+        let err = PluginConfig::new(block.clone(), UnknownKeys::Error)
+            .parse::<OracleConfig>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`servce_name`") && err.contains("`batch_sise`"), "{err}");
+        assert!(PluginConfig::new(block, UnknownKeys::Warn).parse::<OracleConfig>().is_ok());
     }
 
     #[test]

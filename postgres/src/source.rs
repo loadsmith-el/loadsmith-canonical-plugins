@@ -180,10 +180,10 @@ impl SourcePlugin for PostgresSourcePlugin {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        let cfg: PostgresConfig =
-            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid postgres source config: {e}"))?;
+        // Unknown keys (at any depth, flattened blocks included) follow the
+        // operator's policy: an error by default, a warning with
+        // `--ignore-unknown-keys`.
+        let cfg: PostgresConfig = config.parse()?;
 
         // ── Connect (shared TLS/connection layer) ──────────────────────────
         let client = crate::conn::connect(&cfg.conn).await?;
@@ -415,6 +415,27 @@ mod tests {
         let q = p.cursor_query();
         assert!(q.contains("\"we\"\"ird\""));
         assert!(q.contains("> 'o''brien'"));
+    }
+
+    #[test]
+    fn unknown_keys_are_found_in_the_flattened_connection_block() {
+        use loadsmith_plugin_sdk::{PluginConfig, UnknownKeys};
+        let block = serde_json::json!({
+            "host": "localhost", "dbname": "d", "user": "u", "password": "p",
+            "query": "SELECT 1",
+            "hots": "x",
+            "tls": { "mode": "require", "verfy": true },
+            "incremental": { "cursor_column": "c", "intial_value": "1" }
+        });
+        let err = PluginConfig::new(block.clone(), UnknownKeys::Error)
+            .parse::<PostgresConfig>()
+            .unwrap_err()
+            .to_string();
+        for key in ["`hots`", "`tls.verfy`", "`incremental.intial_value`"] {
+            assert!(err.contains(key), "{key} missing from: {err}");
+        }
+        // The operator's warn policy ignores them and parses the rest.
+        assert!(PluginConfig::new(block, UnknownKeys::Warn).parse::<PostgresConfig>().is_ok());
     }
 
     #[test]

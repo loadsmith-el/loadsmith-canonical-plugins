@@ -71,11 +71,11 @@ pub struct ConnectionConfig {
     pub connect_timeout: Option<String>,
 }
 
-/// The canon's shared `tls` block (same shape as `loadsmith_tls::TlsConfig`),
-/// with `deny_unknown_fields` so a stale pre-0.3 block (`enabled`/`wallet_dir`)
-/// fails loudly instead of silently reading as `mode: disable` (plaintext).
+/// The canon's shared `tls` block (same shape as `loadsmith_tls::TlsConfig`).
+/// A stale pre-0.3 block (`enabled`/`wallet_dir`) has only unknown keys, so
+/// `PluginConfig::parse` rejects it (by default) instead of it silently
+/// reading as `mode: disable` (plaintext).
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
@@ -355,10 +355,15 @@ mod tests {
     fn tls_rejects_the_pre_0_3_block() {
         // A stale `enabled`/`wallet_dir` block must fail, not silently read as
         // `mode: disable` (plaintext).
-        let err = tls_cfg(serde_json::json!({ "enabled": true, "wallet_dir": "/wallet" }))
+        let block = serde_json::json!({
+            "service_name": "FREEPDB1", "user": "lab", "password": "lab",
+            "tls": { "enabled": true, "wallet_dir": "/wallet" }
+        });
+        let err = loadsmith_plugin_sdk::PluginConfig::new(block, loadsmith_plugin_sdk::UnknownKeys::Error)
+            .parse::<ConnectionConfig>()
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unknown field"), "{err}");
+        assert!(err.contains("tls.enabled") && err.contains("tls.wallet_dir"), "{err}");
     }
 
     #[test]

@@ -153,10 +153,10 @@ impl SourcePlugin for MysqlSourcePlugin {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        let cfg: MysqlConfig =
-            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid mysql source config: {e}"))?;
+        // Unknown keys (at any depth, flattened blocks included) follow the
+        // operator's policy: an error by default, a warning with
+        // `--ignore-unknown-keys`.
+        let cfg: MysqlConfig = config.parse()?;
 
         let mut conn = crate::conn::connect(&cfg.conn).await?;
 
@@ -253,6 +253,22 @@ mod tests {
         let cfg: MysqlConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.conn.tls.is_some());
         assert_eq!(cfg.incremental.unwrap().cursor_column, "updated_at");
+    }
+
+    #[test]
+    fn unknown_keys_are_found_in_the_flattened_connection_block() {
+        use loadsmith_plugin_sdk::{PluginConfig, UnknownKeys};
+        let block = serde_json::json!({
+            "dbname": "lab", "user": "lab", "password": "lab", "query": "SELECT 1",
+            "prot": 3306,
+            "tls": { "mode": "require", "root_crt": "x" }
+        });
+        let err = PluginConfig::new(block.clone(), UnknownKeys::Error)
+            .parse::<MysqlConfig>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`prot`") && err.contains("`tls.root_crt`"), "{err}");
+        assert!(PluginConfig::new(block, UnknownKeys::Warn).parse::<MysqlConfig>().is_ok());
     }
 
     #[test]
