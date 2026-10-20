@@ -1,0 +1,25 @@
+[package]
+name    = "tabular"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Shared CSV/Excel parsing for the tabular plugins (`sharepoint`, `csv`, `excel`).
+# A plain library: no binary, no `[package.metadata.loadsmith]`, never released
+# on its own (a `tabular-v*` tag fails the release workflow's metadata check).
+
+[dependencies]
+anyhow             = { workspace = true }
+serde_json         = { workspace = true }
+arrow              = { workspace = true }
+arrow-array        = { workspace = true }
+arrow-schema       = { workspace = true }
+loadsmith-arrow    = { workspace = true }
+loadsmith-protocol = { workspace = true }
+
+# Pure Rust (multi-arch posture: no native deps).
+calamine    = { version = "0.36", features = ["dates"] }
+csv         = "1.3"
+encoding_rs = "0.8"
+chrono      = { version = "0.4", features = ["serde"] }

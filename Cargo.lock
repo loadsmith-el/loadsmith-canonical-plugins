@@ -2483,10 +2483,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
- "calamine",
  "chrono",
- "csv",
- "encoding_rs",
  "httpmock",
  "loadsmith-arrow",
  "loadsmith-plugin-sdk",
@@ -2496,6 +2493,7 @@ dependencies = [
  "rust_xlsxwriter",
  "serde",
  "serde_json",
+ "tabular",
  "tokio",
  "tracing",
  "unicode-normalization",
@@ -4037,6 +4035,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tabular"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "calamine",
+ "chrono",
+ "csv",
+ "encoding_rs",
+ "loadsmith-arrow",
+ "loadsmith-protocol",
+ "serde_json",
 ]
 
 [[package]]
