@@ -48,3 +48,13 @@ The codec is always embedded in the name so files are self-describing:
   with an 8-digit zero-padded sequence starting at `1` — e.g.
   `events.00000001.snappy.parquet`, `events.00000002.snappy.parquet`, … Once a
   file passes the size cap it is finalized and the next one is opened.
+
+## Behavior notes
+
+- **Zero rows ⇒ no file.** The writer opens lazily on the first batch, so a run
+  that yields no rows writes nothing, and a sink has nothing to deliver.
+- **Cancel removes the run's files.** When the core cancels the run, every file
+  the run created in `path` is removed, including chunks already finalized
+  (copies a sink already delivered elsewhere are not touched).
+- **`max_file_size` is a rollover threshold**, checked after each batch is
+  written, so a file can exceed it by up to one batch.

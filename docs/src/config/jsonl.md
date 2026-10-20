@@ -17,6 +17,9 @@ destination:
 ```
 
 Column values follow JSON types: strings as JSON strings, integers as JSON
-numbers, booleans as `true`/`false`, nulls as `null`. Arrow `Timestamp` and
-`Date32` columns are written as ISO 8601 strings; Arrow `Binary` columns as
-base64-encoded strings.
+numbers, booleans as `true`/`false`, nulls as `null`. Arrow `Date32` columns are
+written as integer days since 1970-01-01, and `Timestamp` columns as integer
+epoch milliseconds (the raw stored value; only millisecond-unit timestamps are
+supported). Arrow `Binary` columns are written as base64-encoded strings. Arrow
+types the converter does not handle (e.g. `List` from Postgres arrays) are
+written as `null`, and NaN/±Inf floats are written as `0`.

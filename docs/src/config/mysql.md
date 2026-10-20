@@ -22,9 +22,9 @@ pure-Rust RSA public-key exchange) and legacy `mysql_native_password` (MySQL
 | `dbname` | string | — | Database (schema) name. |
 | `user` | string | — | Login user. |
 | `password` | string | — | Login password. Supports `{{ env(...) }}`. |
-| `tls` | object | — | The shared [`tls` block](./overview.md#the-tls-block). MySQL maps it onto `mysql_async`'s `SslOpts`: `require`/`prefer` encrypt without verification; `verify-ca`/`verify-full` verify against `root_cert` (inline PEM); plus mTLS via `client_cert`/`client_key`. |
+| `tls` | object | — | The shared [`tls` block](./overview.md#the-tls-block). MySQL maps it onto `mysql_async`'s `SslOpts`: `require`/`prefer` encrypt without verification (`prefer` is treated as `require` — no plaintext fallback); `verify-ca`/`verify-full` verify against `root_cert` (inline PEM); plus mTLS via `client_cert`/`client_key`. |
 | `statement_timeout` | duration | — | Applied as the session `max_execution_time`. |
-| `session` | map | — | `SET SESSION <k> = <v>` applied on connect. |
+| `session` | map | — | `SET SESSION <k> = <v>` applied on connect. Values are inserted as raw SQL — quote string values yourself (e.g. `time_zone: "'+00:00'"`); unlike postgres, nothing is bound. Applied after `statement_timeout`, so a `max_execution_time` key here overrides it. |
 | `tcp_keepalive` | duration | — | TCP keepalive idle time. |
 
 ## Source
@@ -36,10 +36,24 @@ pure-Rust RSA public-key exchange) and legacy `mysql_native_password` (MySQL
 | `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
 
 Like the postgres source, it reads over the text protocol, so text-rendered
-types round-trip losslessly to Arrow `Utf8`: `TINYINT`/`SMALLINT`/`INT` →
-`Int32`, `BIGINT` → `Int64`, `FLOAT`/`DOUBLE` → float, `DATE` → `Date32`,
+types round-trip losslessly to Arrow `Utf8`:
+`TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT`/`YEAR` → `Int32`, `BIGINT` → `Int64`, `FLOAT`/`DOUBLE` → float, `DATE` → `Date32`,
 `DATETIME`/`TIMESTAMP` → `Timestamp(ms)`, `BLOB`/binary-collation strings →
 `Binary`, everything else (`DECIMAL`, `TIME`, …) → `Utf8`.
+
+Caveats:
+
+- The unsigned flag is ignored, so `INT UNSIGNED` / `BIGINT UNSIGNED` values
+  above the signed range fail the batch. Use `CAST(col AS SIGNED)` for
+  `INT UNSIGNED`, and `CAST(col AS CHAR)` (or `DECIMAL(20,0)`, which crosses as
+  `Utf8`) for `BIGINT UNSIGNED`.
+- Zero dates/datetimes (`0000-00-00…`) fail to parse; map them in SQL, e.g.
+  `NULLIF(col, '0000-00-00')`.
+- The source buffers the full result set in memory before emitting batches
+  (`mysql_async` exposes no row stream). `batch_size` only sets the Arrow batch
+  size, so memory grows with the result size — unlike the postgres source's
+  server-side cursor. Bound very large extracts in the query itself (e.g. by key
+  ranges).
 
 ```yaml
 source:
@@ -67,7 +81,7 @@ must already exist.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | connection fields | — | yes (port default `3306`) | The shared connection block above, including `tls`. |
-| `target_table` | string | yes | Destination table. Must already exist. |
+| `target_table` | string | yes | Destination table. Must already exist. Use an unqualified table name in the connection's `dbname`: `staged_merge` quotes the name as a single identifier, so `schema.table` is not supported there. |
 | `mode` | `atomic` / `staged_merge` | no (default `atomic`) | Commit strategy (below). |
 | `merge_key` | list of strings | for `staged_merge` | Columns **excluded** from the upsert's `UPDATE` set. (Conflict detection keys off the table's PRIMARY/UNIQUE index — MySQL semantics.) |
 

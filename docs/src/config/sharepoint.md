@@ -31,7 +31,7 @@ Uses the OAuth 2.0 **client-credentials** grant (an app registration with
 | `site_id` | string | — | Pre-resolved site id (skips lookup). |
 | `drive` | string | — | Document library by display name; resolved via Graph. File mode only. Provide this **or** `drive_id`. |
 | `drive_id` | string | — | Pre-resolved drive id (skips lookup). File mode only. |
-| `graph_base_url` | string | `https://graph.microsoft.com` | Graph base URL. Override for sovereign clouds (e.g. `https://graph.microsoft.us`) or to point tests at a mock. |
+| `graph_base_url` | string | `https://graph.microsoft.com` | Graph base URL. Override to point tests at a mock. Sovereign clouds are not supported yet: the token scope is fixed to the global Graph (`https://graph.microsoft.com/.default`). |
 | `authority_url` | string | `https://login.microsoftonline.com` | Login authority base URL. |
 | `batch_size` | integer | `1000` | Rows per Arrow batch. |
 | `input` | object | — | The input mode (below). |
@@ -52,10 +52,18 @@ input:
     skip_rows: 10                   # excel: rows to skip before the header (default 0)
 ```
 
-CSV parser options: `delimiter` (single char, default `,`), `encoding` (default
-`utf-8`), `header` (default true). Excel numbers are IEEE doubles in the file
-format, so numeric columns infer to Arrow `Float64`; text → `Utf8`, booleans →
-`Boolean`, dates/datetimes → `Date32`/`Timestamp(ms)`.
+The excel parser reads `.xlsx` only (not `.xls`/`.xlsb`/`.ods`). Excel numbers
+are IEEE doubles in the file format, so numeric columns infer to Arrow
+`Float64`; text → `Utf8`, booleans → `Boolean`, date/datetime cells →
+`Timestamp(ms)` (never `Date32`).
+
+CSV parser options: `delimiter` (a single-byte character, default `,`),
+`encoding` (any WHATWG / `encoding_rs` label, default `utf-8`), `header`
+(default true). CSV inference is simpler: a trimmed integer → `Int64`, a float →
+`Float64`, blank/whitespace → null, anything else → `Utf8` (no boolean or date
+inference).
+
+With `header: false` (Excel or CSV), columns are named `col_0`, `col_1`, …
 
 ### `list` — read SharePoint List items
 
@@ -67,7 +75,8 @@ input:
 
 Items are read with `$expand=fields`, following `@odata.nextLink` pagination.
 Columns are the union of item field keys in first-seen order (Graph `@odata.*`
-annotations are dropped); no parser is involved.
+annotations are dropped); no parser is involved. Date fields arrive as Graph
+ISO strings and stay `Utf8`.
 
 ## Transforms
 

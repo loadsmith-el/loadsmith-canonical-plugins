@@ -10,7 +10,7 @@ Two steps the release workflow calls:
       and their sha256 (computed from the built tarballs).
 
   index <name> <version> <manifest-url> <index.json>
-      Adds/updates the entry in the index that `loadsmith install` reads.
+      Adds/updates the entry in the index that `loadsmith plugin install` reads.
 
 The tag is `<name>-v<version>` (e.g. postgres-v1.0.0).
 """

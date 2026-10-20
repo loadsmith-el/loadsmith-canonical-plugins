@@ -6,9 +6,9 @@ destination).
 
 | Package | Provides | Notes |
 |---|---|---|
-| `postgres` | source + destination | Server-side cursor source; `atomic` / `staged_merge` destination. TLS via rustls. |
-| `mysql` | source + destination | Streaming source with incremental watermark; `atomic` / `staged_merge` (ON DUPLICATE KEY) destination. TLS via rustls. |
-| `oracle` | source + destination | Oracle's pure-Rust `oracledb` thin driver (no Instant Client); `atomic` (array INSERT) / `staged_merge` (staging GTT + one `MERGE`) destination. TLS (TCPS) via rustls. |
+| `postgres` | source + destination | Server-side cursor source with incremental watermark (`cursor_column`); `atomic` / `staged_merge` destination. TLS via rustls. |
+| `mysql` | source + destination | Source with incremental watermark (`cursor_column`; buffers the result set in memory); `atomic` / `staged_merge` (ON DUPLICATE KEY) destination. TLS via rustls. |
+| `oracle` | source + destination | Oracle's pure-Rust `oracledb` thin driver (no Instant Client); source with incremental watermark (`cursor_column`); `atomic` (array INSERT) / `staged_merge` (staging GTT + one `MERGE`) destination. TLS (TCPS) via rustls. |
 | `sharepoint` | source | Microsoft Graph: Excel/CSV file download or SharePoint List items, with in-plugin tabular transforms (filter/normalize/fix-merged/drop-empty). TLS via rustls. |
 | `jsonl` | destination | Newline-delimited JSON output. |
 | `parquet` | destination | Single-file or chunked Parquet output. |

@@ -3,7 +3,7 @@
 > 📖 **Full documentation:** <https://loadsmith-el.github.io/loadsmith-canonical-plugins/>
 
 The **official, supported plugin set** for [Loadsmith](https://github.com/loadsmith-el/loadsmith) — the
-plugins `loadsmith install <name>` resolves from the canonical index. ("Canonical"
+plugins `loadsmith plugin install <name>` resolves from the canonical index. ("Canonical"
 mirrors `loadsmith-lab-canonical-data`: it marks the blessed set apart from
 third-party/local plugins the installer also accepts.)
 
@@ -15,7 +15,7 @@ destination). Each plugin is a self-describing directory:
 
 ```text
 <name>/
-  Cargo.toml     # [package.metadata.loadsmith]: name, protocol, provides[{kind,bin}]
+  Cargo.toml     # [package.metadata.loadsmith]: name, summary, protocol, provides[{kind,bin}]
   src/           # the plugin implementation (one or more [[bin]])
 ```
 
@@ -43,7 +43,7 @@ builds each plugin for `linux/amd64` + `linux/arm64` (static musl binaries
 that run on any Linux), publishes a per-plugin
 **GitHub Release** with the archives + sha256, and generates the published
 `loadsmith-plugin.yaml` (artifact URLs + checksums filled in) + the index that
-`loadsmith install` reads.
+`loadsmith plugin install` reads.
 
 ## Building locally
 

@@ -9,7 +9,7 @@ Delivery](https://loadsmith-el.github.io/loadsmith/architecture/sink-delivery.ht
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `dest` | string | yes | Destination **directory** each finalized file is copied into. |
+| `dest` | string | yes | Destination **directory** each finalized file is copied into. Created if missing. Files keep their staged name and overwrite any existing file of the same name (idempotent re-delivery). |
 
 ```yaml
 destination:

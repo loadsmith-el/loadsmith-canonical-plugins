@@ -49,7 +49,9 @@ The database connectors (`postgres`, `mysql`, `oracle`) take an optional `tls:` 
 an identical shape — it comes from the engine's `loadsmith-tls` crate (pure-Rust
 `rustls` + `rustls-rustcrypto`, no OpenSSL/`native-tls`). Omitting it means no
 TLS (`mode: disable`). (`oracle` supports only `disable` and `verify-full`,
-without mTLS; see [Oracle](./oracle.md#tls-tcps).)
+without mTLS, and `root_cert` is optional there — public CAs verify via webpki
+roots; `mysql` treats `prefer` as `require`, with no plaintext fallback; see
+[Oracle](./oracle.md#tls-tcps) and [MySQL](./mysql.md).)
 
 | Field | Type | Description |
 |---|---|---|
@@ -61,7 +63,7 @@ without mTLS; see [Oracle](./oracle.md#tls-tcps).)
 | Mode | What it does |
 |---|---|
 | `disable` | No TLS. |
-| `prefer` | TLS if the server offers it; plaintext fallback. |
+| `prefer` | TLS if the server offers it; plaintext fallback. (`mysql`: same as `require`.) |
 | `require` | Encrypted channel required. **No** certificate checks. (The `useSSL=true` / `sslmode=require` equivalent — no cert fields needed.) |
 | `verify-ca` | Encrypt **and** verify the chain against `root_cert`. Hostname not checked. |
 | `verify-full` | Encrypt **and** verify the chain *and* the server hostname. Strictest. |

@@ -4,7 +4,7 @@ name: Release plugin
 # `<name>-v<version>` (e.g. `postgres-v1.0.0`, matching its Cargo.toml version)
 # and this builds it natively for amd64 + arm64 as static musl binaries,
 # publishes a GitHub Release with the archives + checksums + the published
-# loadsmith-plugin.yaml, and updates the index.json that `loadsmith install` reads.
+# loadsmith-plugin.yaml, and updates the index.json that `loadsmith plugin install` reads.
 
 on:
   push:
@@ -111,7 +111,7 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             --title "${{ needs.meta.outputs.name }} v${{ needs.meta.outputs.version }}" \
-            --notes "Loadsmith plugin \`${{ needs.meta.outputs.name }}\` v${{ needs.meta.outputs.version }} (linux amd64+arm64). Install: \`loadsmith install ${{ needs.meta.outputs.name }}\`." \
+            --notes "Loadsmith plugin \`${{ needs.meta.outputs.name }}\` v${{ needs.meta.outputs.version }} (linux amd64+arm64). Install: \`loadsmith plugin install ${{ needs.meta.outputs.name }}\`." \
             dist/*.tar.gz dist/*.sha256 dist/loadsmith-plugin.yaml
       - name: Update index.json
         run: |

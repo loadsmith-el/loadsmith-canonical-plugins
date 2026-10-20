@@ -24,12 +24,18 @@ To release a plugin:
 
 The `release-plugin.yml` workflow then:
 
+- checks the tag against the plugin (`ci/release.py check`), failing early if
+  the plugin directory doesn't exist or the version doesn't match `Cargo.toml`;
 - builds the plugin natively for `linux/amd64` + `linux/arm64` as **static musl
-  binaries** (see below) and fails if any binary is dynamically linked;
-- publishes a per-plugin **GitHub Release** with the archives + sha256;
+  binaries** (see below), runs its tests (`cargo test --release`) in the same
+  alpine container, and fails if any binary is dynamically linked;
+- packages one archive per arch, named `<name>-<version>-linux-<arch>.tar.gz`;
 - generates the published `loadsmith-plugin.yaml` (artifact URLs + checksums
   filled in) — the generator is `ci/release.py` (stdlib-only);
-- updates the canonical `index.json` that `loadsmith plugin install` reads.
+- publishes a per-plugin **GitHub Release** with the archives + sha256 and the
+  generated `loadsmith-plugin.yaml` attached as an asset;
+- updates the canonical `index.json` that `loadsmith plugin install` reads — its
+  entries link to that release asset.
 
 ### Static musl binaries
 
@@ -57,6 +63,7 @@ profile strips the symbol table (`strip = true`), which makes the binaries about
 ## What the engine consumes
 
 The result of all this is a published index plus a set of GitHub Releases. The
-engine's installer reads the index, downloads the right per-arch archive,
-verifies its sha256, and checks the protocol range before installing. See
+engine's installer reads the index to find the version's published manifest,
+checks the protocol range, then downloads the right per-arch archive and
+verifies its sha256 against the manifest. See
 [Installing Plugins](./installing.md).

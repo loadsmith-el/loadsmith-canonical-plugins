@@ -20,10 +20,10 @@ driver supports; the lab validates against Oracle Free).
 | `host` | string | `"localhost"` | Server hostname. With TLS it must match the server certificate's SAN. |
 | `port` | integer | `1521` | Listener port (typically `2484` for TCPS). |
 | `service_name` | string | — | Service name (e.g. `FREEPDB1`). Either this or `sid`. |
-| `sid` | string | — | Legacy SID, as an alternative to `service_name`. |
+| `sid` | string | — | Legacy SID, as an alternative to `service_name`. Ignored if `service_name` is set. |
 | `user` | string | — | Login user. |
 | `password` | string | — | Login password. Supports `{{ env(...) }}`. |
-| `connect_timeout` | duration | `10s` | Connection establishment timeout. |
+| `connect_timeout` | duration | `10s` | Connection establishment timeout. Whole seconds only (sub-second values round down, minimum 1s). |
 | `tls` | object | — | The shared [`tls` block](./overview.md#the-tls-block), limited to what the thin driver supports (see [TLS](#tls-tcps) below). |
 
 Every session pins `NLS_NUMERIC_CHARACTERS = '.,'`, and temporal values cross
@@ -40,9 +40,16 @@ ignored, as with every thin driver.)
 | `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
 
 `NUMBER` crosses as exact text (`Utf8`), `BINARY_FLOAT`/`BINARY_DOUBLE` as
-floats, `DATE`/`TIMESTAMP*` as formatted text, `RAW`/`LONG RAW`/`BLOB` as
-`Binary`, and everything else (`VARCHAR2`, `CHAR`, `CLOB`, …) as `Utf8`. CLOBs
-are read through `TO_CHAR`, so values over 4000 bytes aren't supported yet.
+floats, `BOOLEAN` (23ai+) as `Boolean`, `RAW`/`LONG RAW`/`BLOB` as `Binary`, and
+everything else (`VARCHAR2`, `CHAR`, `CLOB`, …) as `Utf8`. Temporal types cross
+as text with fixed formats: `DATE` as `YYYY-MM-DD HH24:MI:SS`, `TIMESTAMP` as
+`YYYY-MM-DD HH24:MI:SS.FF6`, and `TIMESTAMP WITH (LOCAL) TIME ZONE` as
+`YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM`; `INTERVAL` and `LONG` go through `TO_CHAR`
+too. CLOBs are read through `TO_CHAR`, so values over 4000 bytes aren't
+supported yet. `BFILE` is not supported (its contents are not fetched).
+
+The source buffers the whole result set in memory before emitting batches;
+`batch_size` only sets the Arrow batch size.
 
 ```yaml
 source:

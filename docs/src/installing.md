@@ -1,7 +1,9 @@
 # Installing Plugins
 
-The official Loadsmith image is **slim** — the core only. Plugins are installed
-on demand from what this repository publishes.
+The default Loadsmith image (`:latest`, the **slim** flavor) carries only the
+core; plugins are installed on demand from what this repository publishes. The
+`-bundled` image flavor ships the whole canonical set preinstalled — see the
+engine's [Container Images](https://loadsmith-el.github.io/loadsmith/getting-started/container-images.html).
 
 A **package** (e.g. `postgres`) provides one or more **plugins** — its binaries,
 one per kind. Install the whole package, or a single kind with `:<kind>` /
@@ -37,9 +39,16 @@ Installed plugins land in `~/.loadsmith/plugins/`, where the core discovers them
 at run time (a binary named `loadsmith-{kind}-{type}`). Only one version of a
 plugin is installed at a time — reinstalling a different version overwrites it.
 
-The installer is **sha256-verified** and **protocol-range-checked**: it confirms
-the downloaded archive matches the checksum in the index and that the plugin's
-protocol version is one the core speaks before installing it.
+The directory can be overridden with `--plugin-dir` (on `plugin install`,
+`plugin uninstall`, `plugin list`, `run` and `validate`). When a binary isn't in
+the plugin dir, discovery falls back to `PATH` — this is how the `-bundled`
+image finds its plugins in `/usr/local/bin`. `--index <url>` makes
+`plugin install <name>` (or `--all`) resolve from a non-canonical index.
+
+The installer is **protocol-range-checked** and **sha256-verified**: the index
+points at each version's published `loadsmith-plugin.yaml`; the installer checks
+the plugin's protocol range from that manifest before downloading, then verifies
+the archive against the sha256 listed in the manifest.
 
 For the full command reference, options, and the manifest contract, see the
 engine docs:

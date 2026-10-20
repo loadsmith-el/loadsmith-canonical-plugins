@@ -34,7 +34,7 @@ Both roles accept these. Connection defaults make a local dev DB a one-liner.
 |---|---|---|---|
 | `query` | string | — | Any valid `SELECT` — joins, CTEs, window functions. |
 | `batch_size` | integer | `1000` | Rows per `FETCH FORWARD n`. |
-| `transaction_isolation` | `read-committed` / `repeatable-read` / `serializable` | `read-committed` | Isolation for the cursor transaction. `repeatable-read` gives a consistent snapshot across all `FETCH`es. |
+| `transaction_isolation` | `read-committed` / `repeatable-read` / `serializable` | server default (`BEGIN`; normally `read-committed`) | Isolation for the cursor transaction. `repeatable-read` gives a consistent snapshot across all `FETCH`es. |
 | `incremental` | object | — | Activates incremental reads (below). Requires a pipeline `state:` block. |
 
 The query runs through a server-side cursor (`DECLARE … CURSOR FOR`) in a
@@ -165,6 +165,12 @@ source:
 
 Writes Arrow batches via `COPY` (text format, symmetric with the source's
 text-protocol read path so `NUMERIC`/`TIME`/`TIMESTAMP` round-trip cleanly).
+
+Accepted Arrow input types: `Int32`, `Int64`, `Float32`, `Float64`, `Boolean`,
+`Utf8`/`LargeUtf8`, `Date32`, `Timestamp(ms)` (with or without zone), `Binary`.
+A non-null value of any other type — including `List` (the postgres source's
+mapping of array columns) and non-millisecond timestamps — fails the load. Cast arrays to text in
+the source query (e.g. `col::text`).
 
 | Field | Type | Required | Description |
 |---|---|---|---|

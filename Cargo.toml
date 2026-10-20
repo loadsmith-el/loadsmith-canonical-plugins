@@ -4,7 +4,7 @@
 # provides more than one role). Each member declares its install metadata in
 # `[package.metadata.loadsmith]`; CI builds it per-platform, publishes a GitHub
 # Release, and emits the published `loadsmith-plugin.yaml` (with artifact URLs +
-# checksums) into the index that `loadsmith install` reads.
+# checksums) into the index that `loadsmith plugin install` reads.
 #
 # The SDK crates come from the loadsmith repo as **git deps pinned by rev**
 # (the protocol/SDK is still green — bump the rev here to re-pin every plugin).

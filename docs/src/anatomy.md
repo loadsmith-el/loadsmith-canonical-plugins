@@ -40,6 +40,10 @@ tooling.
 - TLS is done via **`rustls` + `rustls-rustcrypto`** (the pure-Rust crypto
   provider).
 - Never use `native-tls`, `openssl-sys`, `ring`, or `aws-lc-rs`.
+  - Known exception: `oracle`'s `oracledb` beta pulls rustls with default
+    features, so `aws-lc-sys` is compiled (build-time only, never the active
+    provider) until oracle/rust-oracledb#34 lands. Don't add new dependencies
+    like this.
 - `postgres` uses `tokio-postgres-rustls-improved` together with the engine's
   `loadsmith-tls` crate.
 
