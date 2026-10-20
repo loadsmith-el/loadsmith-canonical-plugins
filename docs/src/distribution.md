@@ -4,13 +4,14 @@
 
 The plugin SDK comes from the [`loadsmith`](https://loadsmith-el.github.io/loadsmith/)
 repo as a **git dependency pinned by rev** — `loadsmith-plugin-sdk`,
-`loadsmith-arrow`, and `loadsmith-tls`, set once in the root `Cargo.toml`
-`[workspace.dependencies]`.
+`loadsmith-arrow`, `loadsmith-tls` and `loadsmith-protocol` (the type
+vocabulary of the parsers' declared `columns:`), set once in the root
+`Cargo.toml` `[workspace.dependencies]`.
 
 The SDK crates stay 0.x and are not on crates.io (the engine's
 [Stability Policy](https://loadsmith-el.github.io/loadsmith/reference/stability.html)
 covers the wire protocol, not the Rust APIs), so this is deliberate. To move
-*every* plugin onto a newer SDK, bump the `rev` **there**: the three entries
+*every* plugin onto a newer SDK, bump the `rev` **there**: the four entries
 share one commit, so it is a single substitution
 (`sed -i 's/<old-rev>/<new-rev>/' Cargo.toml`), then `cargo update -p
 loadsmith-plugin-sdk` and commit `Cargo.lock`.
@@ -33,7 +34,10 @@ The `release-plugin.yml` workflow then:
 - builds the plugin natively for `linux/amd64` + `linux/arm64` as **static musl
   binaries** (see below), runs its tests (`cargo test --release`) in the same
   alpine container, and fails if any binary is dynamically linked;
-- packages one archive per arch, named `<name>-<version>-linux-<arch>.tar.gz`;
+- packages one archive per arch, named `<name>-<version>-linux-<arch>.tar.gz`,
+  holding **every** binary the plugin's `provides` lists (`ci/release.py bins`):
+  a multi-kind package such as `file` (provider + source) ships both in one
+  archive, and the installer's `:<kind>` selector picks among them;
 - generates the published `loadsmith-plugin.yaml` (artifact URLs + checksums
   filled in) — the generator is `ci/release.py` (stdlib-only);
 - publishes a per-plugin **GitHub Release** with the archives + sha256 and the
@@ -63,6 +67,13 @@ profile strips the symbol table (`strip = true`), which makes the binaries about
   (if you batched them, delete and re-push individually).
 - **`index.json` is committed by CI** as a `github-actions[bot]` commit per
   release. Run `git pull` before working so your local checkout isn't behind.
+
+### Library members are not released
+
+A workspace member without `[package.metadata.loadsmith]` (the shared
+`tabular` library) is never released on its own: a `tabular-v*` tag fails the
+workflow's first check. It is built into each plugin that depends on it (the
+release builds the tagged plugin's manifest, path dependencies included).
 
 ## What the engine consumes
 

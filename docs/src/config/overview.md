@@ -16,7 +16,7 @@ source:
 ```
 
 The **top-level pipeline shape** (`pipeline` / `providers` / `source` /
-`destination` / `sink` / `state`), the **template syntax** (`{{ env(...) }}`,
+`parser` / `destination` / `sink` / `state`), the **template syntax** (`{{ env(...) }}`,
 `{{ file(...) }}`, `{{ secret(...) }}`), and
 the core-owned **`state:` block** for incremental loads are engine concerns —
 see the engine's [Pipeline YAML
@@ -35,7 +35,9 @@ These pages cover only what goes *inside* each plugin's `config:`.
 | `parquet` | destination | [Parquet](./parquet.md) |
 | `null` | destination | [Null](./null.md) |
 | `local-copy` | sink | [Local-copy](./local-copy.md) |
-| `file` | provider | [File](./file.md) |
+| `file` | source + provider | [File](./file.md) |
+| `csv` | parser | [CSV](./csv.md) |
+| `excel` | parser | [Excel](./excel.md) |
 
 ---
 

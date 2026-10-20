@@ -29,7 +29,13 @@ destination). Each plugin is a self-describing directory:
 | `parquet` | destination |
 | `null` | destination (throughput testing) |
 | `local-copy` | sink |
-| `file` | provider (`secret()` values from local files: whole file or a JSON/YAML key) |
+| `file` | source (raw: lists a local directory for a parser) + provider (`secret()` values from local files) |
+| `csv` | parser (streams CSV files into Arrow) |
+| `excel` | parser (one sheet of xlsx/xlsm/xlsb/xls/ods workbooks into Arrow) |
+
+`tabular` is a shared library (CSV/Excel reading and type inference for
+`sharepoint`, `csv` and `excel`), not a plugin: it has no binary and is never
+released on its own.
 
 ## How a plugin is distributed
 

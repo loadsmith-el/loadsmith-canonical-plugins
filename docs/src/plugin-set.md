@@ -14,7 +14,9 @@ destination).
 | `parquet` | destination | Single-file or chunked Parquet output. |
 | `null` | destination | Discards rows — for read/pump throughput testing. |
 | `local-copy` | sink | Delivers staged files to a local destination directory. |
-| `file` | provider | Resolves `secret()` values from local files: a whole file, or one key of a JSON/YAML document. |
+| `file` | source + provider | Raw source: lists the files of a local directory (glob, optional recursion) for a parser, read in place. Provider: resolves `secret()` values from local files (a whole file, or one key of a JSON/YAML document). |
+| `csv` | parser | Streams CSV files into Arrow: delimiter, encoding, header, type inference from a bounded sample or declared columns. |
+| `excel` | parser | One sheet of each xlsx/xlsm/xlsb/xls/ods workbook into Arrow: sheet by name or index, `skip_rows`, inference or declared columns. |
 
 > **Configuring a plugin?** Every plugin's `config:` fields — connection
 > options, TLS, commit modes, incremental, output paths — are documented in the
@@ -22,10 +24,15 @@ destination).
 
 ## Roles, briefly
 
-Loadsmith plugins fall into four kinds (the engine also reserves a fifth,
-`parser`, which is experimental and not wired yet):
+Loadsmith plugins fall into five kinds:
 
-- **source** — extracts rows and emits them as Apache Arrow batches.
+- **source** — extracts rows and emits them as Apache Arrow batches. A *raw*
+  source (capability `object_output`, e.g. `file`) produces files instead,
+  which a parser turns into rows.
+- **parser** — turns each file a raw source announces into Arrow batches
+  (`csv`, `excel`), so one format parser serves every raw source and one raw
+  source every format. Declared under `parser:`; binary
+  `loadsmith-parser-<type>`.
 - **destination** — receives Arrow batches and writes them out (to a database,
   files, or `/dev/null`).
 - **sink** — takes *staged objects* a destination produced and delivers them to
@@ -52,3 +59,11 @@ copy when adding a new one:
   merged read/write driver (see the engine's *Rejected Ideas*).
 
 See [Plugin Anatomy](./anatomy.md) for the rules every plugin must follow.
+
+## Shared code: `tabular`
+
+`tabular` is a workspace **library**, not a plugin: no binary, no
+`[package.metadata.loadsmith]`, never released. It holds the CSV/Excel
+reading, the cell table and its type inference, and the declared-`columns:`
+handling that `sharepoint`, `csv` and `excel` share, so the three read files
+by the same rules.

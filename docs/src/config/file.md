@@ -1,5 +1,69 @@
 # File (`type: file`)
 
+Local files, in two independent roles:
+
+- a **raw source** that lists the files of a directory for the pipeline's
+  `parser:` (binary `loadsmith-source-file`) — see [Source](#source);
+- a **provider** that resolves `{{ secret('<instance>', '<ref>') }}` values
+  from local files (binary `loadsmith-provider-file`) — see
+  [Provider](#provider).
+
+Install both with `loadsmith plugin install file`, or one with `file:source` /
+`file:provider`.
+
+## Source
+
+A **raw source** (capability `object_output`): it produces files, not rows.
+Each matching file is announced to the core, which hands it to the pipeline's
+[parser](https://loadsmith-el.github.io/loadsmith/plugins/writing-a-parser.html)
+(`csv`, `excel`, …); the parser's Arrow stream goes to the destination. A raw
+source needs a `parser:` block, and a `parser:` needs a raw source (otherwise
+the configuration is rejected, exit `3`).
+
+- Source binary: `loadsmith-source-file`
+
+```yaml
+source:
+  type: file                    # → binary loadsmith-source-file
+  config:
+    path: /mnt/inbox
+    glob: "*.csv"
+    recursive: true
+parser:
+  type: csv                     # → binary loadsmith-parser-csv
+  config: { delimiter: ";" }
+destination:
+  type: postgres
+  config: { … }
+```
+
+### Source config
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | The directory to list. A relative path resolves against the engine's working directory. It must exist and be a directory, or the config is rejected (exit `3`). |
+| `glob` | string | no (default `*`) | A pattern matched against each file's **name**: `*`, `?`, `[abc]`, `[!abc]`. It cannot contain `/`. `*` and `?` do not match a leading `.`: hidden files need a pattern that starts with `.`. |
+| `recursive` | bool | no (default `false`) | Also list the subdirectories, at any depth (hidden directories are skipped). The pattern still matches file names. |
+
+Unknown fields are rejected.
+
+### Behavior
+
+- **Sorted, in place.** The matching regular files (symlinks followed) are
+  announced in sorted path order, so reruns parse them in the same order.
+  Each file is read where it is: nothing is copied, the source asks for no
+  `scratch_dir`, and the core never deletes the files.
+- **Listed once.** The directory is listed when the run starts reading;
+  files that appear later are not part of this run.
+- **Errors.** A directory (or, with `recursive`, a subdirectory) that cannot
+  be read fails the run (`OBJECT_FAILED`, exit `1`). No matching file is not
+  an error: the parser decides what zero files means (an empty load when it
+  declares its columns, `NO_INPUT` otherwise).
+- **No incremental loads.** A `parser:` cannot be combined with `state:` in
+  engine 1.0, so each run lists and loads every matching file.
+
+## Provider
+
 A **provider**: it resolves `{{ secret('<instance>', '<ref>') }}` values from
 local files — a whole file, or one key of a JSON or YAML document. See the
 engine's [`providers:` block](https://loadsmith-el.github.io/loadsmith/reference/pipeline-yaml.html#providers)
@@ -29,7 +93,7 @@ source:
       root_cert: "{{ secret('creds', '/etc/ssl/certs/ca.pem') }}"
 ```
 
-## Config
+### Provider config
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -37,7 +101,7 @@ source:
 
 The `config:` block may be omitted entirely. Unknown fields are rejected.
 
-## References
+### References
 
 A reference is `path[#key]`:
 
@@ -57,7 +121,7 @@ A reference is `path[#key]`:
 - The path is everything before the first `#`. A key segment cannot contain a
   `.`.
 
-## Errors
+### Errors
 
 A reference that cannot be resolved fails the run (exit `3`), naming the
 instance and the reference. The `resolved` error codes:
@@ -74,7 +138,7 @@ and, for a parse error, only the line and column (never the parser's text,
 which could quote the document). The core masks every resolved value in its
 own output as well.
 
-## Migrating from 0.1.x
+### Migrating from 0.1.x
 
 0.1.x was a `config-provider` (binary `loadsmith-config-provider-file`, config
 `uri: file://…`) that no engine ever invoked. 0.2.0 is a `provider`: replace
