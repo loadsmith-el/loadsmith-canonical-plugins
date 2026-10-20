@@ -224,6 +224,12 @@ mod tests {
     }
 
     #[test]
+    fn empty_lines_are_skipped() {
+        let (_, batches) = read_all(b"a,b\n\n1,2\n\n3,4\n", &opts(json!({}))).unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+    }
+
+    #[test]
     fn delimiter_and_quoting() {
         let csv = b"a|b\n\"x|y\"|\"say \"\"hi\"\"\"\n";
         let (_, batches) = read_all(csv, &opts(json!({"delimiter": "|"}))).unwrap();

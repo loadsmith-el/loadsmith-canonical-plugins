@@ -90,6 +90,14 @@ fn parse_datetime(t: &str) -> Option<NaiveDateTime> {
     DATETIME_FORMATS.iter().find_map(|f| NaiveDateTime::parse_from_str(t, f).ok())
 }
 
+/// A date-time with an offset (`…Z`, `…+02:00`), as UTC.
+fn parse_datetime_offset(t: &str) -> Option<NaiveDateTime> {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .or_else(|_| chrono::DateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f%:z"))
+        .ok()
+        .map(|dt| dt.naive_utc())
+}
+
 fn parse_bool(t: &str) -> Option<bool> {
     match t.to_ascii_lowercase().as_str() {
         "true" | "t" | "1" => Some(true),
@@ -215,6 +223,7 @@ fn text_array(values: &[Option<&str>], dt: &DataType) -> Result<ArrayRef, (usize
             .map(|d| d.signed_duration_since(epoch).num_days() as i32)),
         DataType::Timestamp(TimeUnit::Millisecond, None) => {
             typed!(TimestampMillisecondBuilder::with_capacity(values.len()), |t: &str| parse_datetime(t)
+                .or_else(|| parse_datetime_offset(t))
                 .or_else(|| parse_date(t).and_then(|d| d.and_hms_opt(0, 0, 0)))
                 .map(|dt| dt.and_utc().timestamp_millis()))
         }
@@ -337,5 +346,17 @@ mod tests {
         assert_eq!(b.column(3).as_primitive::<arrow_array::types::Date32Type>().value(0), 1);
         assert_eq!(b.column(4).as_primitive::<arrow_array::types::TimestampMillisecondType>().value(0), 1500);
         assert_eq!(b.column(5).as_string::<i32>().value(0), " padded ");
+    }
+
+    #[test]
+    fn timestamps_with_an_offset_are_stored_as_utc() {
+        let ms = Arc::new(Schema::new(vec![Field::new("t", DataType::Timestamp(TimeUnit::Millisecond, None), true)]));
+        let us = Arc::new(Schema::new(vec![Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), true)]));
+        for v in ["1970-01-01T01:00:01+01:00", "1970-01-01 00:00:01Z", "1970-01-01 01:00:01+01:00"] {
+            let b = text_batch(&ms, &[vec![Some(v)]]).unwrap();
+            assert_eq!(b.column(0).as_primitive::<arrow_array::types::TimestampMillisecondType>().value(0), 1000, "{v}");
+            let b = text_batch(&us, &[vec![Some(v)]]).unwrap();
+            assert_eq!(b.column(0).as_primitive::<arrow_array::types::TimestampMicrosecondType>().value(0), 1_000_000, "{v}");
+        }
     }
 }
