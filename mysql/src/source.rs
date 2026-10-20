@@ -152,7 +152,9 @@ impl SourcePlugin for MysqlSourcePlugin {
         self.last_cursor_value.clone().map(serde_json::Value::String)
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         let cfg: MysqlConfig =
             serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid mysql source config: {e}"))?;
 

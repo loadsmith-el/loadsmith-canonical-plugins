@@ -49,7 +49,9 @@ impl ProviderPlugin for FileProvider {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         let cfg: FileConfig = if config.is_null() {
             FileConfig::default()
         } else {
@@ -341,17 +343,17 @@ mod tests {
     async fn configure_accepts_no_config_and_validates_base_dir() {
         let s = Scratch::new("configure");
         let mut p = FileProvider::default();
-        p.configure(Value::Null).await.unwrap();
-        p.configure(serde_json::json!({})).await.unwrap();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(Value::Null, loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({}), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
         assert!(p.base_dir.is_none());
 
-        p.configure(serde_json::json!({ "base_dir": s.0 })).await.unwrap();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "base_dir": s.0 }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
         assert_eq!(p.base_dir.as_deref(), Some(s.0.as_path()));
 
         let file = s.write("f", "x");
-        assert!(p.configure(serde_json::json!({ "base_dir": file })).await.is_err());
-        assert!(p.configure(serde_json::json!({ "base_dir": s.0.join("nope") })).await.is_err());
-        assert!(p.configure(serde_json::json!({ "uri": "file:///x" })).await.is_err());
+        assert!(p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "base_dir": file }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.is_err());
+        assert!(p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "base_dir": s.0.join("nope") }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.is_err());
+        assert!(p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "uri": "file:///x" }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.is_err());
     }
 
     #[tokio::test]
@@ -359,7 +361,7 @@ mod tests {
         let s = Scratch::new("trait");
         s.write("token", SECRET);
         let mut p = FileProvider::default();
-        p.configure(serde_json::json!({ "base_dir": s.0 })).await.unwrap();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "base_dir": s.0 }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
         assert_eq!(p.resolve("token").await.unwrap(), SECRET);
         let e = p.resolve("absent").await.unwrap_err();
         let failure = e.downcast_ref::<ResolveFailure>().expect("a ResolveFailure");

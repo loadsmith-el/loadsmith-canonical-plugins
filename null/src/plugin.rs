@@ -28,7 +28,7 @@ impl DestinationPlugin for NullPlugin {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, _config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, _config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
         // No configuration: the null sink takes nothing and ignores any config.
         Ok(())
     }

@@ -191,7 +191,9 @@ impl ParserPlugin for ExcelParser {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         self.opts = ExcelOptions::from_config(config)?;
         Ok(())
     }

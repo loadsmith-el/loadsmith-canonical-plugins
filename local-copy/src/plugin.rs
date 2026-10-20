@@ -50,7 +50,9 @@ impl SinkPlugin for LocalCopyPlugin {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         let cfg: LocalCopyConfig =
             serde_json::from_value(config).context("invalid local-copy sink config")?;
         // Create the destination directory up front so delivery is just a copy.
@@ -125,7 +127,7 @@ mod tests {
         std::fs::write(&src_file, b"hello").unwrap();
 
         let mut p = LocalCopyPlugin::new();
-        p.configure(serde_json::json!({ "dest": dst_dir.to_string_lossy() })).await.unwrap();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "dest": dst_dir.to_string_lossy() }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
         p.deliver(src_file).await.unwrap();
 
         let copied = dst_dir.join("part.0001.parquet");
@@ -145,7 +147,7 @@ mod tests {
         std::fs::write(&src_file, b"data").unwrap();
 
         let mut p = LocalCopyPlugin::new();
-        p.configure(serde_json::json!({ "dest": dst_dir.to_string_lossy() })).await.unwrap();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "dest": dst_dir.to_string_lossy() }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
         p.deliver(src_file.clone()).await.unwrap();
         p.deliver(src_file).await.unwrap(); // same path again — must not error
 

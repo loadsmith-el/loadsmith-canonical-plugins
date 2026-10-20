@@ -37,7 +37,7 @@ async fn file_mode_csv_end_to_end() {
     });
 
     let mut plugin = SharepointSourcePlugin::new();
-    plugin.configure(cfg).await.expect("configure failed");
+    plugin.configure(loadsmith_plugin_sdk::PluginConfig::new(cfg, loadsmith_plugin_sdk::UnknownKeys::Error)).await.expect("configure failed");
 
     let schema = plugin.schema().await.unwrap();
     assert_eq!(schema.fields().len(), 2);
@@ -97,7 +97,7 @@ async fn list_mode_paginates() {
     });
 
     let mut plugin = SharepointSourcePlugin::new();
-    plugin.configure(cfg).await.expect("configure failed");
+    plugin.configure(loadsmith_plugin_sdk::PluginConfig::new(cfg, loadsmith_plugin_sdk::UnknownKeys::Error)).await.expect("configure failed");
 
     let schema = plugin.schema().await.unwrap();
     assert_eq!(schema.field(0).name(), "Title");

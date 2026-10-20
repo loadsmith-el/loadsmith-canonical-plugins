@@ -53,7 +53,9 @@ impl DestinationPlugin for JsonlPlugin {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         let cfg: JsonlConfig =
             serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid jsonl destination config: {e}"))?;
         self.config = Some(cfg);
@@ -126,7 +128,7 @@ mod tests {
 
     async fn started(path: &std::path::Path) -> JsonlPlugin {
         let mut p = JsonlPlugin::new();
-        p.configure(serde_json::json!({ "path": path })).await.unwrap();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "path": path }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
         p.prepare().await.unwrap();
         p.write_batch(batch()).await.unwrap();
         p

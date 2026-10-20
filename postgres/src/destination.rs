@@ -87,7 +87,9 @@ impl DestinationPlugin for PostgresDestPlugin {
         vec!["batch_write".into(), "staged_merge".into()]
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         let cfg: PostgresDestConfig =
             serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid postgres destination config: {e}"))?;
         if cfg.mode == CommitMode::StagedMerge && cfg.merge_key.is_empty() {
@@ -220,18 +222,18 @@ mod tests {
         let mut p = PostgresDestPlugin::new();
         // staged_merge without a key is rejected at configure().
         let err = p
-            .configure(serde_json::json!({
+            .configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({
                 "dbname": "d", "user": "u", "password": "p",
                 "target_table": "events", "mode": "staged_merge"
-            }))
+            }), loadsmith_plugin_sdk::UnknownKeys::Error))
             .await;
         assert!(err.is_err());
         // A valid staged_merge config with a key passes.
         assert!(p
-            .configure(serde_json::json!({
+            .configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({
                 "dbname": "d", "user": "u", "password": "p",
                 "target_table": "events", "mode": "staged_merge", "merge_key": ["id"]
-            }))
+            }), loadsmith_plugin_sdk::UnknownKeys::Error))
             .await
             .is_ok());
     }

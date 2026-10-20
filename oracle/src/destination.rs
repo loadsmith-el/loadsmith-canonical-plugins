@@ -110,7 +110,9 @@ impl DestinationPlugin for OracleDestPlugin {
         vec!["batch_write".into(), "staged_merge".into()]
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         let cfg: OracleDestConfig =
             serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid oracle destination config: {e}"))?;
         if cfg.mode == CommitMode::StagedMerge && cfg.merge_key.is_empty() {
@@ -308,17 +310,17 @@ mod tests {
     async fn config_requires_merge_key_for_staged_merge() {
         let mut p = OracleDestPlugin::new();
         assert!(p
-            .configure(serde_json::json!({
+            .configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({
                 "service_name": "S", "user": "u", "password": "p",
                 "target_table": "events", "mode": "staged_merge"
-            }))
+            }), loadsmith_plugin_sdk::UnknownKeys::Error))
             .await
             .is_err());
         assert!(p
-            .configure(serde_json::json!({
+            .configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({
                 "service_name": "S", "user": "u", "password": "p",
                 "target_table": "events", "mode": "staged_merge", "merge_key": ["id"]
-            }))
+            }), loadsmith_plugin_sdk::UnknownKeys::Error))
             .await
             .is_ok());
     }

@@ -50,7 +50,7 @@ fn source_config(query: &str) -> serde_json::Value {
 #[ignore = "needs a live Oracle"]
 async fn reads_full_wide_table() {
     let mut src = OracleSourcePlugin::new();
-    src.configure(source_config("SELECT * FROM spacecraft_telemetry_events"))
+    src.configure(loadsmith_plugin_sdk::PluginConfig::new(source_config("SELECT * FROM spacecraft_telemetry_events"), loadsmith_plugin_sdk::UnknownKeys::Error))
         .await
         .expect("configure");
 
@@ -66,7 +66,7 @@ async fn reads_full_wide_table() {
 #[ignore = "needs a live Oracle"]
 async fn schema_has_all_columns() {
     let mut src = OracleSourcePlugin::new();
-    src.configure(source_config("SELECT * FROM spacecraft_telemetry_events"))
+    src.configure(loadsmith_plugin_sdk::PluginConfig::new(source_config("SELECT * FROM spacecraft_telemetry_events"), loadsmith_plugin_sdk::UnknownKeys::Error))
         .await
         .expect("configure");
     let schema = src.schema().await.expect("schema");

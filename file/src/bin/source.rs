@@ -123,7 +123,9 @@ impl ObjectSourcePlugin for FileSource {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: Value) -> Result<()> {
+    async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
+        let config = config.into_value();
         self.listing = Some(Listing::from_config(config)?);
         Ok(())
     }
@@ -242,7 +244,7 @@ mod tests {
         d.touch("b.csv");
         d.touch("a.csv");
         let mut src = FileSource::default();
-        src.configure(json!({"path": d.0, "glob": "*.csv"})).await.unwrap();
+        src.configure(loadsmith_plugin_sdk::PluginConfig::new(json!({"path": d.0, "glob": "*.csv"}), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
         assert_eq!(src.next_object().await.unwrap(), Some(d.0.join("a.csv")));
         assert_eq!(src.next_object().await.unwrap(), Some(d.0.join("b.csv")));
         assert_eq!(src.next_object().await.unwrap(), None);
