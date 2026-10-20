@@ -91,7 +91,7 @@ impl OracleDestPlugin {
     fn bind_expr(&self, col: &str, idx: usize) -> String {
         let placeholder = format!(":{idx}");
         match self.target_types.get(&col.to_uppercase()) {
-            Some(t) => typed_expr(&placeholder, *t),
+            Some(t) => typed_expr(&placeholder, t),
             None => placeholder,
         }
     }

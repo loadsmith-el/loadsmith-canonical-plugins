@@ -48,7 +48,7 @@ pub fn oracle_to_arrow(t: &DbType) -> DataType {
 /// `DbType` only derives `PartialEq` (no structural match), so type tests are
 /// done by comparison against the driver's `DB_TYPE_*` constants.
 fn is_one_of(t: &DbType, set: &[&DbType]) -> bool {
-    set.iter().any(|s| t == *s)
+    set.contains(&t)
 }
 
 /// Whether a column must be read through `TO_CHAR`. Returns the `TO_CHAR(...)`
