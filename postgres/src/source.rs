@@ -287,9 +287,12 @@ impl SourcePlugin for PostgresSourcePlugin {
         // The SDK may have dropped an in-flight `next_batch` before calling
         // this; its FETCH still runs server-side, and this ROLLBACK queues
         // behind it. Wait briefly, then drop the client: the server rolls the
-        // (read-only) transaction back when the connection closes.
+        // (read-only) transaction back when the connection closes. A bare
+        // ROLLBACK also closes the cursor, and unlike `CLOSE …; ROLLBACK` it
+        // still runs when the transaction is already aborted or the cursor was
+        // never declared.
         if let Some(client) = self.client.take() {
-            let rollback = client.batch_execute("CLOSE ls_cursor; ROLLBACK");
+            let rollback = client.batch_execute("ROLLBACK");
             let _ = tokio::time::timeout(CANCEL_ROLLBACK_TIMEOUT, rollback).await;
         }
     }
