@@ -2,7 +2,7 @@
 //! (at most `infer_rows` records, emitted first) and one batch, never the
 //! file.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use csv::StringRecord;
 use encoding_rs_io::{DecodeReaderBytes, DecodeReaderBytesBuilder};
 use tabular::table::infer_type;
-use tabular::typed::{infer_cell, text_batch};
+use tabular::typed::{header_names, infer_cell, text_batch};
 
 use crate::options::CsvOptions;
 
@@ -77,7 +77,7 @@ impl<R: Read> CsvReader<R> {
             (None, None) => bail!("the file is empty: there is no record to infer columns from"),
         };
         let names = match &header {
-            Some(h) => header_names(h)?,
+            Some(h) => header_names(h.iter())?,
             None => (0..width).map(|i| format!("col_{i}")).collect(),
         };
         let fields: Vec<Field> = names
@@ -155,21 +155,6 @@ fn check_width(rec: &StringRecord, width: usize) -> Result<()> {
         bail!("line {}: {} fields, expected {width}", line(rec), rec.len());
     }
     Ok(())
-}
-
-/// Column names from the header: a blank one becomes `col_<i>`; duplicates
-/// are an error.
-fn header_names(h: &StringRecord) -> Result<Vec<String>> {
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut out = Vec::with_capacity(h.len());
-    for (i, name) in h.iter().enumerate() {
-        let name = if name.trim().is_empty() { format!("col_{i}") } else { name.to_string() };
-        if let Some(first) = seen.insert(name.clone(), i + 1) {
-            bail!("columns {first} and {} are both named `{name}` in the header", i + 1);
-        }
-        out.push(name);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

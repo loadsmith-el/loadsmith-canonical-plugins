@@ -123,6 +123,21 @@ pub fn infer_cell(s: &str) -> Cell {
     }
 }
 
+/// Column names from a header row, as the parsers use them: a blank name
+/// becomes `col_<i>` (0-based), and two columns with one name are an error.
+pub fn header_names<'a>(header: impl IntoIterator<Item = &'a str>) -> Result<Vec<String>> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::new();
+    for (i, name) in header.into_iter().enumerate() {
+        let name = if name.trim().is_empty() { format!("col_{i}") } else { name.to_string() };
+        if let Some(first) = seen.insert(name.clone(), i + 1) {
+            bail!("columns {first} and {} are both named `{name}` in the header", i + 1);
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
 /// A cell that does not fit its column's type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellError {
@@ -269,6 +284,12 @@ mod tests {
         assert_eq!(col(&["2024-01-02 03:04:05", "2024-01-02T03:04:05.250"]), DataType::Timestamp(TimeUnit::Millisecond, None));
         assert_eq!(col(&["1", "x"]), DataType::Utf8);
         assert_eq!(col(&["", ""]), DataType::Utf8);
+    }
+
+    #[test]
+    fn header_names_fill_blanks_and_reject_duplicates() {
+        assert_eq!(header_names(["a", " ", "c"]).unwrap(), ["a", "col_1", "c"]);
+        assert!(header_names(["a", "b", "a"]).unwrap_err().to_string().contains("columns 1 and 3 are both named `a`"));
     }
 
     #[test]

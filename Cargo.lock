@@ -2461,6 +2461,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "loadsmith-parser-excel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "loadsmith-plugin-sdk",
+ "mimalloc",
+ "rust_xlsxwriter",
+ "serde",
+ "serde_json",
+ "tabular",
+ "tokio",
+]
+
+[[package]]
 name = "loadsmith-plugin-sdk"
 version = "0.1.0"
 source = "git+https://github.com/loadsmith-el/loadsmith?rev=76483680061fc854caaf6513fd8b5d59828f65f2#76483680061fc854caaf6513fd8b5d59828f65f2"

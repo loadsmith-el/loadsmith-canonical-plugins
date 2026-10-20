@@ -25,6 +25,7 @@ members = [
     "oracle",
     "tabular",
     "csv",
+    "excel",
 ]
 
 [workspace.package]

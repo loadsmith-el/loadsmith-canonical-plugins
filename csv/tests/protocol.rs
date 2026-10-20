@@ -47,10 +47,19 @@ fn run(dir: &Path, config: &str, paths: &[String]) -> Run {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_loadsmith-parser-csv"));
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-    // SAFETY: dup2 is async-signal-safe; it runs in the child before exec.
+    // SAFETY: fcntl and dup2 are async-signal-safe; this runs in the child
+    // before exec. Tests run in parallel, so either file may already sit at
+    // fd 3 or 4: move both above them first, then onto 3 and 4 (dup2 to
+    // another number also clears close-on-exec).
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(data_fd, 3) < 0 || libc::dup2(events_fd, 4) < 0 {
+            let high_data = libc::fcntl(data_fd, libc::F_DUPFD, 10);
+            let high_events = libc::fcntl(events_fd, libc::F_DUPFD, 10);
+            if high_data < 0
+                || high_events < 0
+                || libc::dup2(high_data, 3) < 0
+                || libc::dup2(high_events, 4) < 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

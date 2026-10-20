@@ -1,0 +1,38 @@
+[package]
+name    = "loadsmith-parser-excel"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# A parser: turns the spreadsheets a raw source (e.g. `file`) announces into
+# one Arrow stream. A workbook is a zip archive, read whole per file (calamine);
+# batches are then cut from the selected sheet.
+[package.metadata.loadsmith]
+name     = "excel"
+summary  = "Excel parser — reads one sheet of xlsx/xlsm/xlsb/xls/ods workbooks into Arrow"
+protocol = "^1"
+provides = [
+    { kind = "parser", bin = "loadsmith-parser-excel" },
+]
+
+[lib]
+name = "loadsmith_parser_excel"
+
+[[bin]]
+name = "loadsmith-parser-excel"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+arrow-array          = { workspace = true }
+arrow-schema         = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }
+mimalloc             = { workspace = true }
+tabular              = { path = "../tabular" }
+
+[dev-dependencies]
+rust_xlsxwriter = "0.99"
