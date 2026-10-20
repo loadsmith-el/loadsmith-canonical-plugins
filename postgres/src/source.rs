@@ -54,6 +54,9 @@ fn default_batch_size() -> usize {
     1000
 }
 
+/// Upper bound on the cleanup in `cancel()`.
+const CANCEL_ROLLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct PostgresSourcePlugin {
@@ -281,8 +284,13 @@ impl SourcePlugin for PostgresSourcePlugin {
     }
 
     async fn cancel(&mut self) {
-        if let Some(client) = &self.client {
-            let _ = client.batch_execute("CLOSE ls_cursor; ROLLBACK").await;
+        // The SDK may have dropped an in-flight `next_batch` before calling
+        // this; its FETCH still runs server-side, and this ROLLBACK queues
+        // behind it. Wait briefly, then drop the client: the server rolls the
+        // (read-only) transaction back when the connection closes.
+        if let Some(client) = self.client.take() {
+            let rollback = client.batch_execute("CLOSE ls_cursor; ROLLBACK");
+            let _ = tokio::time::timeout(CANCEL_ROLLBACK_TIMEOUT, rollback).await;
         }
     }
 }
