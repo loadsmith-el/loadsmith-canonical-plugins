@@ -94,6 +94,60 @@ impl DestinationPlugin for JsonlPlugin {
     }
 
     async fn cancel(&mut self) {
-        let _ = self.output.as_mut().map(|o| o.flush());
+        // The run will not complete: never leave a partial file that looks
+        // like a finished export. Close it (unflushed) and remove it.
+        // Stdout output cannot be taken back.
+        if let Some(Output::File(_)) = self.output.take() {
+            if let Some(path) = self.config.as_ref().and_then(|c| c.path.as_ref()) {
+                if let Err(e) = std::fs::remove_file(path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!("cannot remove partial output {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array};
+    use std::sync::Arc;
+
+    fn batch() -> RecordBatch {
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        RecordBatch::try_from_iter([("id", ids)]).unwrap()
+    }
+
+    fn out_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("loadsmith-jsonl-{name}-{}.jsonl", std::process::id()))
+    }
+
+    async fn started(path: &std::path::Path) -> JsonlPlugin {
+        let mut p = JsonlPlugin::new();
+        p.configure(serde_json::json!({ "path": path })).await.unwrap();
+        p.prepare().await.unwrap();
+        p.write_batch(batch()).await.unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_the_partial_file() {
+        let path = out_path("cancel");
+        let mut p = started(&path).await;
+        assert!(path.exists());
+        p.cancel().await;
+        assert!(!path.exists(), "partial output must be deleted on cancel");
+    }
+
+    #[tokio::test]
+    async fn finalize_keeps_the_file() {
+        let path = out_path("finalize");
+        let mut p = started(&path).await;
+        assert_eq!(p.finalize().await.unwrap(), 3);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(text.lines().count(), 3);
     }
 }
