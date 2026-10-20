@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-destination-jsonl"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-destination-null"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-destination-parquet"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2368,7 +2368,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-mysql"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-oracle"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-postgres"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-sharepoint"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-sink-local-copy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
