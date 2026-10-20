@@ -1,0 +1,42 @@
+[package]
+name    = "loadsmith-parser-csv"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# A parser: turns the CSV files a raw source (e.g. `file`) announces into one
+# Arrow stream. It streams each file (one batch in memory, plus the bounded
+# inference sample), never loads it whole.
+[package.metadata.loadsmith]
+name     = "csv"
+summary  = "CSV parser — streams delimited text files into Arrow (type inference or declared columns)"
+protocol = "^1"
+provides = [
+    { kind = "parser", bin = "loadsmith-parser-csv" },
+]
+
+[lib]
+name = "loadsmith_parser_csv"
+
+[[bin]]
+name = "loadsmith-parser-csv"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+arrow-array          = { workspace = true }
+arrow-schema         = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }
+mimalloc             = { workspace = true }
+tabular              = { path = "../tabular" }
+csv                  = "1.3"
+encoding_rs          = "0.8"
+encoding_rs_io       = "0.1"
+
+[dev-dependencies]
+loadsmith-arrow      = { workspace = true }
+libc                 = "0.2"
