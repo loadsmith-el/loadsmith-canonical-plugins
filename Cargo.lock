@@ -2306,7 +2306,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "loadsmith-arrow"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=76483680061fc854caaf6513fd8b5d59828f65f2#76483680061fc854caaf6513fd8b5d59828f65f2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2412,7 +2412,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=76483680061fc854caaf6513fd8b5d59828f65f2#76483680061fc854caaf6513fd8b5d59828f65f2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2454,7 +2454,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-protocol"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=76483680061fc854caaf6513fd8b5d59828f65f2#76483680061fc854caaf6513fd8b5d59828f65f2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2518,7 +2518,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-tls"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=76483680061fc854caaf6513fd8b5d59828f65f2#76483680061fc854caaf6513fd8b5d59828f65f2"
 dependencies = [
  "anyhow",
  "rustls",
@@ -2530,7 +2530,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-transport"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=76483680061fc854caaf6513fd8b5d59828f65f2#76483680061fc854caaf6513fd8b5d59828f65f2"
 dependencies = [
  "loadsmith-arrow",
  "loadsmith-protocol",
