@@ -1628,6 +1628,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "gloo-timers"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2367,6 +2373,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "loadsmith-file"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "glob",
+ "loadsmith-plugin-sdk",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "loadsmith-mysql"
 version = "0.2.0"
 dependencies = [
@@ -2458,20 +2479,6 @@ source = "git+https://github.com/loadsmith-el/loadsmith?rev=76483680061fc854caaf
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "loadsmith-provider-file"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "loadsmith-plugin-sdk",
- "mimalloc",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
 ]
 
 [[package]]

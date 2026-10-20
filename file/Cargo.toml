@@ -1,5 +1,5 @@
 [package]
-name    = "loadsmith-provider-file"
+name    = "loadsmith-file"
 version = "0.2.0"
 edition = "2021"
 license.workspace = true
@@ -7,17 +7,25 @@ license.workspace = true
 # Install metadata read by the loadsmith-canonical-plugins CI to emit the
 # published `loadsmith-plugin.yaml`. `version` above is the single source of
 # truth; the CI fills in per-platform artifact URLs + sha256 at release time.
+#
+# Two independent binaries in one package: a provider (secret() values from
+# local files) and a raw source (lists local files for a parser).
 [package.metadata.loadsmith]
 name     = "file"
-summary  = "File provider — resolves secret() values from local files (whole file or a JSON/YAML key)"
+summary  = "Local files — a provider (secret() values from files) and a raw source (lists a directory for a parser)"
 protocol = "^1"
 provides = [
     { kind = "provider", bin = "loadsmith-provider-file" },
+    { kind = "source",   bin = "loadsmith-source-file" },
 ]
 
 [[bin]]
 name = "loadsmith-provider-file"
-path = "src/main.rs"
+path = "src/bin/provider.rs"
+
+[[bin]]
+name = "loadsmith-source-file"
+path = "src/bin/source.rs"
 
 [dependencies]
 tokio                = { workspace = true }
@@ -28,3 +36,4 @@ serde_yaml           = { workspace = true }
 async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { workspace = true }
 mimalloc             = { workspace = true }
+glob                 = "0.3"
