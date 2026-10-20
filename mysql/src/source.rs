@@ -41,6 +41,9 @@ fn default_batch_size() -> usize {
     1000
 }
 
+/// Upper bound on the polite disconnect in `cancel()`.
+const CANCEL_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 /// MySQL source.
@@ -203,8 +206,13 @@ impl SourcePlugin for MysqlSourcePlugin {
     }
 
     async fn cancel(&mut self) {
+        // The SDK may have dropped an in-flight `next_batch` (the buffered
+        // query) before calling this, leaving the connection mid-result. A
+        // polite COM_QUIT is worth a short wait, never more: on timeout the
+        // connection is dropped, and the server ends the session when the
+        // socket closes.
         if let Some(conn) = self.conn.take() {
-            let _ = conn.disconnect().await;
+            let _ = tokio::time::timeout(CANCEL_DISCONNECT_TIMEOUT, conn.disconnect()).await;
         }
     }
 }
