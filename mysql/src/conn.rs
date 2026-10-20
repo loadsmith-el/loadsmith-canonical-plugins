@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use loadsmith_tls::{TlsConfig, TlsMode};
+use crate::vocab::{TlsBlock, TlsMode};
 use mysql_async::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts};
 use serde::Deserialize;
 
@@ -34,7 +34,7 @@ pub struct ConnectionConfig {
     pub user: String,
     pub password: String,
 
-    pub tls: Option<TlsConfig>,
+    pub tls: Option<TlsBlock>,
 
     /// Duration string ("10s", "500ms", "2m"); applied as the session
     /// `max_execution_time` (milliseconds) — MySQL's per-statement read timeout.
@@ -86,9 +86,9 @@ fn dur_err(s: &str) -> anyhow::Error {
 
 // ── TLS mapping ───────────────────────────────────────────────────────────────
 
-/// Maps the generic [`TlsConfig`] onto `mysql_async`'s [`SslOpts`]. Returns
+/// Maps the generic [`TlsBlock`] onto `mysql_async`'s [`SslOpts`]. Returns
 /// `None` for [`TlsMode::Disable`] (plain connection).
-fn ssl_opts(cfg: &TlsConfig) -> Result<Option<SslOpts>> {
+fn ssl_opts(cfg: &TlsBlock) -> Result<Option<SslOpts>> {
     let opts = match cfg.mode {
         TlsMode::Disable => return Ok(None),
         // Encrypt-only: no chain or hostname checks (mirrors loadsmith-tls's
@@ -112,7 +112,7 @@ fn ssl_opts(cfg: &TlsConfig) -> Result<Option<SslOpts>> {
 }
 
 /// Adds mTLS client identity when both `client_cert` and `client_key` are set.
-fn with_client_identity(opts: SslOpts, cfg: &TlsConfig) -> Result<SslOpts> {
+fn with_client_identity(opts: SslOpts, cfg: &TlsBlock) -> Result<SslOpts> {
     match (&cfg.client_cert, &cfg.client_key) {
         (Some(cert), Some(key)) => Ok(opts.with_client_identity(Some(ClientIdentity::new(
             cert.clone().into_bytes().into(),
@@ -194,25 +194,25 @@ mod tests {
 
     #[test]
     fn ssl_disable_is_none() {
-        let cfg = TlsConfig { mode: TlsMode::Disable, ..Default::default() };
+        let cfg = TlsBlock { mode: TlsMode::Disable, ..Default::default() };
         assert!(ssl_opts(&cfg).unwrap().is_none());
     }
 
     #[test]
     fn ssl_require_is_some() {
-        let cfg = TlsConfig { mode: TlsMode::Require, ..Default::default() };
+        let cfg = TlsBlock { mode: TlsMode::Require, ..Default::default() };
         assert!(ssl_opts(&cfg).unwrap().is_some());
     }
 
     #[test]
     fn ssl_verify_ca_requires_root_cert() {
-        let cfg = TlsConfig { mode: TlsMode::VerifyCa, ..Default::default() };
+        let cfg = TlsBlock { mode: TlsMode::VerifyCa, ..Default::default() };
         assert!(ssl_opts(&cfg).is_err());
     }
 
     #[test]
     fn ssl_client_identity_requires_both() {
-        let cfg = TlsConfig {
+        let cfg = TlsBlock {
             mode: TlsMode::Require,
             client_cert: Some("PEM".into()),
             ..Default::default()

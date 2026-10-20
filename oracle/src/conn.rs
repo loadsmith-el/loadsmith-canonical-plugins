@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use loadsmith_tls::TlsMode;
+use crate::vocab::TlsMode;
 use oracledb::Connection;
 use serde::Deserialize;
 
@@ -116,10 +116,10 @@ impl TlsConfig {
                 Ok(true)
             }
             TlsMode::Prefer | TlsMode::Require | TlsMode::VerifyCa => bail!(
-                "oracle tls: mode {:?} is not supported: the oracledb thin driver always \
+                "oracle tls: mode `{}` is not supported: the oracledb thin driver always \
                  verifies the certificate chain and host name. Use `verify-full` (with \
                  `root_cert` for a private CA) or `disable`",
-                self.mode
+                self.mode.as_str()
             ),
         }
     }

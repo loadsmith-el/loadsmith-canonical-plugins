@@ -9,22 +9,37 @@ use serde::Deserialize;
 
 use crate::conn::ConnectionConfig;
 use crate::types::{cell_to_bind, fold_ident, quote_ident, typed_expr, Bind};
+use crate::vocab::config_enum;
 
-#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum CommitMode {
-    /// One transaction for the whole load; array-`INSERT` straight into the
-    /// target, `COMMIT` at the end. All-or-nothing, at-least-once.
-    #[default]
-    Atomic,
-    /// Bulk-load into a session-private global temporary staging table, then a
-    /// single set-based `MERGE` from staging into the target by `merge_key`
-    /// (`WHEN MATCHED` update / `WHEN NOT MATCHED` insert), `COMMIT` at the end.
-    /// Idempotent by the key ⇒ exactly-once effective. The staging insert is the
-    /// same fast array-DML as `Atomic`, and the optimizer plans the one MERGE
-    /// against the real staging cardinality — unlike a per-row `MERGE … FROM
-    /// dual`, whose empty-target plan degrades to O(n²) as the target fills.
-    StagedMerge,
+/// Load-order column of the staging table: the last row of a key wins.
+const STAGING_SEQ: &str = "_LS_SEQ";
+
+config_enum! {
+    /// How the load changes the target table. Every mode is one transaction,
+    /// committed at the end of the load.
+    #[derive(Default)]
+    enum WriteMode for "mode" {
+        /// Array-`INSERT` straight into the target. At-least-once with
+        /// incremental state.
+        #[default]
+        Append = "append",
+        /// `DELETE` every row of the target, then array-`INSERT`: the table's
+        /// contents are replaced by the load's rows, atomically.
+        Overwrite = "overwrite",
+        /// Bulk-load into a session-private global temporary staging table, then
+        /// a single set-based `MERGE` from staging into the target by
+        /// `merge_key`. Idempotent by the key ⇒ exactly-once effective. The
+        /// staging insert is the same fast array-DML as `append`, and the
+        /// optimizer plans the one MERGE against the real staging cardinality.
+        Merge = "merge",
+    }
+    retired {
+        "atomic" => "append",
+        "staged_merge" => "merge",
+        "upsert" => "merge",
+        "replace" => "overwrite",
+        "truncate" => "overwrite",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,11 +50,40 @@ struct OracleDestConfig {
     /// Target table.
     target_table: String,
     #[serde(default)]
-    mode: CommitMode,
-    /// Key columns for `staged_merge`'s `ON (...)` match. Must be a unique key
-    /// on the target.
+    mode: WriteMode,
+    /// `merge`: the key columns of the `MERGE … ON (…)` match (required).
     #[serde(default)]
     merge_key: Vec<String>,
+    /// `merge`: the columns updated when a key matches. Default: every
+    /// incoming column that isn't a key. `[]` inserts new keys only.
+    #[serde(default)]
+    update_columns: Option<Vec<String>>,
+}
+
+impl OracleDestConfig {
+    fn validate(&self) -> Result<()> {
+        if self.mode == WriteMode::Merge {
+            if self.merge_key.is_empty() {
+                bail!("`mode: merge` requires `merge_key` (the key columns to match on)");
+            }
+            if let Some(update) = &self.update_columns {
+                if let Some(k) =
+                    update.iter().find(|c| self.merge_key.iter().any(|k| fold_ident(k) == fold_ident(c)))
+                {
+                    bail!("`update_columns` lists `{k}`, a `merge_key` column; key columns are never updated");
+                }
+            }
+        } else {
+            let mode = self.mode.as_str();
+            if !self.merge_key.is_empty() {
+                bail!("`merge_key` only applies to `mode: merge` (mode is `{mode}`)");
+            }
+            if self.update_columns.is_some() {
+                bail!("`update_columns` only applies to `mode: merge` (mode is `{mode}`)");
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct OracleDestPlugin {
@@ -49,13 +93,14 @@ pub struct OracleDestPlugin {
     /// Target column → Oracle type (upper-cased names), from describing the
     /// target table in `prepare`. Drives the explicit `TO_*` bind wrapping.
     target_types: HashMap<String, &'static DbType>,
-    /// Per-batch array-DML `INSERT` SQL — into the target (`Atomic`) or into the
-    /// staging table (`StagedMerge`). Built once the column set is known.
+    /// Per-batch array-DML `INSERT` SQL — into the target (`append`,
+    /// `overwrite`) or into the staging table (`merge`). Built once the column
+    /// set is known.
     sql: Option<String>,
-    /// `StagedMerge` only: the session-private global temporary staging table,
+    /// `merge` only: the session-private global temporary staging table,
     /// created in `prepare`.
     staging_table: Option<String>,
-    /// `StagedMerge` only: the single set-based `MERGE` run at `finalize`. Built
+    /// `merge` only: the single set-based `MERGE` run at `finalize`. Built
     /// (and the `merge_key` validated) on the first batch.
     merge_sql: Option<String>,
     rows_written: u64,
@@ -81,8 +126,13 @@ impl OracleDestPlugin {
         }
     }
 
-    fn cfg(&self) -> &OracleDestConfig {
-        self.config.as_ref().expect("configured")
+    fn cfg(&self) -> Result<&OracleDestConfig> {
+        self.config.as_ref().context("oracle destination: not configured")
+    }
+
+    /// The target column type of an incoming column, when the target has it.
+    fn target_type(&self, col: &str) -> Option<&'static DbType> {
+        self.target_types.get(&fold_ident(col)).copied()
     }
 
     /// The explicit bind expression for one incoming column at placeholder `:idx`
@@ -90,10 +140,42 @@ impl OracleDestPlugin {
     /// columns, plain `:idx` otherwise (unknown columns pass through).
     fn bind_expr(&self, col: &str, idx: usize) -> String {
         let placeholder = format!(":{idx}");
-        match self.target_types.get(&col.to_uppercase()) {
+        match self.target_type(col) {
             Some(t) => typed_expr(&placeholder, t),
             None => placeholder,
         }
+    }
+
+    /// Builds the per-batch INSERT (and, for `merge`, the final MERGE) once
+    /// the incoming column set is known.
+    fn build_statements(&mut self) -> Result<()> {
+        let binds: Vec<String> =
+            self.columns.iter().enumerate().map(|(i, c)| self.bind_expr(c, i + 1)).collect();
+        let cfg = self.cfg()?;
+        let target = cfg.target_table.clone();
+        let (sql, merge_sql) = match cfg.mode {
+            WriteMode::Append | WriteMode::Overwrite => (build_insert_sql(&target, &self.columns, &binds, None), None),
+            WriteMode::Merge => {
+                let staging =
+                    self.staging_table.clone().context("oracle destination: staging table not prepared")?;
+                // Build (and validate the merge_key against the incoming
+                // columns) the one set-based MERGE up front; run it at finalize.
+                let merge = build_staged_merge_sql(
+                    &target,
+                    &staging,
+                    &self.columns,
+                    &cfg.merge_key,
+                    cfg.update_columns.as_deref(),
+                )?;
+                // Each batch array-inserts into staging (plus the load-order
+                // bind) — the same fast path as `append`.
+                let seq_bind = format!(":{}", self.columns.len() + 1);
+                (build_insert_sql(&staging, &self.columns, &binds, Some(&seq_bind)), Some(merge))
+            }
+        };
+        self.sql = Some(sql);
+        self.merge_sql = merge_sql;
+        Ok(())
     }
 }
 
@@ -115,9 +197,7 @@ impl DestinationPlugin for OracleDestPlugin {
         // operator's policy: an error by default, a warning with
         // `--ignore-unknown-keys`.
         let cfg: OracleDestConfig = config.parse()?;
-        if cfg.mode == CommitMode::StagedMerge && cfg.merge_key.is_empty() {
-            bail!("mode 'staged_merge' requires a non-empty merge_key");
-        }
+        cfg.validate()?;
         self.config = Some(cfg);
         Ok(())
     }
@@ -125,10 +205,12 @@ impl DestinationPlugin for OracleDestPlugin {
     async fn prepare(&mut self) -> Result<()> {
         // Nothing is durable until finalize() commits (Oracle holds the
         // transaction open implicitly).
-        let describe = format!("SELECT * FROM {} WHERE 1 = 0", quote_ident(&self.cfg().target_table));
+        let cfg = self.cfg()?;
+        let target = quote_ident(&cfg.target_table);
+        let describe = format!("SELECT * FROM {target} WHERE 1 = 0");
 
         let (conn, target_types) = tokio::task::block_in_place(|| -> Result<_> {
-            let conn = crate::conn::connect(&self.cfg().conn)?;
+            let conn = crate::conn::connect(&cfg.conn)?;
             let rs = conn
                 .query(&describe, &[])
                 .map_err(|e| anyhow::anyhow!("describing target table failed: {e}"))?;
@@ -137,68 +219,69 @@ impl DestinationPlugin for OracleDestPlugin {
             Ok((conn, target_types))
         })?;
 
+        let mut staging_table = None;
+        match cfg.mode {
+            WriteMode::Append => {}
+            // DELETE, not TRUNCATE: TRUNCATE is DDL and commits implicitly, so
+            // it could not roll back with a failed load.
+            WriteMode::Overwrite => {
+                let delete = format!("DELETE FROM {target}");
+                tokio::task::block_in_place(|| conn.execute(&delete, &[]))
+                    .map_err(|e| anyhow::anyhow!("{delete} failed: {e}"))?;
+            }
+            // `merge` stages into a session-private global temporary table with
+            // the target's columns plus the load-order column. Created here (DDL
+            // auto-commits) before any row is written; `ON COMMIT DELETE ROWS`
+            // clears it at finalize's commit. Create-if-not-exists (ORA-00955)
+            // so reruns reuse it.
+            WriteMode::Merge => {
+                let staging = staging_table_name(&cfg.target_table);
+                let create = format!(
+                    "DECLARE\n  e_exists EXCEPTION;\n  PRAGMA EXCEPTION_INIT(e_exists, -955);\nBEGIN\n  \
+                     EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE {stg} ON COMMIT DELETE ROWS \
+                     AS SELECT t.*, CAST(NULL AS NUMBER(19)) AS {seq} FROM {target} t WHERE 1 = 0';\n\
+                     EXCEPTION WHEN e_exists THEN NULL;\nEND;",
+                    stg = quote_ident(&staging),
+                    seq = quote_ident(STAGING_SEQ),
+                );
+                tokio::task::block_in_place(|| conn.execute(&create, &[]))
+                    .map_err(|e| anyhow::anyhow!("creating staging table failed: {e}"))?;
+                staging_table = Some(staging);
+            }
+        }
+
+        self.staging_table = staging_table;
         self.target_types = target_types;
         self.conn = Some(conn);
-
-        // staged_merge stages into a session-private global temporary table that
-        // mirrors the target's shape. Created here (DDL auto-commits) before any
-        // row is written; `ON COMMIT DELETE ROWS` clears it at finalize's commit.
-        // Create-if-not-exists (ORA-00955) so reruns reuse it.
-        if self.cfg().mode == CommitMode::StagedMerge {
-            let staging = staging_table_name(&self.cfg().target_table);
-            let create = format!(
-                "DECLARE\n  e_exists EXCEPTION;\n  PRAGMA EXCEPTION_INIT(e_exists, -955);\nBEGIN\n  \
-                 EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE {stg} ON COMMIT DELETE ROWS \
-                 AS SELECT * FROM {tgt} WHERE 1 = 0';\nEXCEPTION WHEN e_exists THEN NULL;\nEND;",
-                stg = quote_ident(&staging),
-                tgt = quote_ident(&self.cfg().target_table),
-            );
-            let conn = self.conn.as_ref().unwrap();
-            tokio::task::block_in_place(|| conn.execute(&create, &[]))
-                .map_err(|e| anyhow::anyhow!("creating staging table failed: {e}"))?;
-            self.staging_table = Some(staging);
-        }
         Ok(())
     }
 
     async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
         if self.columns.is_empty() {
             self.columns = batch.schema().fields().iter().map(|f| f.name().clone()).collect();
-            // Per-column bind expressions (temporal columns wrapped in TO_*).
-            let binds: Vec<String> =
-                self.columns.iter().enumerate().map(|(i, c)| self.bind_expr(c, i + 1)).collect();
-            let target = self.cfg().target_table.clone();
-            let merge_key = self.cfg().merge_key.clone();
-            self.sql = Some(match self.cfg().mode {
-                CommitMode::Atomic => build_insert_sql(&target, &self.columns, &binds),
-                CommitMode::StagedMerge => {
-                    let staging = self.staging_table.clone().expect("staging table prepared");
-                    // Build (and validate the merge_key against the incoming
-                    // columns) the one set-based MERGE up front; run it at finalize.
-                    self.merge_sql =
-                        Some(build_staged_merge_sql(&target, &staging, &self.columns, &merge_key)?);
-                    // Each batch array-inserts into staging — same fast path as atomic.
-                    build_insert_sql(&staging, &self.columns, &binds)
-                }
-            });
+            self.build_statements()?;
         }
         let nrows = batch.num_rows();
         if nrows == 0 {
             return Ok(());
         }
+        let staged = self.staging_table.is_some();
 
         // Materialise all binds (owned) up front, then run the array DML.
         let mut rows: Vec<Vec<Bind>> = Vec::with_capacity(nrows);
         for row in 0..nrows {
-            let mut cells: Vec<Bind> = Vec::with_capacity(batch.num_columns());
+            let mut cells: Vec<Bind> = Vec::with_capacity(batch.num_columns() + 1);
             for col in 0..batch.num_columns() {
                 cells.push(cell_to_bind(batch.column(col), row)?);
+            }
+            if staged {
+                cells.push(Bind::Text(Some((self.rows_written + row as u64).to_string())));
             }
             rows.push(cells);
         }
 
-        let sql = self.sql.as_ref().unwrap().clone();
-        let conn = self.conn.as_ref().context("not prepared")?;
+        let sql = self.sql.clone().context("oracle destination: no INSERT statement")?;
+        let conn = self.conn.as_ref().context("oracle destination: not prepared")?;
         tokio::task::block_in_place(|| -> Result<()> {
             // Array DML: one execute_batch over a 2-D slice of `&dyn ToDbValue`.
             let params: Vec<Vec<&dyn ToDbValue>> =
@@ -214,8 +297,8 @@ impl DestinationPlugin for OracleDestPlugin {
     }
 
     async fn finalize(&mut self) -> Result<u64> {
-        let conn = self.conn.as_ref().context("not prepared")?;
-        // staged_merge: a single set-based MERGE from the staging table into the
+        let conn = self.conn.as_ref().context("oracle destination: not prepared")?;
+        // merge: a single set-based MERGE from the staging table into the
         // target, in the same transaction as the staging inserts, then commit.
         if let Some(merge_sql) = self.merge_sql.clone() {
             tokio::task::block_in_place(|| conn.execute(&merge_sql, &[]))
@@ -232,18 +315,25 @@ impl DestinationPlugin for OracleDestPlugin {
     }
 }
 
-/// `INSERT INTO "target" ("c1", …) VALUES (<bind1>, …)`, where each `<bind>` is
-/// the column's (possibly `TO_*`-wrapped) bind expression.
-fn build_insert_sql(target: &str, columns: &[String], binds: &[String]) -> String {
-    let col_list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-    let values = binds.join(", ");
-    format!("INSERT INTO {} ({col_list}) VALUES ({values})", quote_ident(target))
+/// `INSERT INTO "target" ("c1", …[, "_LS_SEQ"]) VALUES (<bind1>, …[, <seq>])`,
+/// where each `<bind>` is the column's (possibly `TO_*`-wrapped) bind
+/// expression and `seq_bind` the staging table's load-order bind.
+fn build_insert_sql(target: &str, columns: &[String], binds: &[String], seq_bind: Option<&str>) -> String {
+    let mut col_list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>();
+    let mut values = binds.to_vec();
+    if let Some(seq) = seq_bind {
+        col_list.push(quote_ident(STAGING_SEQ));
+        values.push(seq.to_string());
+    }
+    format!("INSERT INTO {} ({}) VALUES ({})", quote_ident(target), col_list.join(", "), values.join(", "))
 }
 
-/// A deterministic, session-private staging-table name for `staged_merge`.
-/// Oracle identifiers are ≤30 bytes on 12c, so the target is hashed into a short
+/// A deterministic, session-private staging-table name for `merge`. Oracle
+/// identifiers are ≤30 bytes on 12c, so the target is hashed into a short
 /// fixed-width suffix rather than embedded. The same target always maps to the
 /// same name, so the global temporary table is created once and reused.
+/// (`LS_MRG_`: the `LS_STG_` tables of earlier versions lack the load-order
+/// column.)
 fn staging_table_name(target: &str) -> String {
     // FNV-1a (32-bit) over the resolved (folded) name — stable across runs.
     let mut hash: u32 = 0x811c_9dc5;
@@ -251,87 +341,117 @@ fn staging_table_name(target: &str) -> String {
         hash ^= b as u32;
         hash = hash.wrapping_mul(0x0100_0193);
     }
-    format!("LS_STG_{hash:08X}")
+    format!("LS_MRG_{hash:08X}")
 }
 
-/// `MERGE INTO "target" t USING "staging" s ON (key match) WHEN MATCHED THEN
-/// UPDATE SET <non-key> WHEN NOT MATCHED THEN INSERT (...) VALUES (...)`. A
-/// single set-based statement over the already-typed staging rows (no binds,
-/// no `TO_*` — those happened on the staging insert), so the optimizer joins by
-/// the key index against the real staging cardinality.
+/// `MERGE INTO "target" t USING (<latest row per key in staging>) s ON (key
+/// match) WHEN MATCHED THEN UPDATE SET <update set> WHEN NOT MATCHED THEN
+/// INSERT (...) VALUES (...)`. A single set-based statement over the
+/// already-typed staging rows (no binds, no `TO_*` — those happened on the
+/// staging insert). Within one load the **last row of each key wins**: the
+/// staging rows are first reduced to the latest per key (load order), since
+/// a MERGE cannot apply two source rows to one target row (ORA-30926).
 fn build_staged_merge_sql(
     target: &str,
     staging: &str,
     columns: &[String],
     merge_key: &[String],
+    update_columns: Option<&[String]>,
 ) -> Result<String> {
-    // Compare config-supplied merge keys against the incoming column names using
+    // Compare config-supplied names against the incoming column names using
     // Oracle name resolution (a simple `id` resolves to the catalog's `ID`).
-    let is_key = |c: &str| merge_key.iter().any(|k| fold_ident(k) == fold_ident(c));
+    let present = |k: &str| columns.iter().any(|c| fold_ident(c) == fold_ident(k));
     for k in merge_key {
-        if !columns.iter().any(|c| fold_ident(c) == fold_ident(k)) {
+        if !present(k) {
             bail!("merge_key column '{k}' is not present in the incoming data");
         }
     }
+    let is_key = |c: &str| merge_key.iter().any(|k| fold_ident(k) == fold_ident(c));
     let on = merge_key
         .iter()
         .map(|k| format!("t.{0} = s.{0}", quote_ident(k)))
         .collect::<Vec<_>>()
         .join(" AND ");
+    let keys = merge_key.iter().map(|k| quote_ident(k)).collect::<Vec<_>>().join(", ");
     let col_list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
     let src_list = columns.iter().map(|c| format!("s.{}", quote_ident(c))).collect::<Vec<_>>().join(", ");
+    let latest = format!(
+        "SELECT {col_list} FROM (SELECT {col_list}, ROW_NUMBER() OVER (PARTITION BY {keys} \
+         ORDER BY {seq} DESC) AS \"_LS_RN\" FROM {staging}) WHERE \"_LS_RN\" = 1",
+        seq = quote_ident(STAGING_SEQ),
+        staging = quote_ident(staging),
+    );
 
-    let non_key: Vec<&String> = columns.iter().filter(|c| !is_key(c)).collect();
-    let matched = if non_key.is_empty() {
-        // All columns are keys → nothing to update; only insert new rows.
+    let set: Vec<String> = match update_columns {
+        None => columns.iter().filter(|c| !is_key(c)).cloned().collect(),
+        Some(list) => {
+            for c in list {
+                if !present(c) {
+                    bail!("update_columns column '{c}' is not present in the incoming data");
+                }
+            }
+            list.to_vec()
+        }
+    };
+    let matched = if set.is_empty() {
+        // Nothing to update; only insert new keys.
         String::new()
     } else {
-        let set = non_key
-            .iter()
-            .map(|c| format!("t.{0} = s.{0}", quote_ident(c)))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let set = set.iter().map(|c| format!("t.{0} = s.{0}", quote_ident(c))).collect::<Vec<_>>().join(", ");
         format!(" WHEN MATCHED THEN UPDATE SET {set}")
     };
 
     Ok(format!(
-        "MERGE INTO {target} t USING {staging} s ON ({on}){matched} \
+        "MERGE INTO {target} t USING ({latest}) s ON ({on}){matched} \
          WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({src_list})",
         target = quote_ident(target),
-        staging = quote_ident(staging),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loadsmith_plugin_sdk::{PluginConfig, UnknownKeys};
+
+    async fn configure(extra: serde_json::Value) -> Result<()> {
+        let mut v = serde_json::json!({ "service_name": "S", "user": "u", "password": "p", "target_table": "events" });
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        OracleDestPlugin::new().configure(PluginConfig::new(v, UnknownKeys::Error)).await
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
     #[tokio::test]
-    async fn config_requires_merge_key_for_staged_merge() {
-        let mut p = OracleDestPlugin::new();
-        assert!(p
-            .configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({
-                "service_name": "S", "user": "u", "password": "p",
-                "target_table": "events", "mode": "staged_merge"
-            }), loadsmith_plugin_sdk::UnknownKeys::Error))
+    async fn merge_requires_a_merge_key_and_merge_options_need_merge() {
+        assert!(configure(serde_json::json!({ "mode": "merge" })).await.is_err());
+        assert!(configure(serde_json::json!({ "mode": "merge", "merge_key": ["id"] })).await.is_ok());
+        let e = configure(serde_json::json!({ "mode": "overwrite", "merge_key": ["id"] }))
             .await
-            .is_err());
-        assert!(p
-            .configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({
-                "service_name": "S", "user": "u", "password": "p",
-                "target_table": "events", "mode": "staged_merge", "merge_key": ["id"]
-            }), loadsmith_plugin_sdk::UnknownKeys::Error))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("only applies to `mode: merge`"), "{e}");
+        let e = configure(serde_json::json!({ "mode": "merge", "merge_key": ["id"], "update_columns": ["ID"] }))
             .await
-            .is_ok());
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("never updated"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn retired_modes_name_the_new_value() {
+        let e = configure(serde_json::json!({ "mode": "atomic" })).await.unwrap_err().to_string();
+        assert!(e.contains("did you mean `append`?"), "{e}");
     }
 
     #[test]
-    fn default_mode_is_atomic() {
+    fn default_mode_is_append() {
         let json = serde_json::json!({
             "service_name": "S", "user": "u", "password": "p", "target_table": "t"
         });
         let cfg: OracleDestConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.mode, CommitMode::Atomic);
+        assert_eq!(cfg.mode, WriteMode::Append);
     }
 
     // Plain positional binds (no temporal columns): bind == ":idx".
@@ -341,50 +461,63 @@ mod tests {
 
     #[test]
     fn insert_sql_positional_binds() {
-        let cols = vec!["ID".to_string(), "NAME".to_string()];
+        let cols = strings(&["ID", "NAME"]);
         assert_eq!(
-            build_insert_sql("EVENTS", &cols, &plain_binds(2)),
+            build_insert_sql("EVENTS", &cols, &plain_binds(2), None),
             "INSERT INTO \"EVENTS\" (\"ID\", \"NAME\") VALUES (:1, :2)"
+        );
+        assert_eq!(
+            build_insert_sql("LS_MRG_1", &cols, &plain_binds(2), Some(":3")),
+            "INSERT INTO \"LS_MRG_1\" (\"ID\", \"NAME\", \"_LS_SEQ\") VALUES (:1, :2, :3)"
         );
     }
 
     #[test]
     fn insert_sql_wraps_temporal_binds() {
-        let cols = vec!["ID".to_string(), "TS".to_string()];
-        let binds = vec![":1".to_string(), "TO_TIMESTAMP(:2, 'YYYY-MM-DD HH24:MI:SS.FF6')".to_string()];
+        let cols = strings(&["ID", "TS"]);
+        let binds = vec![":1".to_string(), "TO_TIMESTAMP(:2, 'YYYY-MM-DD HH24:MI:SS.FF')".to_string()];
         assert_eq!(
-            build_insert_sql("EVENTS", &cols, &binds),
-            "INSERT INTO \"EVENTS\" (\"ID\", \"TS\") VALUES (:1, TO_TIMESTAMP(:2, 'YYYY-MM-DD HH24:MI:SS.FF6'))"
+            build_insert_sql("EVENTS", &cols, &binds, None),
+            "INSERT INTO \"EVENTS\" (\"ID\", \"TS\") VALUES (:1, TO_TIMESTAMP(:2, 'YYYY-MM-DD HH24:MI:SS.FF'))"
         );
     }
 
     #[test]
-    fn staged_merge_sql_updates_non_key() {
-        let cols = vec!["ID".to_string(), "NAME".to_string(), "TS".to_string()];
+    fn staged_merge_sql_dedupes_and_updates_non_key() {
+        let cols = strings(&["ID", "NAME", "TS"]);
         // Config keys in lower case must resolve to the catalog's upper-cased ID.
-        let keys = vec!["id".to_string()];
-        let sql = build_staged_merge_sql("events", "LS_STG_DEADBEEF", &cols, &keys).unwrap();
-        assert!(sql.contains("MERGE INTO \"EVENTS\" t USING \"LS_STG_DEADBEEF\" s"));
+        let sql = build_staged_merge_sql("events", "LS_MRG_DEADBEEF", &cols, &strings(&["id"]), None).unwrap();
+        assert!(sql.contains(
+            "MERGE INTO \"EVENTS\" t USING (SELECT \"ID\", \"NAME\", \"TS\" FROM (SELECT \"ID\", \"NAME\", \"TS\", \
+             ROW_NUMBER() OVER (PARTITION BY \"ID\" ORDER BY \"_LS_SEQ\" DESC) AS \"_LS_RN\" FROM \"LS_MRG_DEADBEEF\") \
+             WHERE \"_LS_RN\" = 1) s"
+        ), "{sql}");
         assert!(sql.contains("ON (t.\"ID\" = s.\"ID\")"));
         assert!(sql.contains("WHEN MATCHED THEN UPDATE SET t.\"NAME\" = s.\"NAME\", t.\"TS\" = s.\"TS\""));
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT (\"ID\", \"NAME\", \"TS\") VALUES (s.\"ID\", s.\"NAME\", s.\"TS\")"));
-        // No per-row `FROM dual`, no binds — set-based over staging.
-        assert!(!sql.contains("FROM dual"));
+    }
+
+    #[test]
+    fn staged_merge_sql_update_columns_and_insert_only() {
+        let cols = strings(&["ID", "NAME", "TS"]);
+        let sql = build_staged_merge_sql("T", "S", &cols, &strings(&["ID"]), Some(&strings(&["name"]))).unwrap();
+        assert!(sql.contains("WHEN MATCHED THEN UPDATE SET t.\"NAME\" = s.\"NAME\" WHEN NOT MATCHED"), "{sql}");
+        let sql = build_staged_merge_sql("T", "S", &cols, &strings(&["ID"]), Some(&[])).unwrap();
+        assert!(!sql.contains("WHEN MATCHED"));
+        assert!(build_staged_merge_sql("T", "S", &cols, &strings(&["ID"]), Some(&strings(&["X"]))).is_err());
     }
 
     #[test]
     fn staged_merge_sql_all_keys_inserts_only() {
-        let cols = vec!["A".to_string(), "B".to_string()];
-        let keys = vec!["A".to_string(), "B".to_string()];
-        let sql = build_staged_merge_sql("T", "S", &cols, &keys).unwrap();
+        let cols = strings(&["A", "B"]);
+        let sql = build_staged_merge_sql("T", "S", &cols, &cols, None).unwrap();
         assert!(!sql.contains("WHEN MATCHED"));
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
     }
 
     #[test]
     fn staged_merge_sql_rejects_unknown_key() {
-        let cols = vec!["A".to_string()];
-        assert!(build_staged_merge_sql("T", "S", &cols, &["B".to_string()]).is_err());
+        assert!(build_staged_merge_sql("T", "S", &strings(&["A"]), &strings(&["B"]), None).is_err());
     }
 
     #[test]
@@ -392,7 +525,7 @@ mod tests {
         // Folds the target first → case-insensitive, stable across runs.
         assert_eq!(staging_table_name("events_sink"), staging_table_name("EVENTS_SINK"));
         let name = staging_table_name("events_sink");
-        assert!(name.starts_with("LS_STG_"));
+        assert!(name.starts_with("LS_MRG_"));
         assert_eq!(name.len(), 15);
     }
 }

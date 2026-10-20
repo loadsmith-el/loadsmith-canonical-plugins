@@ -10,29 +10,34 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use loadsmith_tls::{TlsConfig, TlsMode};
 use serde::Deserialize;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres_rustls_improved::MakeRustlsConnect;
 
+use crate::vocab::{config_enum, TlsBlock, TlsMode};
+
 // ── Config structs ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ChannelBinding {
-    Disable,
-    Prefer,
-    Require,
+config_enum! {
+    /// SCRAM channel binding.
+    pub enum ChannelBinding for "channel_binding" {
+        Disable = "disable",
+        Prefer = "prefer",
+        Require = "require",
+    }
+    retired {}
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TargetSessionAttrs {
-    Any,
-    ReadWrite,
-    ReadOnly,
+config_enum! {
+    /// With several hosts, which kind of server to accept.
+    pub enum TargetSessionAttrs for "target_session_attrs" {
+        Any = "any",
+        ReadWrite = "read-write",
+        ReadOnly = "read-only",
+    }
+    retired {}
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,7 +71,10 @@ pub struct ConnectionConfig {
     pub port: u16,
     pub dbname: String,
     pub user: String,
-    pub password: String,
+    /// Optional: certificate (`tls.client_cert`) and `trust` authentication
+    /// need none.
+    #[serde(default)]
+    pub password: Option<String>,
 
     pub application_name: Option<String>,
     /// Duration string: "10s", "500ms", "2m", "1h".
@@ -76,7 +84,7 @@ pub struct ConnectionConfig {
     /// Extra GUC parameters passed via the startup-message `options` field.
     pub options: Option<HashMap<String, String>>,
 
-    pub tls: Option<TlsConfig>,
+    pub tls: Option<TlsBlock>,
     pub channel_binding: Option<ChannelBinding>,
     pub target_session_attrs: Option<TargetSessionAttrs>,
 
@@ -158,7 +166,10 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<Client> {
         }
     }
 
-    pg.dbname(&cfg.dbname).user(&cfg.user).password(cfg.password.as_str());
+    pg.dbname(&cfg.dbname).user(&cfg.user);
+    if let Some(password) = &cfg.password {
+        pg.password(password.as_str());
+    }
 
     if let Some(name) = &cfg.application_name {
         pg.application_name(name);
@@ -210,8 +221,9 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<Client> {
     // loadsmith-tls validates the config and builds the generic rustls
     // ClientConfig; here we just map the mode to postgres' SslMode and wrap the
     // config in the postgres driver's connector.
-    let tls_cfg = cfg.tls.clone().unwrap_or_default();
-    pg.ssl_mode(match tls_cfg.mode {
+    let tls_block = cfg.tls.clone().unwrap_or_default();
+    let tls_cfg = tls_block.to_tls_config();
+    pg.ssl_mode(match tls_block.mode {
         TlsMode::Disable => SslMode::Disable,
         TlsMode::Prefer => SslMode::Prefer,
         TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull => SslMode::Require,
@@ -327,5 +339,19 @@ mod tests {
         assert!(matches!(cfg.host, HostSpec::Many(ref v) if v.len() == 2));
         assert!(matches!(cfg.tls.as_ref().unwrap().mode, TlsMode::VerifyFull));
         assert!(matches!(cfg.channel_binding, Some(ChannelBinding::Require)));
+    }
+
+    #[test]
+    fn password_is_optional() {
+        let json = serde_json::json!({ "dbname": "d", "user": "u" });
+        let cfg: ConnectionConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.password.is_none());
+    }
+
+    #[test]
+    fn enum_values_suggest_the_kebab_case_spelling() {
+        let json = serde_json::json!({ "dbname": "d", "user": "u", "target_session_attrs": "read_only" });
+        let e = serde_json::from_value::<ConnectionConfig>(json).unwrap_err().to_string();
+        assert!(e.contains("did you mean `read-only`?"), "{e}");
     }
 }

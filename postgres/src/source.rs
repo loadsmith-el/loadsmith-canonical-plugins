@@ -4,18 +4,21 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::SourcePlugin;
 use crate::conn::ConnectionConfig;
+use crate::vocab::config_enum;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio_postgres::Client;
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum TransactionIsolation {
-    ReadCommitted,
-    RepeatableRead,
-    Serializable,
+config_enum! {
+    /// Isolation level of the cursor transaction.
+    enum TransactionIsolation for "transaction_isolation" {
+        ReadCommitted = "read-committed",
+        RepeatableRead = "repeatable-read",
+        Serializable = "serializable",
+    }
+    retired {}
 }
 
 /// Incremental load. The core persists the high watermark of `cursor_column`

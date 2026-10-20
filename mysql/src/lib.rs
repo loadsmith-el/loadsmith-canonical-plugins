@@ -7,6 +7,7 @@ pub mod conn;
 pub mod destination;
 pub mod source;
 pub mod types;
+pub mod vocab;
 
 pub use destination::MysqlDestPlugin;
 pub use source::MysqlSourcePlugin;

@@ -8,6 +8,7 @@ pub mod copy;
 pub mod destination;
 pub mod source;
 pub mod types;
+pub mod vocab;
 
 pub use destination::PostgresDestPlugin;
 pub use source::PostgresSourcePlugin;
