@@ -37,16 +37,25 @@ ignored, as with every thin driver.)
 |---|---|---|---|
 | `query` | string | — | The SQL to extract. |
 | `batch_size` | integer | `1000` | Rows per Arrow batch. |
-| `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
+| `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. `cursor_column` must be one of the query's columns (a plain name folds to upper case, like unquoted SQL); any other name fails at startup. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
+| `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `DATE`/`TIMESTAMP` columns. The default is the same in every canonical plugin and truncates below the millisecond; **`ns` keeps `TIMESTAMP(9)` whole** (years 1677–2262 only), `us` covers the default `TIMESTAMP(6)`. |
 
-`NUMBER` crosses as exact text (`Utf8`), `BINARY_FLOAT`/`BINARY_DOUBLE` as
-floats, `BOOLEAN` (23ai+) as `Boolean`, `RAW`/`LONG RAW`/`BLOB` as `Binary`, and
-everything else (`VARCHAR2`, `CHAR`, `CLOB`, …) as `Utf8`. Temporal types cross
-as text with fixed formats: `DATE` as `YYYY-MM-DD HH24:MI:SS`, `TIMESTAMP` as
-`YYYY-MM-DD HH24:MI:SS.FF6`, and `TIMESTAMP WITH (LOCAL) TIME ZONE` as
-`YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM`; `INTERVAL` and `LONG` go through `TO_CHAR`
-too. CLOBs are read through `TO_CHAR`, so values over 4000 bytes aren't
-supported yet. `BFILE` is not supported (its contents are not fetched).
+| Oracle type | Arrow type | Notes |
+|---|---|---|
+| `NUMBER` | `Utf8` | Exact decimal text, any precision. |
+| `BINARY_FLOAT` / `BINARY_DOUBLE` | `Float32` / `Float64` | |
+| `BOOLEAN` (23ai+) | `Boolean` | |
+| `DATE` | `Timestamp(unit, None)` | Oracle `DATE` carries a time of day. |
+| `TIMESTAMP` | `Timestamp(unit, None)` | Digits finer than `unit` are truncated. |
+| `TIMESTAMP WITH TIME ZONE`, `… WITH LOCAL TIME ZONE` | `Timestamp(unit, "UTC")` | Normalized to the UTC instant. The original offset/region is not kept: select `TO_CHAR(col, 'YYYY-MM-DD HH24:MI:SS.FF9 TZR')` to carry it as text. |
+| `RAW`, `LONG RAW`, `BLOB` | `Binary` | |
+| everything else (`VARCHAR2`, `CHAR`, `CLOB`, `INTERVAL`, `ROWID`, …) | `Utf8` | |
+
+Temporal columns are rendered server-side with `TO_CHAR` and fixed formats, so
+values are NLS-independent. `INTERVAL` and `LONG` go through `TO_CHAR` too.
+CLOBs are read through `TO_CHAR`, so values over 4000 bytes aren't supported
+yet. `BFILE` is not supported (its contents are not fetched). Years BC are not
+supported.
 
 The source buffers the whole result set in memory before emitting batches;
 `batch_size` only sets the Arrow batch size.
@@ -72,8 +81,34 @@ source:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `target_table` | string | — | Table to load, in the login user's schema (schema-qualified names aren't supported yet). A plain identifier folds to upper case like unquoted SQL (`events` → `EVENTS`); anything else (mixed symbols, spaces) is used verbatim as a quoted name. `merge_key` columns resolve the same way. |
-| `mode` | `atomic` / `staged_merge` | `atomic` | `atomic`: array `INSERT` in one transaction, committed at the end. `staged_merge`: loads a global temporary staging table, then runs one set-based `MERGE` into the target (upsert by `merge_key`). |
-| `merge_key` | list of strings | `[]` | Key columns for `staged_merge`. Required in that mode. |
+| `mode` | `append` / `overwrite` / `merge` | `append` | How the load changes the table (below). |
+| `merge_key` | list of strings | — | The key columns of the `MERGE … ON (…)` match. Required for `merge`, rejected in the other modes. |
+| `update_columns` | list of strings | every non-key column | `merge` only: the columns a matched row updates. `[]` inserts new keys and leaves existing rows alone. |
+
+Every mode runs in **one transaction**, committed at the end of the load.
+
+- **`append`** (default) — array `INSERT` straight into the target.
+- **`overwrite`** — `DELETE FROM` the target, then array `INSERT`: the contents
+  are replaced by exactly the load's rows, atomically. (`DELETE`, not
+  `TRUNCATE`: `TRUNCATE` is DDL and commits implicitly, so it could not roll
+  back. Deleting generates undo, so it is slower on big tables.)
+- **`merge`** — loads a global temporary staging table (`LS_MRG_<hash>`, created
+  once per target and reused; `ON COMMIT DELETE ROWS`), then runs one set-based
+  `MERGE` into the target. Idempotent by key ⇒ exactly-once effective. When one
+  load holds several rows with the same key, **the last one (load order) wins**
+  — the staging rows are reduced to the latest per key first, so the `MERGE`
+  never raises ORA-30926. Rows whose key is `NULL` never match: keep key columns
+  `NOT NULL`. The staging table mirrors the target's columns at creation (plus
+  `_LS_SEQ`); after altering the target, drop `LS_MRG_<hash>` so it is
+  recreated.
+
+Accepted Arrow input types: every integer width (signed and unsigned), floats,
+`Decimal128`/`Decimal256`, `Boolean`, the string and binary types, `Date32`/
+`Date64`, `Timestamp` in **every unit** with or without a zone, and
+`Time32`/`Time64` (bound as `HH:MM:SS[.f]` text, e.g. for a `VARCHAR2`).
+Temporal values are spelled for the target column: whole seconds for a `DATE`,
+nine fraction digits for a `TIMESTAMP`, and the UTC instant with `+00:00` for a
+`TIMESTAMP WITH (LOCAL) TIME ZONE` (a timestamp without a zone is taken as UTC).
 
 ```yaml
 destination:
@@ -84,9 +119,24 @@ destination:
     user: app
     password: "{{ env('ORACLE_PASSWORD') }}"
     target_table: events_copy
-    mode: staged_merge
+    mode: merge                # append (default) | overwrite | merge
     merge_key: [id]
 ```
+
+Every key is checked, the flattened connection fields and the `tls` block
+included: an unknown or misspelled key fails the run (`UNKNOWN_CONFIG_KEYS`)
+unless the run uses `--ignore-unknown-keys`. Enum values are kebab-case; any
+other spelling is rejected with the valid values.
+
+### Migrating from 0.3
+
+| 0.3 | 0.4 |
+|---|---|
+| `mode: atomic` | `mode: append` |
+| `mode: staged_merge` | `mode: merge` (staging table renamed `LS_STG_*` → `LS_MRG_*`; the old one can be dropped) |
+| a duplicate key within one load failed the `MERGE` (ORA-30926) | the last row of the key wins |
+| `DATE`/`TIMESTAMP`/`TIMESTAMP WITH TZ` → text (`FF6`) | `Timestamp(ms)` / `Timestamp(ms, "UTC")`; `timestamp_unit` for finer units |
+| unknown keys ignored (except in `tls`) | rejected (or warned with `--ignore-unknown-keys`) |
 
 ## TLS (TCPS)
 

@@ -75,22 +75,93 @@ the sink still work with older engines.
   unit is written as epoch milliseconds, and NaN/±Infinity are `null` (they
   were `0`). See [JSONL](docs/src/config/jsonl.md#value-mapping).
 
-### postgres 0.3.0
+### postgres 0.3.0 (breaking)
 
 - SDK bump (abort rules, exact schema messages).
+- **Unknown config keys are rejected** (`UNKNOWN_CONFIG_KEYS`, with a "did you
+  mean"), at any depth — the flattened connection fields and `tls` included —
+  unless the run uses `--ignore-unknown-keys`.
+- **Destination write modes renamed and extended**: `mode: append | overwrite |
+  merge` (default `append`). `atomic` → `append`, `staged_merge` → `merge`; the
+  old spellings are rejected with the new one named. `overwrite` (new)
+  `TRUNCATE`s the target and loads it in one transaction. `merge_key` is the
+  match key of `merge` and an error in the other modes; `update_columns` (new)
+  picks the updated columns (`[]`: insert new keys only). Duplicate keys within
+  one load no longer break the `MERGE`: the last row of a key wins.
+- **Enum values are kebab-case**, and a wrong one names the valid values and the
+  likely one (`read_only` → `read-only`, also in `tls.mode`).
+- Source: `timestamp_unit: s | ms | us | ns` (default `ms`); `us` keeps
+  Postgres' full precision.
+- Source: `incremental.cursor_column` must be a query column (a typo silently
+  reloaded everything on every run).
+- Source: arrays are parsed strictly — a quoted `"NULL"` element is a string,
+  explicit bounds (`[0:2]={…}`) are accepted, and a multi-dimensional value
+  fails with a hint (`array_to_json(col)`) instead of decoding garbage.
+- `password` is optional (certificate or `trust` authentication).
+- Destination: accepts every timestamp unit (with or without a zone),
+  `Time32`/`Time64`, `Date64`, `Decimal128`/`Decimal256`, all integer widths,
+  view/large strings and binaries, and **`List` columns** (written as Postgres
+  arrays). Float NaN/±Infinity are spelled the Postgres way.
+- Malformed `bytea` text no longer panics.
 - Source: `cancel()` bounds its `CLOSE`/`ROLLBACK` to 5 s. After the SDK drops
   an in-flight batch its FETCH still runs server-side, and the rollback could
   otherwise outlast the core's grace period.
 
-### mysql 0.2.0
+### mysql 0.2.0 (breaking)
 
 - SDK bump (abort rules, exact schema messages).
+- **Unknown config keys are rejected**, at any depth, unless the run uses
+  `--ignore-unknown-keys`. Enum values are kebab-case with a "did you mean".
+- **Destination write modes**: `mode: append | overwrite | merge` (default
+  `append`; `atomic`/`staged_merge` are rejected, naming the new value).
+  `overwrite` (new) deletes the target's rows and loads it in one transaction.
+  `merge` now matches on `merge_key` (`merge_strategy: keyed`, the default): an
+  `UPDATE … JOIN` then an `INSERT` of the new keys, like postgres and oracle. The
+  0.1 behavior — `ON DUPLICATE KEY UPDATE` on any unique index, `merge_key`
+  only excluded from the update — is `merge_strategy: on-duplicate-key`.
+  `update_columns` (new) picks the updated columns. Duplicate keys within one
+  load: the last row wins (the staging table no longer copies the target's
+  unique indexes).
+- `target_table` is quoted the same way in every mode (`table` or
+  `database.table`); `append` used to interpolate it raw.
+- **`tls.mode: prefer` is rejected** (it silently meant `require`).
+- **The session `time_zone` is pinned to `'+00:00'`**, so `TIMESTAMP` values
+  cross as UTC instants, now typed `Timestamp(unit, "UTC")`; `session.time_zone`
+  is rejected.
+- Source: rows are **streamed** from the server instead of buffering the whole
+  result set.
+- Source: `INT UNSIGNED` → `Int64`, `BIGINT UNSIGNED` → `UInt64` (large values
+  failed); `BIT` → `UInt64` and `GEOMETRY` → `Binary` (WKB) instead of lossy
+  text.
+- Source: `timestamp_unit: s | ms | us | ns` (default `ms`); `us` keeps
+  `DATETIME(6)`/`TIMESTAMP(6)` whole.
+- Source: `incremental.cursor_column` must be a query column; the watermark
+  literal escapes backslashes.
+- Destination: accepts every timestamp unit and zone, `Time32`/`Time64`,
+  `Date64`, decimals, all integer widths, view/large strings and binaries.
 - Source: `cancel()` bounds the disconnect to 2 s, then drops the connection.
   The connection can be mid-result after the SDK drops an in-flight batch.
 
-### oracle 0.4.0
+### oracle 0.4.0 (breaking)
 
 - SDK bump (abort rules, exact schema messages).
+- **Unknown config keys are rejected** at any depth (the `tls` block's own
+  `deny_unknown_fields` is gone: `--ignore-unknown-keys` now applies to it like
+  everywhere else). Enum values are kebab-case with a "did you mean".
+- **Destination write modes**: `mode: append | overwrite | merge` (default
+  `append`; `atomic`/`staged_merge` are rejected, naming the new value).
+  `overwrite` (new) deletes the target's rows and loads it in one transaction.
+  `update_columns` (new) picks the updated columns. Duplicate keys within one
+  load no longer fail the `MERGE` with ORA-30926: the last row of a key wins. The
+  staging table is now `LS_MRG_<hash>` (with a load-order column); old
+  `LS_STG_*` tables can be dropped.
+- Source: `DATE`/`TIMESTAMP` → `Timestamp(unit)` and `TIMESTAMP WITH [LOCAL]
+  TIME ZONE` → `Timestamp(unit, "UTC")`, instead of `FF6` text;
+  `timestamp_unit: s | ms | us | ns` (default `ms`), `ns` keeps `TIMESTAMP(9)`.
+- Source: `incremental.cursor_column` must be a query column.
+- Destination: accepts every timestamp unit and zone (spelled for the target
+  column type), `Time32`/`Time64`, `Date64`, decimals, all integer widths,
+  view/large strings and binaries.
 
 ### sharepoint 0.2.0
 

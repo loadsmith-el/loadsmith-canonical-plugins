@@ -17,7 +17,7 @@ Both roles accept these. Connection defaults make a local dev DB a one-liner.
 | `port` | integer | `5432` | TCP port. Shared by all hosts in a multi-host list. |
 | `dbname` | string | — | Database name. |
 | `user` | string | — | Login role. |
-| `password` | string | — | Login password. Supports `{{ env(...) }}`. |
+| `password` | string | — | Login password. Supports `{{ env(...) }}`. Optional: leave it out for certificate (`tls.client_cert`) or `trust` authentication. |
 | `application_name` | string | — | Appears in `pg_stat_activity`. Useful for spotting pipelines in monitoring. |
 | `connect_timeout` | duration | — | Max time to establish a connection (e.g. `10s`, `500ms`). |
 | `statement_timeout` | duration | — | Kills a query exceeding this wall time. Applied via `set_config`. |
@@ -28,6 +28,12 @@ Both roles accept these. Connection defaults make a local dev DB a one-liner.
 | `session` | map | — | GUCs applied via `set_config($1,$2,false)` after connect (bind params, no SQL interpolation) — e.g. `work_mem: 256MB`. |
 | `tcp_keepalives` | object | — | TCP keepalives — `idle` (duration), `interval` (duration), `retries` (int). |
 
+Every key is checked, the flattened connection fields and the `tls` block
+included: an unknown or misspelled key fails the run (`UNKNOWN_CONFIG_KEYS`,
+with a "did you mean" when one is close) unless the run uses
+`--ignore-unknown-keys`. Enum values are kebab-case; any other spelling is
+rejected with the valid values (`read_only` → "did you mean `read-only`?").
+
 ## Source
 
 | Field | Type | Default | Description |
@@ -36,6 +42,7 @@ Both roles accept these. Connection defaults make a local dev DB a one-liner.
 | `batch_size` | integer | `1000` | Rows per `FETCH FORWARD n`. |
 | `transaction_isolation` | `read-committed` / `repeatable-read` / `serializable` | server default (`BEGIN`; normally `read-committed`) | Isolation for the cursor transaction. `repeatable-read` gives a consistent snapshot across all `FETCH`es. |
 | `incremental` | object | — | Activates incremental reads (below). Requires a pipeline `state:` block. |
+| `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `timestamp`/`timestamptz` columns (and arrays of them). The default is the same in every canonical plugin and truncates below the millisecond; **`us` keeps Postgres' full precision**. `ns` is the µs value × 1000 and only covers the years 1677–2262 (a value outside fails the batch). |
 
 The query runs through a server-side cursor (`DECLARE … CURSOR FOR`) in a
 transaction, streamed in `batch_size` chunks, so large results never buffer
@@ -51,14 +58,14 @@ State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.h
 
 | Field | Type | Description |
 |---|---|---|
-| `cursor_column` | string | Ordered, monotonically-advancing column to resume on (e.g. an `updated_at`). Must be in the query's output. |
+| `cursor_column` | string | Ordered, monotonically-advancing column to resume on (e.g. an `updated_at`). Must be one of the query's output columns, spelled exactly (it is quoted); any other name fails at startup. |
 | `initial_value` | string | Watermark for the very first run (before any state). Omit to read everything first time. |
 
 > **Cursor choice matters.** Use a column capturing both inserts *and* updates
 > (an `updated_at` timestamp, not a bare integer PK). The boundary is compared
 > with `>`; rows sharing the exact watermark plus in-flight transactions are the
 > classic at-least-once hazard — pair with an idempotent destination (the
-> postgres destination's `staged_merge`), or have the source subtract a safety lag.
+> postgres destination's `mode: merge`), or have the source subtract a safety lag.
 
 ### Type mapping
 
@@ -70,12 +77,12 @@ State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.h
 | `DOUBLE PRECISION`, `FLOAT8` | `Float64` | |
 | `BOOLEAN` | `Boolean` | |
 | `DATE` | `Date32` | BC dates supported; `infinity`/`-infinity` are rejected with a clear error (map them in the query, e.g. `NULLIF(col, 'infinity')`). |
-| `TIMESTAMP` | `Timestamp(Millisecond, None)` | Sub-millisecond digits are truncated. BC and `infinity` as for `DATE`. |
-| `TIMESTAMPTZ` | `Timestamp(Millisecond, "UTC")` | The session zone's offset (incl. local-mean-time `+HH:MM:SS`) is parsed and the value normalized to UTC, so the session `TimeZone` doesn't change the instant. |
+| `TIMESTAMP` | `Timestamp(unit, None)` | `unit` is `timestamp_unit` (default `ms`: sub-millisecond digits are truncated; `us` keeps them all). BC and `infinity` as for `DATE`. |
+| `TIMESTAMPTZ` | `Timestamp(unit, "UTC")` | The session zone's offset (incl. local-mean-time `+HH:MM:SS`) is parsed and the value normalized to UTC, so the session `TimeZone` doesn't change the instant. |
 | `BYTEA` | `Binary` | |
-| `anytype[]` (arrays) | `List(inner)` | Inner type follows the same mapping; `NULL` elements preserved. |
+| `anytype[]` (arrays) | `List(inner)` | Inner type follows the same mapping; `NULL` elements preserved, a quoted `"NULL"` element is the string. One-dimensional values only (explicit bounds like `[0:2]={…}` are fine): a multi-dimensional value fails with a hint — select `array_to_json(col)` to keep its shape as JSON, or `col::text`. |
 | `hstore` | `Utf8` (JSON) | `"k"=>"v"` → `{"k":"v"}`; null values become JSON `null`. |
-| Everything else (`NUMERIC`, `TEXT`, `UUID`, `TIME`, …) | `Utf8` | Text as returned by the Postgres text protocol. |
+| Everything else (`NUMERIC`, `TEXT`, `UUID`, `TIME`, …) | `Utf8` | Text as returned by the Postgres text protocol — exact, so `NUMERIC` keeps every digit. |
 
 Rows are read over the text protocol, so the source pins the two output
 settings its decoder depends on — `DateStyle = 'ISO'` (output style only; your
@@ -166,26 +173,47 @@ source:
 Writes Arrow batches via `COPY` (text format, symmetric with the source's
 text-protocol read path so `NUMERIC`/`TIME`/`TIMESTAMP` round-trip cleanly).
 
-Accepted Arrow input types: `Int32`, `Int64`, `Float32`, `Float64`, `Boolean`,
-`Utf8`/`LargeUtf8`, `Date32`, `Timestamp(ms)` (with or without zone), `Binary`.
-A non-null value of any other type — including `List` (the postgres source's
-mapping of array columns) and non-millisecond timestamps — fails the load. Cast arrays to text in
-the source query (e.g. `col::text`).
+Accepted Arrow input types: every integer width (signed and unsigned),
+`Float16`/`Float32`/`Float64` (NaN and ±Infinity included), `Decimal128` and
+`Decimal256` (exact text), `Boolean`, `Utf8`/`LargeUtf8`/`Utf8View`,
+`Binary`/`LargeBinary`/`FixedSizeBinary`/`BinaryView` (as `bytea`),
+`Date32`/`Date64`, `Timestamp` in **every unit** (`s`/`ms`/`us`/`ns`) with or
+without a zone, `Time32`/`Time64` in every unit, and `List`/`LargeList`/
+`FixedSizeList` of any of these, written as Postgres arrays (a nested list
+becomes a multi-dimensional array, which Postgres requires to be rectangular).
+A zoned timestamp is written as its UTC instant with an explicit `+00` offset
+(right for a `timestamptz` column whatever the session `TimeZone`); BC dates
+use Postgres's `YYYY-MM-DD BC` form; nanoseconds are rounded to Postgres'
+microseconds. Any other type (struct, map, …) fails the load.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | connection fields | — | yes (host/port default `localhost`/`5432`) | The shared connection block above, including `tls`. |
-| `target_table` | string | yes | Destination table, optionally schema-qualified. Must already exist. |
-| `mode` | `atomic` / `staged_merge` | no (default `atomic`) | Commit strategy (below). |
-| `merge_key` | list of strings | for `staged_merge` | Key columns for the `MERGE` (the table's PK / natural key). |
+| `target_table` | string | yes | Destination table, optionally schema-qualified (`public.events`). Used verbatim in SQL, so quote mixed-case names yourself (`'"MyTable"'`). Must already exist. |
+| `mode` | `append` / `overwrite` / `merge` | no (default `append`) | How the load changes the table (below). |
+| `merge_key` | list of strings | for `merge` | The key columns the `MERGE` matches on (the table's PK / natural key). Only valid with `mode: merge`. |
+| `update_columns` | list of strings | no | `merge` only: the columns a matched row updates. Default: every incoming column that isn't a key. `[]` inserts new keys and leaves existing rows alone. |
 
-**`atomic`** — one transaction: `COPY` straight into the target, `COMMIT` at the
-end. All-or-nothing; a crash leaves the target untouched. At-least-once with
-incremental state (best for append-only or truncate-load tables).
+Every mode runs in **one transaction**, committed at the end of the load:
+nothing is visible before, and a failed or cancelled load leaves the table as
+it was.
 
-**`staged_merge`** — `COPY` into a temporary staging table, then `MERGE` by
-`merge_key` into the target in the same transaction. **Idempotent by key** ⇒
-exactly-once effective. Requires Postgres 15+ (`MERGE`).
+- **`append`** (default) — `COPY` straight into the target. At-least-once with
+  incremental state (best for append-only tables).
+- **`overwrite`** — `TRUNCATE` the target, then `COPY` into it: the table's
+  contents are replaced by exactly the load's rows (a load of zero rows empties
+  it). `TRUNCATE` is transactional in Postgres, so readers keep seeing the old
+  rows until the commit — but it takes an `ACCESS EXCLUSIVE` lock, so they
+  *wait* for the load to finish, and it fails on a table referenced by a
+  foreign key.
+- **`merge`** — `COPY` into a temporary staging table, then one `MERGE` by
+  `merge_key` into the target (update on match, insert otherwise). **Idempotent
+  by key** ⇒ exactly-once effective. Requires Postgres 15+. When one load holds
+  several rows with the same key, **the last one (load order) wins** — the
+  staging rows are reduced to the latest per key before the `MERGE`, which could
+  not apply two rows to one target row. Rows whose key is `NULL` never match, so
+  they are inserted on every run: keep key columns `NOT NULL`. (The staging
+  table has an extra `_ls_seq` column: a target column with that name clashes.)
 
 Durability is at the final `COMMIT`, so the core persists the incremental
 watermark at end of run.
@@ -199,6 +227,21 @@ destination:
     user: loadsmith_writer
     password: "{{ env('PG_PASSWORD') }}"
     target_table: public.orders
-    mode: staged_merge       # "atomic" (default) | "staged_merge"
-    merge_key: [id]          # required for staged_merge
+    mode: merge              # append (default) | overwrite | merge
+    merge_key: [id]          # required for merge
+    update_columns: [status, updated_at]   # optional; default: every non-key column
 ```
+
+### Migrating from 0.2
+
+| 0.2 | 0.3 |
+|---|---|
+| `mode: atomic` | `mode: append` |
+| `mode: staged_merge` | `mode: merge` |
+| — | `mode: overwrite`, `update_columns`, `timestamp_unit` (new) |
+| a `merge_key` with `atomic` (ignored) | an error: `merge_key` only applies to `mode: merge` |
+| unknown keys ignored | rejected (or warned with `--ignore-unknown-keys`) |
+
+The old mode spellings are rejected with the new one named:
+``unknown `mode` value `atomic` (did you mean `append`?)``.
+
