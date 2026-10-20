@@ -23,4 +23,4 @@
 - [Parquet](./config/parquet.md)
 - [Null](./config/null.md)
 - [Local-copy sink](./config/local-copy.md)
-- [File config provider](./config/file.md)
+- [File provider](./config/file.md)

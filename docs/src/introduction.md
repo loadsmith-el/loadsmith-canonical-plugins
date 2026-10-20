@@ -5,7 +5,7 @@ This is the **official, supported plugin set** for
 `loadsmith plugin install <name>` resolves from the canonical index.
 
 Loadsmith's core is deliberately small: it knows nothing about Postgres, JSONL,
-Parquet, or S3. Every source, destination, sink, and config provider is a
+Parquet, or S3. Every source, destination, sink, and provider is a
 separate plugin, distributed and installed on demand on top of the **slim**
 core image (or preinstalled in the `-bundled` image flavor). This repository is where the *blessed* set of those plugins
 lives.

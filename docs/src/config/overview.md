@@ -15,8 +15,9 @@ source:
     # …
 ```
 
-The **top-level pipeline shape** (`pipeline` / `source` / `destination` / `sink`
-/ `state`), the **template syntax** (`{{ env(...) }}`, `{{ file(...) }}`), and
+The **top-level pipeline shape** (`pipeline` / `providers` / `source` /
+`destination` / `sink` / `state`), the **template syntax** (`{{ env(...) }}`,
+`{{ file(...) }}`, `{{ secret(...) }}`), and
 the core-owned **`state:` block** for incremental loads are engine concerns —
 see the engine's [Pipeline YAML
 reference](https://loadsmith-el.github.io/loadsmith/reference/pipeline-yaml.html).
@@ -34,7 +35,7 @@ These pages cover only what goes *inside* each plugin's `config:`.
 | `parquet` | destination | [Parquet](./parquet.md) |
 | `null` | destination | [Null](./null.md) |
 | `local-copy` | sink | [Local-copy](./local-copy.md) |
-| `file` | config provider | [File](./file.md) |
+| `file` | provider | [File](./file.md) |
 
 ---
 

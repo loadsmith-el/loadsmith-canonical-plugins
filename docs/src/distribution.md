@@ -7,9 +7,13 @@ repo as a **git dependency pinned by rev** — `loadsmith-plugin-sdk`,
 `loadsmith-arrow`, and `loadsmith-tls`, set once in the root `Cargo.toml`
 `[workspace.dependencies]`.
 
-The protocol/SDK is still evolving, so this is deliberate (the crates are not on
-crates.io). To move *every* plugin onto a newer SDK, bump the `rev` **there**, in
-one place.
+The SDK crates stay 0.x and are not on crates.io (the engine's
+[Stability Policy](https://loadsmith-el.github.io/loadsmith/reference/stability.html)
+covers the wire protocol, not the Rust APIs), so this is deliberate. To move
+*every* plugin onto a newer SDK, bump the `rev` **there**: the three entries
+share one commit, so it is a single substitution
+(`sed -i 's/<old-rev>/<new-rev>/' Cargo.toml`), then `cargo update -p
+loadsmith-plugin-sdk` and commit `Cargo.lock`.
 
 ## Per-plugin, independent versioning
 

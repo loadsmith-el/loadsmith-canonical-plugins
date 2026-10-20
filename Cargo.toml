@@ -7,7 +7,9 @@
 # checksums) into the index that `loadsmith plugin install` reads.
 #
 # The SDK crates come from the loadsmith repo as **git deps pinned by rev**
-# (the protocol/SDK is still green — bump the rev here to re-pin every plugin).
+# (they stay 0.x, off crates.io). The three entries below must share one rev;
+# to re-pin every plugin it is a single substitution:
+#   sed -i 's/<old-rev>/<new-rev>/' Cargo.toml && cargo update -p loadsmith-plugin-sdk
 
 [workspace]
 resolver = "2"
@@ -27,7 +29,7 @@ members = [
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# Pinned Loadsmith SDK (bump `rev` to move every plugin to a newer SDK).
+# Pinned Loadsmith SDK (one rev for all three; see the note at the top).
 loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e" }
 loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e" }
 loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e" }

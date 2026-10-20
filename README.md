@@ -29,13 +29,13 @@ destination). Each plugin is a self-describing directory:
 | `parquet` | destination |
 | `null` | destination (throughput testing) |
 | `local-copy` | sink |
-| `file` | config-provider |
+| `file` | provider (`secret()` values from local files: whole file or a JSON/YAML key) |
 
 ## How a plugin is distributed
 
 The SDK comes from the [loadsmith](https://github.com/loadsmith-el/loadsmith) repo as a **git dependency
-pinned by rev** (the protocol/SDK is still evolving — bump the rev in the root
-`[workspace.dependencies]` to move every plugin to a newer SDK).
+pinned by rev** (the SDK crates stay 0.x and are not on crates.io — bump the
+rev in the root `[workspace.dependencies]` to move every plugin to a newer SDK).
 
 Each plugin declares its install metadata in `[package.metadata.loadsmith]`
 (the `[package] version` is the single source of truth for the version). CI

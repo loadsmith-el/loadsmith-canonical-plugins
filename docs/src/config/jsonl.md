@@ -16,10 +16,38 @@ destination:
     path: /output/data.jsonl   # omit entirely to stream to stdout
 ```
 
-Column values follow JSON types: strings as JSON strings, integers as JSON
-numbers, booleans as `true`/`false`, nulls as `null`. Arrow `Date32` columns are
-written as integer days since 1970-01-01, and `Timestamp` columns as integer
-epoch milliseconds (the raw stored value; only millisecond-unit timestamps are
-supported). Arrow `Binary` columns are written as base64-encoded strings. Arrow
-types the converter does not handle (e.g. `List` from Postgres arrays) are
-written as `null`, and NaN/±Inf floats are written as `0`.
+## Value mapping
+
+Every Arrow type has a defined JSON form (the conversion never fails a run):
+
+| Arrow | JSON |
+|---|---|
+| null slot, `Null` | `null` |
+| `Boolean` | `true` / `false` |
+| `Int*`, `UInt*` | number (a `uint64` above 2^53 may lose precision in some JSON readers) |
+| `Float16/32/64` | number; **NaN and ±Infinity are written as `null`** |
+| `Decimal128/256` | **string** with the scale applied, e.g. `"123.45"` (exact) |
+| `Utf8`, `LargeUtf8`, `Utf8View` | string |
+| `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary` | base64 string (standard, padded) |
+| `Date32` | integer days since 1970-01-01 |
+| `Date64` | integer milliseconds since the epoch |
+| `Timestamp` (any unit, any time zone) | integer **epoch milliseconds** (`us`/`ns` floored) |
+| `Time32`, `Time64` | integer milliseconds since midnight (floored) |
+| `Duration` | integer milliseconds (floored) |
+| `Interval` | `{"months": n}` / `{"days": d, "milliseconds": ms}` / `{"months": m, "days": d, "nanoseconds": ns}` |
+| `List`, `LargeList`, `FixedSizeList` | array of the converted items (e.g. Postgres arrays) |
+| `Struct` | object keyed by child name |
+| `Map` | object (a non-string key is written as its JSON text) |
+| `Dictionary` | the decoded value |
+
+A value that cannot be represented (a timestamp in seconds whose millisecond
+form overflows) is `null`.
+
+## Behavior notes
+
+- **Cancel removes the file.** When the run does not complete (the core cancels
+  it, the input stream is truncated, or a write fails), the partial file at
+  `path` is deleted rather than left looking like a finished export. Output
+  already written to stdout cannot be taken back.
+- The file at `path` is created (truncated) when the destination starts, so a
+  failed run also removes the previous run's output there.

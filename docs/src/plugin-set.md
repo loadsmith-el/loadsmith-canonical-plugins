@@ -14,7 +14,7 @@ destination).
 | `parquet` | destination | Single-file or chunked Parquet output. |
 | `null` | destination | Discards rows — for read/pump throughput testing. |
 | `local-copy` | sink | Delivers staged files to a local destination directory. |
-| `file` | config-provider | Loads pipeline config from a file. |
+| `file` | provider | Resolves `secret()` values from local files: a whole file, or one key of a JSON/YAML document. |
 
 > **Configuring a plugin?** Every plugin's `config:` fields — connection
 > options, TLS, commit modes, incremental, output paths — are documented in the
@@ -22,7 +22,8 @@ destination).
 
 ## Roles, briefly
 
-Loadsmith plugins fall into four kinds, each a distinct stage in a pipeline:
+Loadsmith plugins fall into four kinds (the engine also reserves a fifth,
+`parser`, which is experimental and not wired yet):
 
 - **source** — extracts rows and emits them as Apache Arrow batches.
 - **destination** — receives Arrow batches and writes them out (to a database,
@@ -30,7 +31,10 @@ Loadsmith plugins fall into four kinds, each a distinct stage in a pipeline:
 - **sink** — takes *staged objects* a destination produced and delivers them to
   their final location, separately from the format. This is why there's no
   `s3_parquet` explosion: `parquet` (format) + a sink (location) compose.
-- **config-provider** — supplies pipeline configuration to the core.
+- **provider** — not a data stage: it resolves the
+  `{{ secret('<instance>', '<ref>') }}` values of a pipeline file (from a
+  mounted file, a secret store…) before any data plugin starts. Declared under
+  `providers:`; binary `loadsmith-provider-<type>`.
 
 For the full design of each role — the protocol they speak, the lifecycle, and
 how to author one from scratch — see the engine docs under
