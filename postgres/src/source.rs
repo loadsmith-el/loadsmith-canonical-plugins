@@ -4,7 +4,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::SourcePlugin;
 use crate::conn::ConnectionConfig;
-use crate::vocab::config_enum;
+use crate::vocab::{config_enum, TimestampUnit};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio_postgres::Client;
@@ -51,6 +51,11 @@ struct PostgresConfig {
 
     #[serde(default)]
     incremental: Option<IncrementalConfig>,
+
+    /// Unit of the emitted timestamps (default `ms`; `us` keeps Postgres' full
+    /// precision, `ns` is µs × 1000 within 1677–2262).
+    #[serde(default)]
+    timestamp_unit: TimestampUnit,
 }
 
 fn default_batch_size() -> usize {
@@ -142,7 +147,7 @@ impl PostgresSourcePlugin {
             return Ok(());
         }
         let query = self.cursor_query();
-        let client = self.client.as_ref().unwrap();
+        let client = self.client.as_ref().context("postgres source: not configured")?;
         client.batch_execute(&self.begin_sql).await.context("BEGIN failed")?;
         client
             .execute(&format!("DECLARE ls_cursor NO SCROLL CURSOR FOR ({query})"), &[])
@@ -205,7 +210,7 @@ impl SourcePlugin for PostgresSourcePlugin {
         // column set, so the schema is inferred from the original query here.
 
         let stmt = client.prepare(&cfg.query).await.context("failed to prepare query")?;
-        let schema = Arc::new(crate::types::columns_to_schema(stmt.columns()));
+        let schema = Arc::new(crate::types::columns_to_schema(stmt.columns(), cfg.timestamp_unit.arrow()));
 
         // The transaction + cursor are opened lazily on the first batch, after
         // `resume_from` has supplied the watermark (see `ensure_cursor`).
@@ -222,6 +227,7 @@ impl SourcePlugin for PostgresSourcePlugin {
             }
         };
         if let Some(inc) = &cfg.incremental {
+            check_cursor_column(&inc.cursor_column, &schema)?;
             self.cursor_column = Some(inc.cursor_column.clone());
             self.initial_value = inc.initial_value.clone();
         }
@@ -234,7 +240,7 @@ impl SourcePlugin for PostgresSourcePlugin {
     }
 
     async fn schema(&mut self) -> Result<Schema> {
-        Ok(self.schema.as_ref().unwrap().as_ref().clone())
+        Ok(self.schema.as_ref().context("postgres source: not configured")?.as_ref().clone())
     }
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
@@ -245,8 +251,8 @@ impl SourcePlugin for PostgresSourcePlugin {
         // Declare the cursor on first use, now that the resume watermark is in.
         self.ensure_cursor().await?;
 
-        let schema = self.schema.as_ref().unwrap().clone();
-        let client = self.client.as_ref().unwrap();
+        let schema = self.schema.as_ref().context("postgres source: not configured")?.clone();
+        let client = self.client.as_ref().context("postgres source: not configured")?;
 
         // Use simple_query (text protocol) so all types come back as strings.
         // This avoids binary-format issues with NUMERIC, TIME, and other types
@@ -301,6 +307,23 @@ impl SourcePlugin for PostgresSourcePlugin {
             let _ = tokio::time::timeout(CANCEL_ROLLBACK_TIMEOUT, rollback).await;
         }
     }
+}
+
+/// The incremental cursor must be one of the query's output columns (the
+/// cursor query quotes it, so the name is matched exactly). Without this
+/// check a typo would silently reload everything on every run.
+fn check_cursor_column(cursor: &str, schema: &Schema) -> Result<()> {
+    if schema.fields().iter().any(|f| f.name() == cursor) {
+        return Ok(());
+    }
+    let names = schema.fields().iter().map(|f| format!("`{}`", f.name())).collect::<Vec<_>>().join(", ");
+    let hint = schema
+        .fields()
+        .iter()
+        .find(|f| f.name().eq_ignore_ascii_case(cursor))
+        .map(|f| format!(" (did you mean `{}`?)", f.name()))
+        .unwrap_or_default();
+    anyhow::bail!("incremental.cursor_column `{cursor}` is not a column of the query{hint}; its columns are {names}")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -418,6 +441,24 @@ mod tests {
         let q = p.cursor_query();
         assert!(q.contains("\"we\"\"ird\""));
         assert!(q.contains("> 'o''brien'"));
+    }
+
+    #[test]
+    fn cursor_column_must_be_a_query_column() {
+        let schema = Schema::new(vec![arrow_schema::Field::new("updated_at", arrow_schema::DataType::Utf8, true)]);
+        assert!(check_cursor_column("updated_at", &schema).is_ok());
+        let e = check_cursor_column("Updated_At", &schema).unwrap_err().to_string();
+        assert!(e.contains("did you mean `updated_at`?") && e.contains("its columns are `updated_at`"), "{e}");
+    }
+
+    #[test]
+    fn timestamp_unit_defaults_to_ms() {
+        let json = serde_json::json!({ "dbname": "d", "user": "u", "query": "SELECT 1" });
+        let cfg: PostgresConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.timestamp_unit, TimestampUnit::Ms);
+        let json = serde_json::json!({ "dbname": "d", "user": "u", "query": "SELECT 1", "timestamp_unit": "us" });
+        let cfg: PostgresConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.timestamp_unit, TimestampUnit::Us);
     }
 
     #[test]

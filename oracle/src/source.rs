@@ -33,6 +33,11 @@ struct OracleConfig {
 
     #[serde(default)]
     incremental: Option<IncrementalConfig>,
+
+    /// Unit of the emitted DATE/TIMESTAMP values (default `ms`; `ns` keeps
+    /// `TIMESTAMP(9)` whole, within 1677–2262).
+    #[serde(default)]
+    timestamp_unit: crate::vocab::TimestampUnit,
 }
 
 fn default_batch_size() -> usize {
@@ -191,14 +196,21 @@ impl SourcePlugin for OracleSourcePlugin {
             Ok((conn, cols))
         })?;
 
-        let (select_list, schema) = types::projected_select(&cols);
+        let (select_list, schema) = types::projected_select(&cols, cfg.timestamp_unit.arrow());
 
         if let Some(inc) = &cfg.incremental {
             // Resolve the config cursor name against the catalog's upper-cased
             // names (a simple `event_ts` matches the column `EVENT_TS`).
             let cursor = types::fold_ident(&inc.cursor_column);
-            self.cursor_idx =
-                schema.fields().iter().position(|f| types::fold_ident(f.name()) == cursor);
+            let idx = schema.fields().iter().position(|f| types::fold_ident(f.name()) == cursor);
+            if idx.is_none() {
+                let names = schema.fields().iter().map(|f| format!("`{}`", f.name())).collect::<Vec<_>>().join(", ");
+                anyhow::bail!(
+                    "incremental.cursor_column `{}` is not a column of the query; its columns are {names}",
+                    inc.cursor_column
+                );
+            }
+            self.cursor_idx = idx;
             self.cursor_type = cols
                 .iter()
                 .find(|c| types::fold_ident(&c.name) == cursor)
@@ -216,7 +228,7 @@ impl SourcePlugin for OracleSourcePlugin {
     }
 
     async fn schema(&mut self) -> Result<Schema> {
-        Ok(self.schema.as_ref().unwrap().as_ref().clone())
+        Ok(self.schema.as_ref().context("oracle source: not configured")?.as_ref().clone())
     }
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
@@ -226,7 +238,7 @@ impl SourcePlugin for OracleSourcePlugin {
             return Ok(None);
         }
         let end = (self.pos + self.batch_size).min(self.rows.len());
-        let schema = self.schema.as_ref().unwrap().clone();
+        let schema = self.schema.as_ref().context("oracle source: not configured")?.clone();
         let slice = &self.rows[self.pos..end];
 
         // High watermark: rows are ordered by the cursor ascending, so the last

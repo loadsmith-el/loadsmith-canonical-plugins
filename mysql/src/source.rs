@@ -1,14 +1,16 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use loadsmith_plugin_sdk::SourcePlugin;
-use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Row};
+use mysql_async::prelude::{Query, Queryable};
+use mysql_async::{Conn, ResultSetStream, Row, TextProtocol};
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::conn::ConnectionConfig;
+use crate::vocab::TimestampUnit;
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
@@ -35,6 +37,11 @@ struct MysqlConfig {
 
     #[serde(default)]
     incremental: Option<IncrementalConfig>,
+
+    /// Unit of the emitted timestamps (default `ms`; `us` keeps the full
+    /// precision of `DATETIME(6)`/`TIMESTAMP(6)`).
+    #[serde(default)]
+    timestamp_unit: TimestampUnit,
 }
 
 fn default_batch_size() -> usize {
@@ -44,18 +51,22 @@ fn default_batch_size() -> usize {
 /// Upper bound on the polite disconnect in `cancel()`.
 const CANCEL_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The row stream of the running query. It owns the connection, so it is
+/// `'static` and lives in the plugin across `next_batch` calls.
+type RowStream = ResultSetStream<'static, 'static, 'static, Row, TextProtocol>;
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
-/// MySQL source.
-///
-/// `mysql_async`'s `QueryResult` (0.37) exposes no `Stream` adapter, so rows are
-/// collected once on first read and then handed out in `batch_size` chunks. This
-/// is fine for the bounded smoke/TLS workloads; a future improvement for very
-/// large extracts is a `for_each`-backed bounded bridge.
+/// MySQL source. The query's rows are streamed from the server
+/// (`QueryResult::stream`), `batch_size` at a time: memory holds one batch,
+/// not the result set.
 pub struct MysqlSourcePlugin {
+    /// The connection, until the query starts (then the stream owns it).
     conn: Option<Conn>,
+    stream: Option<RowStream>,
     schema: Option<Arc<Schema>>,
     batch_size: usize,
+    exhausted: bool,
 
     query: String,
     cursor_column: Option<String>,
@@ -63,10 +74,6 @@ pub struct MysqlSourcePlugin {
     initial_value: Option<String>,
     resume_value: Option<String>,
     last_cursor_value: Option<String>,
-
-    rows: Vec<Row>,
-    pos: usize,
-    loaded: bool,
 }
 
 impl Default for MysqlSourcePlugin {
@@ -79,17 +86,16 @@ impl MysqlSourcePlugin {
     pub fn new() -> Self {
         Self {
             conn: None,
+            stream: None,
             schema: None,
             batch_size: 1000,
+            exhausted: false,
             query: String::new(),
             cursor_column: None,
             cursor_idx: None,
             initial_value: None,
             resume_value: None,
             last_cursor_value: None,
-            rows: Vec::new(),
-            pos: 0,
-            loaded: false,
         }
     }
 
@@ -105,7 +111,7 @@ impl MysqlSourcePlugin {
                 let ident = format!("`{}`", col.replace('`', "``"));
                 let bound = self.resume_value.as_ref().or(self.initial_value.as_ref());
                 let where_clause = match bound {
-                    Some(v) => format!(" WHERE _ls.{ident} > '{}'", v.replace('\'', "''")),
+                    Some(v) => format!(" WHERE _ls.{ident} > '{}'", v.replace('\'', "''").replace('\\', "\\\\")),
                     None => String::new(),
                 };
                 format!("SELECT * FROM ({}) AS _ls{where_clause} ORDER BY _ls.{ident} ASC", self.query)
@@ -113,17 +119,16 @@ impl MysqlSourcePlugin {
         }
     }
 
-    /// Runs the query and buffers all rows, deferred until the first batch so the
-    /// resume watermark (delivered after `configure`) is folded in.
-    async fn ensure_loaded(&mut self) -> Result<()> {
-        if self.loaded {
+    /// Starts the query on first use, so the resume watermark (delivered after
+    /// `configure`) is folded in.
+    async fn ensure_stream(&mut self) -> Result<()> {
+        if self.stream.is_some() || self.exhausted {
             return Ok(());
         }
         let query = self.cursor_query();
-        let conn = self.conn.as_mut().context("not configured")?;
-        self.rows = conn.query_iter(query).await.context("query failed")?
-            .collect::<Row>().await.context("row fetch failed")?;
-        self.loaded = true;
+        let conn = self.conn.take().context("mysql source: not configured")?;
+        let stream: RowStream = query.stream::<Row, _>(conn).await.context("query failed")?;
+        self.stream = Some(stream);
         Ok(())
     }
 }
@@ -163,11 +168,14 @@ impl SourcePlugin for MysqlSourcePlugin {
         // Schema inference via a prepared statement; the incremental wrapper
         // preserves the column set, so the base query's columns are authoritative.
         let stmt = conn.prep(&cfg.query).await.context("failed to prepare query")?;
-        let schema = crate::types::columns_to_schema(stmt.columns().as_ref());
+        let schema = crate::types::columns_to_schema(stmt.columns().as_ref(), cfg.timestamp_unit.arrow());
+        conn.close(stmt).await.context("closing the prepared statement")?;
 
         if let Some(inc) = &cfg.incremental {
-            self.cursor_idx = schema.fields().iter().position(|f| f.name() == &inc.cursor_column);
-            self.cursor_column = Some(inc.cursor_column.clone());
+            let idx = cursor_index(&inc.cursor_column, &schema)?;
+            self.cursor_idx = Some(idx);
+            // The column's own name: the cursor query quotes it.
+            self.cursor_column = Some(schema.field(idx).name().clone());
             self.initial_value = inc.initial_value.clone();
         }
 
@@ -179,44 +187,70 @@ impl SourcePlugin for MysqlSourcePlugin {
     }
 
     async fn schema(&mut self) -> Result<Schema> {
-        Ok(self.schema.as_ref().unwrap().as_ref().clone())
+        Ok(self.schema.as_ref().context("mysql source: not configured")?.as_ref().clone())
     }
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        self.ensure_loaded().await?;
+        self.ensure_stream().await?;
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(None);
+        };
 
-        if self.pos >= self.rows.len() {
+        let mut rows: Vec<Row> = Vec::with_capacity(self.batch_size);
+        while rows.len() < self.batch_size {
+            match stream.try_next().await.context("row fetch failed")? {
+                Some(row) => rows.push(row),
+                None => {
+                    // End of the result set: drop the stream (and with it the
+                    // connection).
+                    self.stream = None;
+                    self.exhausted = true;
+                    break;
+                }
+            }
+        }
+        if rows.is_empty() {
             return Ok(None);
         }
-        let end = (self.pos + self.batch_size).min(self.rows.len());
-        let schema = self.schema.as_ref().unwrap().clone();
-        let slice = &self.rows[self.pos..end];
 
         // High watermark: rows are ordered by the cursor ascending, so the last
         // row of this chunk carries the largest cursor value seen so far.
         if let Some(idx) = self.cursor_idx {
-            if let Some(last) = slice.last() {
-                if let Some(v) = last.as_ref(idx).and_then(crate::types::value_text) {
-                    self.last_cursor_value = Some(v);
-                }
+            if let Some(v) = rows.last().and_then(|last| last.as_ref(idx)).and_then(crate::types::value_text) {
+                self.last_cursor_value = Some(v);
             }
         }
 
-        let batch = crate::types::rows_to_batch(slice, &schema).context("RecordBatch build failed")?;
-        self.pos = end;
+        let schema = self.schema.as_ref().context("mysql source: not configured")?.clone();
+        let batch = crate::types::rows_to_batch(&rows, &schema).context("RecordBatch build failed")?;
         Ok(Some(batch))
     }
 
     async fn cancel(&mut self) {
-        // The SDK may have dropped an in-flight `next_batch` (the buffered
-        // query) before calling this, leaving the connection mid-result. A
-        // polite COM_QUIT is worth a short wait, never more: on timeout the
-        // connection is dropped, and the server ends the session when the
-        // socket closes.
+        // A running query's stream owns the connection: dropping it closes the
+        // socket, and the server ends the session. Before the query starts, a
+        // polite COM_QUIT is worth a short wait, never more.
+        self.stream = None;
         if let Some(conn) = self.conn.take() {
             let _ = tokio::time::timeout(CANCEL_DISCONNECT_TIMEOUT, conn.disconnect()).await;
         }
     }
+}
+
+/// The index of the incremental cursor among the query's columns. MySQL
+/// column names are case-insensitive, so an exact match wins, then a
+/// case-insensitive one; a name that is not a column fails (it would
+/// otherwise silently never advance the watermark).
+fn cursor_index(cursor: &str, schema: &Schema) -> Result<usize> {
+    let fields = schema.fields();
+    if let Some(i) = fields.iter().position(|f| f.name() == cursor) {
+        return Ok(i);
+    }
+    if let Some(i) = fields.iter().position(|f| f.name().eq_ignore_ascii_case(cursor)) {
+        return Ok(i);
+    }
+    let names = fields.iter().map(|f| format!("`{}`", f.name())).collect::<Vec<_>>().join(", ");
+    bail!("incremental.cursor_column `{cursor}` is not a column of the query; its columns are {names}")
 }
 
 #[cfg(test)]
@@ -240,6 +274,7 @@ mod tests {
         assert_eq!(cfg.conn.dbname, "lab");
         assert_eq!(cfg.batch_size, 1000);
         assert!(cfg.incremental.is_none());
+        assert_eq!(cfg.timestamp_unit, TimestampUnit::Ms);
     }
 
     #[test]
@@ -248,10 +283,12 @@ mod tests {
             "dbname": "lab", "user": "lab", "password": "lab",
             "query": "SELECT id, updated_at FROM t",
             "tls": { "mode": "require" },
+            "timestamp_unit": "us",
             "incremental": { "cursor_column": "updated_at", "initial_value": "2026-01-01" }
         });
         let cfg: MysqlConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.conn.tls.is_some());
+        assert_eq!(cfg.timestamp_unit, TimestampUnit::Us);
         assert_eq!(cfg.incremental.unwrap().cursor_column, "updated_at");
     }
 
@@ -269,6 +306,16 @@ mod tests {
             .to_string();
         assert!(err.contains("`prot`") && err.contains("`tls.root_crt`"), "{err}");
         assert!(PluginConfig::new(block, UnknownKeys::Warn).parse::<MysqlConfig>().is_ok());
+    }
+
+    #[test]
+    fn cursor_column_is_validated_case_insensitively() {
+        use arrow_schema::{DataType, Field};
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("Updated_At", DataType::Utf8, true)]);
+        assert_eq!(cursor_index("Updated_At", &schema).unwrap(), 1);
+        assert_eq!(cursor_index("updated_at", &schema).unwrap(), 1);
+        let e = cursor_index("updatedat", &schema).unwrap_err().to_string();
+        assert!(e.contains("not a column of the query") && e.contains("`Updated_At`"), "{e}");
     }
 
     #[test]
@@ -301,10 +348,10 @@ mod tests {
     fn cursor_query_resume_priority_and_escaping() {
         let mut p = plugin_with("SELECT c FROM t", Some("we`ird"));
         p.initial_value = Some("2000-01-01".into());
-        p.resume_value = Some("o'brien".into());
+        p.resume_value = Some("o'brien\\".into());
         let q = p.cursor_query();
         assert!(q.contains("`we``ird`"));
-        assert!(q.contains("> 'o''brien'"));
+        assert!(q.contains("> 'o''brien\\\\'"), "{q}");
         assert!(!q.contains("2000-01-01"));
     }
 }

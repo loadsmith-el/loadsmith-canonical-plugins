@@ -266,13 +266,14 @@ impl DestinationPlugin for OracleDestPlugin {
             return Ok(());
         }
         let staged = self.staging_table.is_some();
+        let targets: Vec<Option<&'static DbType>> = self.columns.iter().map(|c| self.target_type(c)).collect();
 
         // Materialise all binds (owned) up front, then run the array DML.
         let mut rows: Vec<Vec<Bind>> = Vec::with_capacity(nrows);
         for row in 0..nrows {
             let mut cells: Vec<Bind> = Vec::with_capacity(batch.num_columns() + 1);
             for col in 0..batch.num_columns() {
-                cells.push(cell_to_bind(batch.column(col), row)?);
+                cells.push(cell_to_bind(batch.column(col), row, targets.get(col).copied().flatten())?);
             }
             if staged {
                 cells.push(Bind::Text(Some((self.rows_written + row as u64).to_string())));

@@ -123,6 +123,83 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+// ── Timestamp unit ───────────────────────────────────────────────────────────
+
+config_enum! {
+    /// `timestamp_unit`: the Arrow unit a source emits timestamps in. The
+    /// default `ms` is the same in every plugin; a finer unit keeps the
+    /// database's own precision.
+    #[derive(Default)]
+    pub enum TimestampUnit for "timestamp_unit" {
+        S = "s",
+        #[default]
+        Ms = "ms",
+        Us = "us",
+        Ns = "ns",
+    }
+    retired {
+        "second" => "s", "seconds" => "s", "sec" => "s",
+        "millisecond" => "ms", "milliseconds" => "ms", "millis" => "ms",
+        "microsecond" => "us", "microseconds" => "us", "micros" => "us", "µs" => "us",
+        "nanosecond" => "ns", "nanoseconds" => "ns", "nanos" => "ns",
+    }
+}
+
+impl TimestampUnit {
+    /// The Arrow time unit.
+    #[allow(dead_code)]
+    pub fn arrow(self) -> arrow_schema::TimeUnit {
+        match self {
+            TimestampUnit::S => arrow_schema::TimeUnit::Second,
+            TimestampUnit::Ms => arrow_schema::TimeUnit::Millisecond,
+            TimestampUnit::Us => arrow_schema::TimeUnit::Microsecond,
+            TimestampUnit::Ns => arrow_schema::TimeUnit::Nanosecond,
+        }
+    }
+}
+
+/// `dt` (a UTC wall clock) as an epoch value in `unit`, floored to it. `ns`
+/// covers the years 1677–2262 only; a value outside fails with a hint.
+#[allow(dead_code)]
+pub fn epoch_in(dt: chrono::NaiveDateTime, unit: arrow_schema::TimeUnit) -> Result<i64, String> {
+    use arrow_schema::TimeUnit::*;
+    let utc = dt.and_utc();
+    Ok(match unit {
+        Second => utc.timestamp(),
+        Millisecond => utc.timestamp_millis(),
+        Microsecond => utc.timestamp_micros(),
+        Nanosecond => utc.timestamp_nanos_opt().ok_or_else(|| {
+            format!("{dt} is outside the nanosecond range (1677-2262); use `timestamp_unit: us`")
+        })?,
+    })
+}
+
+/// An epoch value in `unit` back to a UTC wall clock.
+#[allow(dead_code)]
+pub fn from_epoch(v: i64, unit: arrow_schema::TimeUnit) -> Option<chrono::NaiveDateTime> {
+    use arrow_schema::TimeUnit::*;
+    let dt = match unit {
+        Second => chrono::DateTime::from_timestamp(v, 0),
+        Millisecond => chrono::DateTime::from_timestamp_millis(v),
+        Microsecond => chrono::DateTime::from_timestamp_micros(v),
+        Nanosecond => Some(chrono::DateTime::from_timestamp_nanos(v)),
+    };
+    dt.map(|d| d.naive_utc())
+}
+
+/// A time-of-day value in `unit` (seconds..nanoseconds since midnight).
+#[allow(dead_code)]
+pub fn time_of_day(v: i64, unit: arrow_schema::TimeUnit) -> Option<chrono::NaiveTime> {
+    use arrow_schema::TimeUnit::*;
+    let (secs, nanos) = match unit {
+        Second => (v, 0),
+        Millisecond => (v.div_euclid(1_000), v.rem_euclid(1_000) * 1_000_000),
+        Microsecond => (v.div_euclid(1_000_000), v.rem_euclid(1_000_000) * 1_000),
+        Nanosecond => (v.div_euclid(1_000_000_000), v.rem_euclid(1_000_000_000)),
+    };
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(u32::try_from(secs).ok()?, nanos as u32)
+}
+
 // ── The shared `tls` block ───────────────────────────────────────────────────
 
 config_enum! {
@@ -179,6 +256,25 @@ impl TlsBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_units() {
+        let u: TimestampUnit = serde_json::from_value(serde_json::json!("us")).unwrap();
+        assert_eq!(u.arrow(), arrow_schema::TimeUnit::Microsecond);
+        let e = serde_json::from_value::<TimestampUnit>(serde_json::json!("microseconds")).unwrap_err().to_string();
+        assert!(e.contains("did you mean `us`?"), "{e}");
+        let dt = chrono::NaiveDate::from_ymd_opt(1969, 12, 31).unwrap().and_hms_micro_opt(23, 59, 59, 999_999).unwrap();
+        assert_eq!(epoch_in(dt, arrow_schema::TimeUnit::Millisecond).unwrap(), -1);
+        assert_eq!(epoch_in(dt, arrow_schema::TimeUnit::Microsecond).unwrap(), -1);
+        assert_eq!(epoch_in(dt, arrow_schema::TimeUnit::Second).unwrap(), -1);
+        let far = chrono::NaiveDate::from_ymd_opt(3000, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        assert!(epoch_in(far, arrow_schema::TimeUnit::Nanosecond).unwrap_err().contains("timestamp_unit: us"));
+        assert_eq!(from_epoch(-1, arrow_schema::TimeUnit::Microsecond), Some(dt));
+        assert_eq!(
+            time_of_day(3_723_000_001, arrow_schema::TimeUnit::Nanosecond).unwrap().to_string(),
+            "00:00:03.723000001"
+        );
+    }
 
     #[test]
     fn tls_mode_suggests_the_kebab_case_spelling() {

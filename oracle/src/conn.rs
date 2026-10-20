@@ -37,12 +37,17 @@ use serde::Deserialize;
 
 // ── Canonical text formats (shared by source TO_CHAR and destination TO_*) ─────
 
-/// `DATE` → text. Oracle DATE always carries a time component.
+/// `DATE` ⇄ text. Oracle DATE always carries a time component.
 pub const FMT_DATE: &str = "YYYY-MM-DD HH24:MI:SS";
-/// `TIMESTAMP` → text, microsecond precision (canonical data is µs).
-pub const FMT_TIMESTAMP: &str = "YYYY-MM-DD HH24:MI:SS.FF6";
+/// `TIMESTAMP` → text (`TO_CHAR`), nanosecond precision: every digit Oracle
+/// keeps (`TIMESTAMP(9)`).
+pub const FMT_TIMESTAMP_OUT: &str = "YYYY-MM-DD HH24:MI:SS.FF9";
+/// Text → `TIMESTAMP` (`TO_TIMESTAMP`): `FF` reads 0 to 9 fraction digits.
+pub const FMT_TIMESTAMP_IN: &str = "YYYY-MM-DD HH24:MI:SS.FF";
 /// `TIMESTAMP WITH [LOCAL] TIME ZONE` → text, with explicit offset.
-pub const FMT_TIMESTAMP_TZ: &str = "YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM";
+pub const FMT_TIMESTAMP_TZ_OUT: &str = "YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM";
+/// Text → `TIMESTAMP WITH TIME ZONE`.
+pub const FMT_TIMESTAMP_TZ_IN: &str = "YYYY-MM-DD HH24:MI:SS.FF TZH:TZM";
 
 // ── Config structs ─────────────────────────────────────────────────────────────
 

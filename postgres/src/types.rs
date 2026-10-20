@@ -3,9 +3,10 @@ use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow_array::{
     builder::{
         BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
-        Int32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+        Int32Builder, Int64Builder, StringBuilder,
     },
-    ArrayRef, ListArray, RecordBatch,
+    ArrayRef, ListArray, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -23,7 +24,7 @@ const HSTORE_TYPE_VALUE: &str = "hstore";
 static UNIX_EPOCH: std::sync::OnceLock<NaiveDate> = std::sync::OnceLock::new();
 
 fn unix_epoch() -> NaiveDate {
-    *UNIX_EPOCH.get_or_init(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+    *UNIX_EPOCH.get_or_init(NaiveDate::default) // 1970-01-01
 }
 
 /// Maps a Postgres type to an Arrow DataType.
@@ -31,12 +32,12 @@ fn unix_epoch() -> NaiveDate {
 /// - `array` (any element type) → `DataType::List` with a recursively-mapped inner type
 /// - `hstore` → `DataType::Utf8` (JSON-encoded; see HSTORE_TYPE_KEY metadata on the Field)
 /// - everything else → mapped by type name (NUMERIC/UUID/etc. fall through to Utf8)
-pub fn pg_type_to_arrow(pg_type: &PgType) -> DataType {
+pub fn pg_type_to_arrow(pg_type: &PgType, unit: TimeUnit) -> DataType {
     if pg_type.name() == "hstore" {
         return DataType::Utf8;
     }
     if let Kind::Array(inner) = pg_type.kind() {
-        let inner_dt = pg_type_to_arrow(inner);
+        let inner_dt = pg_type_to_arrow(inner, unit);
         return DataType::List(Arc::new(Field::new("item", inner_dt, true)));
     }
     match pg_type.name() {
@@ -46,21 +47,21 @@ pub fn pg_type_to_arrow(pg_type: &PgType) -> DataType {
         "float8" => DataType::Float64,
         "bool" => DataType::Boolean,
         "date" => DataType::Date32,
-        "timestamp" => DataType::Timestamp(TimeUnit::Millisecond, None),
+        "timestamp" => DataType::Timestamp(unit, None),
         // An absolute instant: decoded to UTC, and tagged so downstream (e.g.
         // Parquet) keeps it zone-aware.
-        "timestamptz" => DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        "timestamptz" => DataType::Timestamp(unit, Some("UTC".into())),
         "bytea" => DataType::Binary,
         _ => DataType::Utf8,
     }
 }
 
 /// Builds an Arrow Schema from a slice of tokio-postgres columns.
-pub fn columns_to_schema(cols: &[Column]) -> Schema {
+pub fn columns_to_schema(cols: &[Column], unit: TimeUnit) -> Schema {
     let fields: Vec<Field> = cols
         .iter()
         .map(|c| {
-            let dt = pg_type_to_arrow(c.type_());
+            let dt = pg_type_to_arrow(c.type_(), unit);
             if c.type_().name() == "hstore" {
                 let meta = HashMap::from([(
                     HSTORE_TYPE_KEY.to_string(),
@@ -118,7 +119,8 @@ fn build_list(values: &[Option<&str>], inner_field: Arc<Field>, col_name: &str) 
                 is_valid.push(false);
             }
             Some(text) => {
-                let parsed = parse_pg_array_text(text);
+                let parsed = parse_pg_array_text(text)
+                    .map_err(|e| anyhow::anyhow!("col {col_name}: array '{text}': {e}"))?;
                 lengths.push(parsed.len());
                 is_valid.push(true);
                 items.extend(parsed);
@@ -159,19 +161,25 @@ fn build_values(values: &[Option<&str>], field: &Field, col_name: &str) -> Resul
         DataType::Float64 => parsed!(Float64Builder, |v: &str| v.parse::<f64>()),
         DataType::Boolean => parsed!(BooleanBuilder, parse_bool),
         DataType::Date32 => parsed!(Date32Builder, parse_date_days),
-        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+        DataType::Timestamp(unit, tz) => {
             let with_offset = tz.is_some();
-            let mut b = TimestampMillisecondBuilder::with_capacity(values.len());
+            let mut out: Vec<Option<i64>> = Vec::with_capacity(values.len());
             for v in values {
-                match v {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        parse_timestamp_millis(v, with_offset)
+                out.push(match v {
+                    None => None,
+                    Some(v) => Some(
+                        parse_timestamp(v, with_offset, *unit)
                             .map_err(|e| anyhow::anyhow!("col {col_name}: '{v}': {e}"))?,
                     ),
-                }
+                });
             }
-            Arc::new(b.finish().with_timezone_opt(tz.clone())) as ArrayRef
+            let tz = tz.clone();
+            match unit {
+                TimeUnit::Second => Arc::new(TimestampSecondArray::from(out).with_timezone_opt(tz)) as ArrayRef,
+                TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(out).with_timezone_opt(tz)),
+                TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(out).with_timezone_opt(tz)),
+                TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(out).with_timezone_opt(tz)),
+            }
         }
         DataType::Binary => {
             let mut b = BinaryBuilder::with_capacity(values.len(), values.len() * 16);
@@ -213,73 +221,78 @@ fn parse_bool(v: &str) -> Result<bool> {
     }
 }
 
-/// Parses the Postgres text-protocol array format `{val1,val2,NULL,...}` into a Vec.
-/// Quoted elements (`"..."`) have backslash-escape handling; unquoted `NULL` → `None`.
-fn parse_pg_array_text(text: &str) -> Vec<Option<String>> {
-    let text = text.trim();
-    let inner = match text.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        Some(s) => s,
-        None => return vec![Some(text.to_string())],
-    };
-    if inner.is_empty() {
-        return Vec::new();
+/// Parses a one-dimensional Postgres array in text form (`{a,"b c",NULL}`)
+/// into its elements.
+///
+/// A quoted element (`"…"`, with `\` escapes) is always a value — `"NULL"` is
+/// the string `NULL` — while an unquoted `NULL` is SQL NULL. A non-default
+/// lower bound (`[0:2]={…}`) is accepted. A multi-dimensional value
+/// (`{{1,2},{3,4}}`) has no single-level Arrow list, so it is rejected with a
+/// hint to keep its shape as JSON.
+fn parse_pg_array_text(text: &str) -> Result<Vec<Option<String>>> {
+    let mut text = text.trim();
+    // Explicit bounds: `[1:3]={...}` (or `[1:2][1:2]={...}` for 2-D).
+    if text.starts_with('[') {
+        let eq = text.find('=').ok_or_else(|| anyhow::anyhow!("malformed array bounds"))?;
+        if text[..eq].matches('[').count() > 1 {
+            bail!(multi_dim_error());
+        }
+        text = &text[eq + 1..];
     }
+    let inner = text
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| anyhow::anyhow!("not an array literal"))?;
 
     let mut result = Vec::new();
     let mut chars = inner.chars().peekable();
-
+    if chars.peek().is_none() {
+        return Ok(result);
+    }
     loop {
-        while chars.peek() == Some(&' ') {
-            chars.next();
-        }
-        if chars.peek().is_none() {
-            break;
-        }
-
-        if chars.peek() == Some(&'"') {
-            chars.next(); // consume opening "
-            let mut value = String::new();
-            loop {
-                match chars.next() {
-                    None => break,
-                    Some('\\') => {
-                        if let Some(c) = chars.next() {
-                            value.push(c);
-                        }
-                    }
-                    Some('"') => break,
-                    Some(c) => value.push(c),
-                }
-            }
-            result.push(Some(value));
-        } else {
-            let mut value = String::new();
-            while let Some(&c) = chars.peek() {
-                if c == ',' {
-                    break;
-                }
-                value.push(c);
+        match chars.peek() {
+            Some('{') => bail!(multi_dim_error()),
+            Some('"') => {
                 chars.next();
-            }
-            let value = value.trim().to_string();
-            if value.eq_ignore_ascii_case("null") {
-                result.push(None);
-            } else {
+                let mut value = String::new();
+                loop {
+                    match chars.next() {
+                        None => bail!("unterminated quoted element"),
+                        Some('\\') => value.push(chars.next().ok_or_else(|| anyhow::anyhow!("dangling '\\'"))?),
+                        Some('"') => break,
+                        Some(c) => value.push(c),
+                    }
+                }
                 result.push(Some(value));
             }
+            _ => {
+                let mut value = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == ',' {
+                        break;
+                    }
+                    if c == '"' || c == '{' || c == '}' {
+                        bail!("unexpected '{c}' in an unquoted element");
+                    }
+                    value.push(c);
+                    chars.next();
+                }
+                let value = value.trim();
+                result.push(if value.eq_ignore_ascii_case("null") { None } else { Some(value.to_string()) });
+            }
         }
-
-        while chars.peek() == Some(&' ') {
-            chars.next();
-        }
-        if chars.peek() == Some(&',') {
-            chars.next();
-        } else {
-            break;
+        match chars.next() {
+            None => return Ok(result),
+            Some(',') => {}
+            Some(c) => bail!("expected ',' between elements, got '{c}'"),
         }
     }
+}
 
-    result
+fn multi_dim_error() -> String {
+    "multi-dimensional arrays are not supported (an Arrow list has one level); select \
+     `array_to_json(col)` to keep the shape as JSON, or `col::text`"
+        .to_string()
 }
 
 /// Converts the Postgres hstore text format `"k1"=>"v1", "k2"=>NULL` to a JSON string.
@@ -415,14 +428,14 @@ fn parse_date_days(s: &str) -> Result<i32> {
     Ok(date.signed_duration_since(unix_epoch()).num_days() as i32)
 }
 
-/// Parses postgres `timestamp` / `timestamptz` text (DateStyle ISO) → milliseconds
-/// since the Unix epoch (UTC).
+/// Parses postgres `timestamp` / `timestamptz` text (DateStyle ISO) → an epoch
+/// value in `unit` (UTC).
 ///
 /// `timestamp`: `YYYY-MM-DD HH:MM:SS[.ffffff][ BC]`. `timestamptz` additionally
 /// carries the session zone's UTC offset right after the time — `+HH`, `+HH:MM`
 /// or, for pre-standard-time local mean time, `+HH:MM:SS` — which is subtracted
-/// to get the UTC instant. Fractions below a millisecond are truncated.
-fn parse_timestamp_millis(s: &str, with_offset: bool) -> Result<i64> {
+/// to get the UTC instant. Digits finer than `unit` are truncated (floored).
+fn parse_timestamp(s: &str, with_offset: bool, unit: TimeUnit) -> Result<i64> {
     reject_infinity(s)?;
     let (date, time) = parse_iso_date(s)?;
     let (time, offset_secs) = if with_offset {
@@ -434,7 +447,8 @@ fn parse_timestamp_millis(s: &str, with_offset: bool) -> Result<i64> {
         (time, 0)
     };
     let time = NaiveTime::parse_from_str(time, "%H:%M:%S%.f").map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(NaiveDateTime::new(date, time).and_utc().timestamp_millis() - offset_secs * 1000)
+    let utc = NaiveDateTime::new(date, time) - chrono::Duration::seconds(offset_secs);
+    crate::vocab::epoch_in(utc, unit).map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Parses a `+HH[:MM[:SS]]` / `-HH[:MM[:SS]]` UTC offset into seconds.
@@ -457,10 +471,17 @@ fn parse_utc_offset(s: &str) -> Result<i64> {
 
 /// Parses postgres bytea hex format ("\\xdeadbeef") → bytes.
 fn parse_bytea_hex(s: &str) -> Result<Vec<u8>> {
-    let hex = s.strip_prefix("\\x").unwrap_or(s);
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| anyhow::anyhow!("{e}")))
+    let hex = s.strip_prefix("\\x").unwrap_or(s).as_bytes();
+    if !hex.len().is_multiple_of(2) {
+        bail!("odd number of hex digits");
+    }
+    hex.chunks(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+                .ok_or_else(|| anyhow::anyhow!("invalid hex digits"))
+        })
         .collect()
 }
 
@@ -474,36 +495,73 @@ mod tests {
 
     #[test]
     fn array_empty() {
-        assert_eq!(parse_pg_array_text("{}"), Vec::<Option<String>>::new());
+        assert_eq!(parse_pg_array_text("{}").unwrap(), Vec::<Option<String>>::new());
+    }
+
+    #[test]
+    fn array_quoted_null_is_a_string_and_bounds_are_accepted() {
+        let v = parse_pg_array_text(r#"{"NULL",NULL,"a,b","{x}",""}"#).unwrap();
+        assert_eq!(v, vec![Some("NULL".into()), None, Some("a,b".into()), Some("{x}".into()), Some("".into())]);
+        assert_eq!(parse_pg_array_text("[0:1]={7,8}").unwrap(), vec![Some("7".into()), Some("8".into())]);
+    }
+
+    #[test]
+    fn array_multi_dimensional_is_a_clear_error() {
+        for text in ["{{1,2},{3,4}}", "[1:2][1:1]={{1},{2}}"] {
+            let e = parse_pg_array_text(text).unwrap_err().to_string();
+            assert!(e.contains("array_to_json"), "{e}");
+        }
+        assert!(parse_pg_array_text("{\"open").is_err());
+        assert!(parse_pg_array_text("nope").is_err());
+    }
+
+    #[test]
+    fn timestamps_in_every_unit() {
+        let s = "2024-01-15 12:30:45.123456+00";
+        assert_eq!(parse_timestamp(s, true, TimeUnit::Second).unwrap(), 1_705_321_845);
+        assert_eq!(parse_timestamp(s, true, TimeUnit::Microsecond).unwrap(), 1_705_321_845_123_456);
+        assert_eq!(parse_timestamp(s, true, TimeUnit::Nanosecond).unwrap(), 1_705_321_845_123_456_000);
+        assert!(parse_timestamp("3000-01-01 00:00:00", false, TimeUnit::Nanosecond).is_err());
+        let field = Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true);
+        let arr = build_values(&[Some(s), None], &field, "ts").unwrap();
+        assert_eq!(arr.data_type(), field.data_type());
+        assert_eq!(arr.null_count(), 1);
+    }
+
+    #[test]
+    fn bytea_hex_rejects_bad_input_without_panicking() {
+        assert!(parse_bytea_hex("\\xabc").is_err());
+        assert!(parse_bytea_hex("\\xzz").is_err());
+        assert!(parse_bytea_hex("\\xé1").is_err());
     }
 
     #[test]
     fn array_integers() {
-        let v = parse_pg_array_text("{1,2,3}");
+        let v = parse_pg_array_text("{1,2,3}").unwrap();
         assert_eq!(v, vec![Some("1".into()), Some("2".into()), Some("3".into())]);
     }
 
     #[test]
     fn array_text_quoted() {
-        let v = parse_pg_array_text(r#"{"hello","world"}"#);
+        let v = parse_pg_array_text(r#"{"hello","world"}"#).unwrap();
         assert_eq!(v, vec![Some("hello".into()), Some("world".into())]);
     }
 
     #[test]
     fn array_text_with_spaces_in_value() {
-        let v = parse_pg_array_text(r#"{"hello world","foo bar"}"#);
+        let v = parse_pg_array_text(r#"{"hello world","foo bar"}"#).unwrap();
         assert_eq!(v, vec![Some("hello world".into()), Some("foo bar".into())]);
     }
 
     #[test]
     fn array_with_null_element() {
-        let v = parse_pg_array_text("{1,NULL,3}");
+        let v = parse_pg_array_text("{1,NULL,3}").unwrap();
         assert_eq!(v, vec![Some("1".into()), None, Some("3".into())]);
     }
 
     #[test]
     fn array_quoted_with_backslash_escape() {
-        let v = parse_pg_array_text(r#"{"say \"hi\""}"#);
+        let v = parse_pg_array_text(r#"{"say \"hi\""}"#).unwrap();
         assert_eq!(v, vec![Some(r#"say "hi""#.into())]);
     }
 
@@ -543,7 +601,7 @@ mod tests {
     #[test]
     fn type_int4_array_becomes_list_of_int32() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::INT4_ARRAY);
+        let dt = pg_type_to_arrow(&Type::INT4_ARRAY, TimeUnit::Millisecond);
         assert!(matches!(dt, DataType::List(_)));
         if let DataType::List(inner) = dt {
             assert_eq!(inner.data_type(), &DataType::Int32);
@@ -553,14 +611,14 @@ mod tests {
     #[test]
     fn type_text_becomes_utf8() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::TEXT);
+        let dt = pg_type_to_arrow(&Type::TEXT, TimeUnit::Millisecond);
         assert_eq!(dt, DataType::Utf8);
     }
 
     #[test]
     fn type_float8_becomes_float64() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::FLOAT8);
+        let dt = pg_type_to_arrow(&Type::FLOAT8, TimeUnit::Millisecond);
         assert_eq!(dt, DataType::Float64);
     }
 
@@ -568,7 +626,7 @@ mod tests {
 
     #[test]
     fn parse_timestamp_millis_basic() {
-        let ms = parse_timestamp_millis("2024-01-15 12:30:45.123", false).unwrap();
+        let ms = parse_timestamp("2024-01-15 12:30:45.123", false, TimeUnit::Millisecond).unwrap();
         assert_eq!(ms, 1_705_321_845_123);
     }
 
@@ -581,29 +639,29 @@ mod tests {
             "2024-01-15 09:30:45.123-03",
             "2024-01-15 12:30:45.123456+00", // micros truncated
         ] {
-            assert_eq!(parse_timestamp_millis(s, true).unwrap(), utc, "{s}");
+            assert_eq!(parse_timestamp(s, true, TimeUnit::Millisecond).unwrap(), utc, "{s}");
         }
         // Local mean time offsets carry seconds (Asia/Kolkata, year 1).
         assert_eq!(
-            parse_timestamp_millis("0001-01-01 05:53:28+05:53:28", true).unwrap(),
+            parse_timestamp("0001-01-01 05:53:28+05:53:28", true, TimeUnit::Millisecond).unwrap(),
             -62_135_596_800_000
         );
-        assert!(parse_timestamp_millis("2024-01-15 12:30:45", true).is_err());
+        assert!(parse_timestamp("2024-01-15 12:30:45", true, TimeUnit::Millisecond).is_err());
     }
 
     #[test]
     fn bc_and_pre_epoch_values() {
         // Values cross-checked against Postgres 15 (extract(epoch …)).
         assert_eq!(parse_date_days("0044-03-15 BC").unwrap(), -735_160);
-        assert_eq!(parse_timestamp_millis("0044-03-15 12:00:00 BC", false).unwrap(), -63_517_780_800_000);
-        assert_eq!(parse_timestamp_millis("1969-12-31 23:59:59.999", false).unwrap(), -1);
+        assert_eq!(parse_timestamp("0044-03-15 12:00:00 BC", false, TimeUnit::Millisecond).unwrap(), -63_517_780_800_000);
+        assert_eq!(parse_timestamp("1969-12-31 23:59:59.999", false, TimeUnit::Millisecond).unwrap(), -1);
         // 1 BC (astronomical year 0) is a leap year.
         assert!(parse_date_days("0001-02-29 BC").is_ok());
     }
 
     #[test]
     fn infinity_is_a_clear_error() {
-        let e = parse_timestamp_millis("infinity", false).unwrap_err().to_string();
+        let e = parse_timestamp("infinity", false, TimeUnit::Millisecond).unwrap_err().to_string();
         assert!(e.contains("NULLIF"), "{e}");
         assert!(parse_date_days("-infinity").is_err());
     }

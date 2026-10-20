@@ -91,10 +91,15 @@ fn dur_err(s: &str) -> anyhow::Error {
 fn ssl_opts(cfg: &TlsBlock) -> Result<Option<SslOpts>> {
     let opts = match cfg.mode {
         TlsMode::Disable => return Ok(None),
+        // mysql_async has no opportunistic mode: it can't fall back to
+        // plaintext, so `prefer` would silently mean `require`.
+        TlsMode::Prefer => bail!(
+            "mysql: tls.mode `prefer` is not supported (the driver has no plaintext fallback); \
+             use `require` to always encrypt, or `disable`"
+        ),
         // Encrypt-only: no chain or hostname checks (mirrors loadsmith-tls's
-        // NoVerifier path). `Prefer` is treated as `Require` — mysql_async has no
-        // opportunistic mode, so once TLS is configured it is required.
-        TlsMode::Prefer | TlsMode::Require => SslOpts::default()
+        // NoVerifier path).
+        TlsMode::Require => SslOpts::default()
             .with_danger_accept_invalid_certs(true)
             .with_danger_skip_domain_validation(true),
         // Verify the chain against root_cert; skip the hostname for verify-ca.
@@ -138,9 +143,19 @@ pub fn build_opts(cfg: &ConnectionConfig) -> Result<Opts> {
     }
     if let Some(session) = &cfg.session {
         for (k, v) in session {
+            if k.trim().eq_ignore_ascii_case("time_zone") {
+                bail!(
+                    "mysql: `session.time_zone` can't be set: the session time zone is pinned to \
+                     '+00:00', so TIMESTAMP values cross as UTC instants (use CONVERT_TZ in the \
+                     query for local times)"
+                );
+            }
             init.push(format!("SET SESSION {k} = {v}"));
         }
     }
+    // TIMESTAMP columns are read and written in the session time zone: pin it
+    // to UTC so they cross as instants (DATETIME is unaffected).
+    init.push("SET time_zone = '+00:00'".to_string());
 
     let mut builder = OptsBuilder::default()
         .ip_or_hostname(cfg.host.clone())
@@ -202,6 +217,22 @@ mod tests {
     fn ssl_require_is_some() {
         let cfg = TlsBlock { mode: TlsMode::Require, ..Default::default() };
         assert!(ssl_opts(&cfg).unwrap().is_some());
+    }
+
+    #[test]
+    fn ssl_prefer_is_rejected() {
+        let cfg = TlsBlock { mode: TlsMode::Prefer, ..Default::default() };
+        assert!(ssl_opts(&cfg).unwrap_err().to_string().contains("`prefer` is not supported"));
+    }
+
+    #[test]
+    fn session_time_zone_is_pinned() {
+        let json = serde_json::json!({ "dbname": "d", "user": "u", "password": "p", "session": { "time_zone": "'+02:00'" } });
+        let cfg: ConnectionConfig = serde_json::from_value(json).unwrap();
+        assert!(build_opts(&cfg).unwrap_err().to_string().contains("pinned"));
+        let json = serde_json::json!({ "dbname": "d", "user": "u", "password": "p" });
+        let opts = build_opts(&serde_json::from_value(json).unwrap()).unwrap();
+        assert!(opts.init().iter().any(|s| s == "SET time_zone = '+00:00'"));
     }
 
     #[test]
