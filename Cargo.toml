@@ -28,14 +28,15 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Pinned Loadsmith SDK (bump `rev` to move every plugin to a newer SDK).
-loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "9258040b7ba2fdf5c7670b91a9a4fc78b8977444" }
-loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "9258040b7ba2fdf5c7670b91a9a4fc78b8977444" }
-loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "9258040b7ba2fdf5c7670b91a9a4fc78b8977444" }
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e" }
+loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e" }
 
 # Common deps (versions mirror the loadsmith workspace).
 tokio          = { version = "1", features = ["full"] }
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
+serde_yaml     = "0.9"
 anyhow         = "1"
 tracing        = "0.1"
 async-trait    = "0.1"

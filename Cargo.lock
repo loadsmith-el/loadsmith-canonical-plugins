@@ -2306,7 +2306,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "loadsmith-arrow"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=9258040b7ba2fdf5c7670b91a9a4fc78b8977444#9258040b7ba2fdf5c7670b91a9a4fc78b8977444"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2315,20 +2315,6 @@ dependencies = [
  "loadsmith-protocol",
  "serde_json",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "loadsmith-config-provider-file"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "loadsmith-plugin-sdk",
- "mimalloc",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2426,7 +2412,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=9258040b7ba2fdf5c7670b91a9a4fc78b8977444#9258040b7ba2fdf5c7670b91a9a4fc78b8977444"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2468,10 +2454,24 @@ dependencies = [
 [[package]]
 name = "loadsmith-protocol"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=9258040b7ba2fdf5c7670b91a9a4fc78b8977444#9258040b7ba2fdf5c7670b91a9a4fc78b8977444"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "loadsmith-provider-file"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "loadsmith-plugin-sdk",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
 ]
 
 [[package]]
@@ -2518,7 +2518,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-tls"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=9258040b7ba2fdf5c7670b91a9a4fc78b8977444#9258040b7ba2fdf5c7670b91a9a4fc78b8977444"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
 dependencies = [
  "anyhow",
  "rustls",
@@ -2530,14 +2530,16 @@ dependencies = [
 [[package]]
 name = "loadsmith-transport"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=9258040b7ba2fdf5c7670b91a9a4fc78b8977444#9258040b7ba2fdf5c7670b91a9a4fc78b8977444"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e#35aa0c94ac5f77fcc3536a364cd09f29a4b79e4e"
 dependencies = [
  "loadsmith-arrow",
  "loadsmith-protocol",
  "rustix 0.38.44",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3778,6 +3780,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4425,6 +4440,12 @@ dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
