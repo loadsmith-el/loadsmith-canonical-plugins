@@ -6,6 +6,12 @@
         "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/csv-v0.1.0/loadsmith-plugin.yaml"
       }
     },
+    "excel": {
+      "latest": "0.1.0",
+      "versions": {
+        "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/excel-v0.1.0/loadsmith-plugin.yaml"
+      }
+    },
     "file": {
       "latest": "0.1.2",
       "versions": {
