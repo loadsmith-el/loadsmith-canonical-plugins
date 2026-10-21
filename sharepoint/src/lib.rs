@@ -11,6 +11,7 @@ pub mod list;
 pub mod parse;
 pub mod source;
 pub mod table;
+pub mod telemetry;
 pub mod transform;
 pub mod vocab;
 

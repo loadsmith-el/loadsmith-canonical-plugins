@@ -15,6 +15,9 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::config::{parse_duration, SharepointConfig};
+use crate::telemetry::HttpCall;
+use loadsmith_plugin_sdk::telemetry;
+use tracing::Instrument;
 
 /// Longest wait between two attempts, whatever `Retry-After` asks for.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
@@ -66,24 +69,39 @@ impl GraphClient {
 
     /// Sends the request `build` makes, again on `429`/`503` (after the
     /// server's `Retry-After`, else an exponential backoff) and on a timeout or
-    /// a failed connection, at most `max_retries` more times.
-    async fn send(&self, what: &str, build: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    /// a failed connection, at most `max_retries` more times. Each retry is a
+    /// `retry` event of `call`'s span.
+    async fn send(
+        &self,
+        call: &mut HttpCall,
+        what: &str,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
         let mut attempt = 0u32;
         loop {
             let wait = match build().send().await {
                 Ok(resp) => match retry_wait(resp.status(), resp.headers(), attempt) {
                     Some(wait) if attempt < self.max_retries => {
+                        let retry_after = resp.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok());
+                        call.retry(attempt + 1, resp.status().as_str(), wait, retry_after);
                         tracing::warn!("{what} returned {}; retrying in {wait:?}", resp.status());
                         wait
                     }
-                    _ => return Ok(resp),
+                    _ => {
+                        call.response(resp.status().as_u16());
+                        return Ok(resp);
+                    }
                 },
                 Err(e) if (e.is_timeout() || e.is_connect()) && attempt < self.max_retries => {
                     let wait = backoff(attempt);
+                    call.retry(attempt + 1, if e.is_timeout() { "timeout" } else { "connect" }, wait, None);
                     tracing::warn!("{what} failed ({e}); retrying in {wait:?}");
                     wait
                 }
-                Err(e) => return Err(anyhow::Error::new(e).context(format!("{what} failed"))),
+                Err(e) => {
+                    call.transport_error(&e);
+                    return Err(anyhow::Error::new(e).context(format!("{what} failed")));
+                }
             };
             tokio::time::sleep(wait).await;
             attempt += 1;
@@ -91,12 +109,27 @@ impl GraphClient {
     }
 
     /// Returns a cached or freshly-minted access token (client-credentials grant).
+    /// Minting one is a `token` span around its `POST` (the token and the
+    /// secret are never recorded).
     async fn token(&mut self) -> Result<String> {
         if let Some((tok, expiry)) = &self.token {
             if Instant::now() < *expiry {
                 return Ok(tok.clone());
             }
         }
+        let span = if telemetry::enabled() {
+            tracing::info_span!("token", oauth.grant_type = "client_credentials", error = tracing::field::Empty)
+        } else {
+            tracing::Span::none()
+        };
+        let result = self.mint_token().instrument(span.clone()).await;
+        if let Err(e) = &result {
+            span.record("error", format!("{e:#}"));
+        }
+        result
+    }
+
+    async fn mint_token(&mut self) -> Result<String> {
         let url = format!("{}/{}/oauth2/v2.0/token", self.authority_url, self.tenant_id);
         let form = [
             ("client_id", self.client_id.as_str()),
@@ -104,8 +137,16 @@ impl GraphClient {
             ("scope", self.scope.as_str()),
             ("grant_type", "client_credentials"),
         ];
-        let resp = self.send("token request", || self.http.post(&url).form(&form)).await?;
-        let body = read_json(resp, "token").await?;
+        let mut call = HttpCall::new("POST", &url);
+        let span = call.span().clone();
+        let body = async {
+            let resp = self.send(&mut call, "token request", || self.http.post(&url).form(&form)).await?;
+            read_json(resp, "token").await
+        }
+        .instrument(span)
+        .await;
+        call.finish(&body);
+        let body = body?;
         let token = body
             .get("access_token")
             .and_then(Value::as_str)
@@ -117,24 +158,41 @@ impl GraphClient {
         Ok(token)
     }
 
-    async fn get(&mut self, url: &str) -> Result<reqwest::Response> {
-        let token = self.token().await?;
-        self.send(&format!("GET {url}"), || self.http.get(url).bearer_auth(&token)).await
-    }
-
+    /// One `GET` span (the body read included) per call.
     async fn get_json(&mut self, url: &str) -> Result<Value> {
-        let resp = self.get(url).await?;
-        read_json(resp, url).await
+        let token = self.token().await?;
+        let mut call = HttpCall::new("GET", url);
+        let span = call.span().clone();
+        let result = async {
+            let resp = self.send(&mut call, &format!("GET {url}"), || self.http.get(url).bearer_auth(&token)).await?;
+            read_json(resp, url).await
+        }
+        .instrument(span)
+        .await;
+        call.finish(&result);
+        result
     }
 
     async fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>> {
-        let resp = self.get(url).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("GET {url} returned {status}: {body}");
+        let token = self.token().await?;
+        let mut call = HttpCall::new("GET", url);
+        let span = call.span().clone();
+        let result = async {
+            let resp = self.send(&mut call, &format!("GET {url}"), || self.http.get(url).bearer_auth(&token)).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                bail!("GET {url} returned {status}: {body}");
+            }
+            Ok(resp.bytes().await.context("reading body bytes")?.to_vec())
         }
-        Ok(resp.bytes().await.context("reading body bytes")?.to_vec())
+        .instrument(span.clone())
+        .await;
+        if let Ok(bytes) = &result {
+            span.record("http.response.body.size", bytes.len() as u64);
+        }
+        call.finish(&result);
+        result
     }
 
     /// Resolves the site id from an explicit id or a `host/path` reference.
