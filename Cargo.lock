@@ -2338,8 +2338,9 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-schema",
  "async-trait",
- "loadsmith-arrow",
+ "chrono",
  "loadsmith-plugin-sdk",
  "mimalloc",
  "serde",
@@ -2350,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-destination-null"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2365,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-destination-parquet"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2556,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-sink-local-copy"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2566,6 +2567,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "loadsmith-sink-local-copy-chaos"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "loadsmith-plugin-sdk",
+ "loadsmith-sink-local-copy",
+ "tokio",
 ]
 
 [[package]]

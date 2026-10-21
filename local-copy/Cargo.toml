@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-sink-local-copy"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license.workspace = true
 
@@ -11,6 +11,10 @@ protocol = "^1"
 provides = [
     { kind = "sink", bin = "loadsmith-sink-local-copy" },
 ]
+
+# A library too: the never-released `local-copy-chaos` lab build wraps it.
+[lib]
+name = "loadsmith_local_copy"
 
 [[bin]]
 name = "loadsmith-sink-local-copy"

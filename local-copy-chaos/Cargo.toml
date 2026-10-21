@@ -1,0 +1,24 @@
+[package]
+name    = "loadsmith-sink-local-copy-chaos"
+version = "0.0.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Lab-only fault-injection build of the local-copy sink (never released)"
+
+# Deliberately NO [package.metadata.loadsmith]: this is not a plugin package.
+# It is never tagged, released or indexed; it exists so the lab can exercise the
+# core's sink supervisor (crash + respawn + resume) without a crash switch in
+# the released local-copy binary. Build it with the lab's `--plugin` and use
+# `sink: { type: local-copy-chaos }`.
+
+[[bin]]
+name = "loadsmith-sink-local-copy-chaos"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+async-trait          = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }
+loadsmith-sink-local-copy = { path = "../local-copy" }

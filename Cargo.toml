@@ -19,6 +19,7 @@ members = [
     "parquet",
     "null",
     "local-copy",
+    "local-copy-chaos",
     "postgres",
     "mysql",
     "sharepoint",
