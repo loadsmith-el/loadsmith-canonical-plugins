@@ -2,10 +2,11 @@ use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::TimeUnit;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::DestinationPlugin;
+use loadsmith_plugin_sdk::{telemetry, DestinationPlugin};
 use serde::Deserialize;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use tracing::Span;
 
 use crate::json::{self, Temporal};
 use crate::vocab::config_enum;
@@ -87,11 +88,14 @@ pub struct JsonlPlugin {
     settings: Option<Settings>,
     output: Option<BufWriter<std::fs::File>>,
     rows_written: u64,
+    /// The `write <file>` span: from `prepare` (file created) to `finalize`
+    /// (flushed), with `file.path`, `file.size` and `loadsmith.object.rows`.
+    file_span: Span,
 }
 
 impl JsonlPlugin {
     pub fn new() -> Self {
-        Self { settings: None, output: None, rows_written: 0 }
+        Self { settings: None, output: None, rows_written: 0, file_span: Span::none() }
     }
 }
 
@@ -119,6 +123,19 @@ impl DestinationPlugin for JsonlPlugin {
         let file = std::fs::File::create(path)
             .with_context(|| format!("cannot create output file: {}", path.display()))?;
         self.output = Some(BufWriter::new(file));
+        if telemetry::enabled() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // A root of the plugin's trace: it outlives the `start` span.
+            self.file_span = tracing::info_span!(
+                parent: None,
+                "file",
+                otel.name = format!("write {name}"),
+                file.path = %path.display(),
+                file.size = tracing::field::Empty,
+                loadsmith.object.rows = tracing::field::Empty,
+                error = tracing::field::Empty,
+            );
+        }
         Ok(())
     }
 
@@ -134,13 +151,24 @@ impl DestinationPlugin for JsonlPlugin {
     }
 
     async fn finalize(&mut self) -> Result<u64> {
+        let span = std::mem::replace(&mut self.file_span, Span::none());
         if let Some(out) = self.output.as_mut() {
-            out.flush().context("flush error")?;
+            if let Err(e) = span.in_scope(|| out.flush()) {
+                span.record("error", format!("flush error: {e}"));
+                return Err(anyhow::Error::new(e).context("flush error"));
+            }
+            if !span.is_none() {
+                span.record("loadsmith.object.rows", self.rows_written);
+                if let Ok(meta) = out.get_ref().metadata() {
+                    span.record("file.size", meta.len());
+                }
+            }
         }
         Ok(self.rows_written)
     }
 
     async fn cancel(&mut self) {
+        self.file_span.record("error", "cancelled");
         // The run will not complete: never leave a partial file that looks
         // like a finished export. Close it (unflushed) and remove it.
         if self.output.take().is_some() {

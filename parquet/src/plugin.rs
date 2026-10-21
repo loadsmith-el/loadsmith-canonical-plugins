@@ -1,12 +1,13 @@
 use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::DestinationPlugin;
+use loadsmith_plugin_sdk::{telemetry, DestinationPlugin};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use tracing::Span;
 
 use crate::vocab::config_enum;
 
@@ -129,8 +130,29 @@ fn is_dataset_file(prefix: &str, name: &str) -> bool {
     CompressionKind::VALUES.iter().any(|(l, _)| *l == label)
 }
 
-/// Removes the files of the `prefix` dataset in `dir`, except `keep`.
+/// Removes the files of the `prefix` dataset in `dir`, except `keep` — one
+/// `cleanup` span (`file.directory`, `loadsmith.files.removed`).
 fn remove_dataset(dir: &Path, prefix: &str, keep: Option<&Path>) -> Result<()> {
+    let span = if telemetry::enabled() {
+        tracing::info_span!(
+            "cleanup",
+            file.directory = %dir.display(),
+            loadsmith.files.removed = tracing::field::Empty,
+            error = tracing::field::Empty,
+        )
+    } else {
+        Span::none()
+    };
+    let mut removed = 0u64;
+    let result = span.in_scope(|| remove_dataset_files(dir, prefix, keep, &mut removed));
+    span.record("loadsmith.files.removed", removed);
+    if let Err(e) = &result {
+        span.record("error", format!("{e:#}"));
+    }
+    result
+}
+
+fn remove_dataset_files(dir: &Path, prefix: &str, keep: Option<&Path>, removed: &mut u64) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("cannot list {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -138,9 +160,22 @@ fn remove_dataset(dir: &Path, prefix: &str, keep: Option<&Path>) -> Result<()> {
         if is_ours && Some(path.as_path()) != keep && entry.file_type()?.is_file() {
             std::fs::remove_file(&path).with_context(|| format!("cannot remove stale {}", path.display()))?;
             tracing::info!("removed {} (previous run)", path.display());
+            *removed += 1;
         }
     }
     Ok(())
+}
+
+/// Moves the finished temp file into place — a `rename` span.
+fn rename(temp: &Path, path: &Path) -> Result<()> {
+    let span = if telemetry::enabled() {
+        tracing::info_span!("rename", file.path = %temp.display(), loadsmith.file.target = %path.display())
+    } else {
+        Span::none()
+    };
+    span.in_scope(|| {
+        std::fs::rename(temp, path).with_context(|| format!("cannot rename {} to {}", temp.display(), path.display()))
+    })
 }
 
 /// What `configure` validated.
@@ -158,6 +193,27 @@ struct OpenFile {
     writer: ArrowWriter<std::fs::File>,
     temp: PathBuf,
     path: PathBuf,
+    /// The file's `write <file>` span, open until the file is closed.
+    span: Span,
+    rows: u64,
+}
+
+/// The span of one file written: from its creation to its rename into place
+/// (`file.path`, `file.size`, `loadsmith.object.rows`). A root of the
+/// plugin's trace, not a child of the batch that opened it.
+fn file_span(name: &str, path: &Path) -> Span {
+    if !telemetry::enabled() {
+        return Span::none();
+    }
+    tracing::info_span!(
+        parent: None,
+        "file",
+        otel.name = format!("write {name}"),
+        file.path = %path.display(),
+        file.size = tracing::field::Empty,
+        loadsmith.object.rows = tracing::field::Empty,
+        error = tracing::field::Empty,
+    )
 }
 
 pub struct ParquetPlugin {
@@ -203,7 +259,8 @@ impl ParquetPlugin {
         self.created.push(temp.clone());
         let writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
             .with_context(|| format!("cannot open parquet writer for {}", temp.display()))?;
-        self.current = Some(OpenFile { writer, temp, path });
+        let span = file_span(&name, &path);
+        self.current = Some(OpenFile { writer, temp, path, span, rows: 0 });
         Ok(())
     }
 
@@ -211,11 +268,28 @@ impl ParquetPlugin {
     /// name and records it as ready for delivery. No-op when none is open.
     fn close_current(&mut self) -> Result<()> {
         if let Some(f) = self.current.take() {
-            f.writer.close().context("parquet close error")?;
-            std::fs::rename(&f.temp, &f.path)
-                .with_context(|| format!("cannot rename {} to {}", f.temp.display(), f.path.display()))?;
-            self.created.push(f.path.clone());
-            self.ready.push(f.path);
+            let span = f.span.clone();
+            let result = span.in_scope(|| -> Result<PathBuf> {
+                f.writer.close().context("parquet close error")?;
+                rename(&f.temp, &f.path)?;
+                if !span.is_none() {
+                    span.record("loadsmith.object.rows", f.rows);
+                    if let Ok(meta) = std::fs::metadata(&f.path) {
+                        span.record("file.size", meta.len());
+                    }
+                }
+                Ok(f.path)
+            });
+            match result {
+                Ok(path) => {
+                    self.created.push(path.clone());
+                    self.ready.push(path);
+                }
+                Err(e) => {
+                    span.record("error", format!("{e:#}"));
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -313,6 +387,7 @@ impl DestinationPlugin for ParquetPlugin {
         let rows = batch.num_rows() as u64;
         let current = self.current.as_mut().context("no open parquet writer")?;
         current.writer.write(&batch).context("parquet write error")?;
+        current.rows += rows;
         self.rows_written += rows;
 
         // Roll over to the next chunk once the current file passes the cap.
@@ -350,7 +425,9 @@ impl DestinationPlugin for ParquetPlugin {
         // Drop the in-progress writer without finalizing its footer, then remove
         // every file produced this run. A partial multi-chunk dataset is more
         // likely to mislead a downstream consumer (looks complete) than help.
-        self.current = None;
+        if let Some(f) = self.current.take() {
+            f.span.record("error", "cancelled");
+        }
         for path in self.created.drain(..) {
             let _ = std::fs::remove_file(&path);
         }

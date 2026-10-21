@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::SinkPlugin;
+use loadsmith_plugin_sdk::{telemetry, SinkPlugin};
+use tracing::Span;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -53,19 +54,53 @@ fn temp_path(target: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
 /// previous file or the complete new one, never a partial copy.
 fn copy_atomic(src: &Path, target: &Path, file_name: &std::ffi::OsStr) -> Result<()> {
     let temp = temp_path(target, file_name);
-    let copied = std::fs::copy(src, &temp)
-        .with_context(|| format!("copy {} → {}", src.display(), temp.display()))
-        .and_then(|_| {
-            // Durable before it becomes visible under its real name.
-            std::fs::File::open(&temp)
-                .and_then(|f| f.sync_all())
-                .with_context(|| format!("sync {}", temp.display()))
+    // Telemetry: a `copy <file>` span (`file.path`, `file.size`) over the copy
+    // and its sync, then a `rename` span for the atomic move into place.
+    let on = telemetry::enabled();
+    let copy_span = if on {
+        tracing::info_span!(
+            "copy",
+            otel.name = format!("copy {}", file_name.to_string_lossy()),
+            file.path = %target.display(),
+            file.size = tracing::field::Empty,
+            error = tracing::field::Empty,
+        )
+    } else {
+        Span::none()
+    };
+    let copied = copy_span
+        .in_scope(|| {
+            std::fs::copy(src, &temp)
+                .with_context(|| format!("copy {} → {}", src.display(), temp.display()))
+                .and_then(|bytes| {
+                    copy_span.record("file.size", bytes);
+                    // Durable before it becomes visible under its real name.
+                    std::fs::File::open(&temp)
+                        .and_then(|f| f.sync_all())
+                        .with_context(|| format!("sync {}", temp.display()))
+                })
         })
         .and_then(|_| {
-            std::fs::rename(&temp, target)
-                .with_context(|| format!("rename {} → {}", temp.display(), target.display()))
+            let span = if on {
+                tracing::info_span!(
+                    "rename",
+                    file.path = %temp.display(),
+                    loadsmith.file.target = %target.display(),
+                    error = tracing::field::Empty,
+                )
+            } else {
+                Span::none()
+            };
+            span.in_scope(|| {
+                std::fs::rename(&temp, target)
+                    .with_context(|| format!("rename {} → {}", temp.display(), target.display()))
+            })
+            .inspect_err(|e| {
+                span.record("error", format!("{e:#}"));
+            })
         });
-    if copied.is_err() {
+    if let Err(e) = &copied {
+        copy_span.record("error", format!("{e:#}"));
         let _ = std::fs::remove_file(&temp);
     }
     copied
