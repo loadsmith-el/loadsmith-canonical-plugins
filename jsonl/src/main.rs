@@ -1,4 +1,6 @@
+mod json;
 mod plugin;
+mod vocab;
 
 // mimalloc: release builds are static musl, whose default allocator is slow
 // under the many small allocations of Arrow batch building.

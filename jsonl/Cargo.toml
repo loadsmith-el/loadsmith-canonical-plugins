@@ -25,5 +25,6 @@ serde_json           = { workspace = true }
 async-trait          = { workspace = true }
 arrow-array          = { workspace = true }
 loadsmith-plugin-sdk = { workspace = true }
-loadsmith-arrow      = { workspace = true }
+arrow-schema         = { workspace = true }
+chrono               = { version = "0.4", default-features = false, features = ["std"] }
 mimalloc             = { workspace = true }
