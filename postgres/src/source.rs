@@ -4,6 +4,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::SourcePlugin;
 use crate::conn::ConnectionConfig;
+use crate::telemetry::{op, DbOp};
 use crate::vocab::{config_enum, TimestampUnit};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -88,6 +89,8 @@ pub struct PostgresSourcePlugin {
     last_cursor_value: Option<String>,
     /// Cursor is declared lazily on the first batch, once the resume value is in.
     cursor_declared: bool,
+    /// `db.namespace` of the telemetry spans (the database name).
+    namespace: String,
 }
 
 impl Default for PostgresSourcePlugin {
@@ -110,6 +113,7 @@ impl PostgresSourcePlugin {
             resume_value: None,
             last_cursor_value: None,
             cursor_declared: false,
+            namespace: String::new(),
         }
     }
 
@@ -125,12 +129,19 @@ impl PostgresSourcePlugin {
     /// applied; the cursor value originates from our own state, but we escape
     /// defensively all the same.
     fn cursor_query(&self) -> String {
+        self.cursor_query_with(false)
+    }
+
+    /// The cursor query; `redacted` puts a `?` in place of the watermark
+    /// literal — the statement text telemetry records (never a value).
+    fn cursor_query_with(&self, redacted: bool) -> String {
         match &self.cursor_column {
             None => self.query.clone(),
             Some(col) => {
                 let ident = format!("\"{}\"", col.replace('"', "\"\""));
                 let bound = self.resume_value.as_ref().or(self.initial_value.as_ref());
                 let where_clause = match bound {
+                    Some(_) if redacted => format!(" WHERE _ls.{ident} > ?"),
                     Some(v) => format!(" WHERE _ls.{ident} > '{}'", v.replace('\'', "''")),
                     None => String::new(),
                 };
@@ -148,11 +159,18 @@ impl PostgresSourcePlugin {
         }
         let query = self.cursor_query();
         let client = self.client.as_ref().context("postgres source: not configured")?;
-        client.batch_execute(&self.begin_sql).await.context("BEGIN failed")?;
-        client
-            .execute(&format!("DECLARE ls_cursor NO SCROLL CURSOR FOR ({query})"), &[])
-            .await
-            .context("DECLARE cursor failed")?;
+        let ns = self.namespace.as_str();
+        let begin = self.begin_sql.as_str();
+        op("BEGIN", ns, None, Some(begin), async { client.batch_execute(begin).await.context("BEGIN failed") }).await?;
+        let text = loadsmith_plugin_sdk::telemetry::enabled()
+            .then(|| format!("DECLARE ls_cursor NO SCROLL CURSOR FOR ({})", self.cursor_query_with(true)));
+        op("DECLARE", ns, None, text.as_deref(), async {
+            client
+                .execute(&format!("DECLARE ls_cursor NO SCROLL CURSOR FOR ({query})"), &[])
+                .await
+                .context("DECLARE cursor failed")
+        })
+        .await?;
         self.cursor_declared = true;
         Ok(())
     }
@@ -200,16 +218,19 @@ impl SourcePlugin for PostgresSourcePlugin {
         // DateStyle 'ISO' only sets the output style, keeping the user's
         // DMY/MDY input order. TimeZone is deliberately left alone: timestamptz
         // offsets are parsed, and changing it would alter the query's semantics.
-        client
-            .batch_execute("SET DateStyle = 'ISO'; SET bytea_output = 'hex'")
-            .await
-            .context("pinning DateStyle/bytea_output")?;
+        let ns = cfg.conn.dbname.as_str();
+        let pin = "SET DateStyle = 'ISO'; SET bytea_output = 'hex'";
+        op("SET", ns, None, Some(pin), async { client.batch_execute(pin).await.context("pinning DateStyle/bytea_output") })
+            .await?;
 
         // ── Schema inference via prepare() ────────────────────────────────
         // The incremental wrapper (`SELECT * FROM (<query>) …`) preserves the
         // column set, so the schema is inferred from the original query here.
 
-        let stmt = client.prepare(&cfg.query).await.context("failed to prepare query")?;
+        let stmt = op("PREPARE", ns, None, Some(&cfg.query), async {
+            client.prepare(&cfg.query).await.context("failed to prepare query")
+        })
+        .await?;
         let schema = Arc::new(crate::types::columns_to_schema(stmt.columns(), cfg.timestamp_unit.arrow()));
 
         // The transaction + cursor are opened lazily on the first batch, after
@@ -231,6 +252,7 @@ impl SourcePlugin for PostgresSourcePlugin {
             self.cursor_column = Some(inc.cursor_column.clone());
             self.initial_value = inc.initial_value.clone();
         }
+        self.namespace = cfg.conn.dbname.clone();
         self.query = cfg.query;
         self.schema = Some(schema);
         self.batch_size = cfg.batch_size;
@@ -257,10 +279,11 @@ impl SourcePlugin for PostgresSourcePlugin {
         // Use simple_query (text protocol) so all types come back as strings.
         // This avoids binary-format issues with NUMERIC, TIME, and other types
         // that tokio_postgres's FromSql doesn't support out of the box.
-        let messages = client
-            .simple_query(&format!("FETCH FORWARD {} FROM ls_cursor", self.batch_size))
-            .await
-            .context("FETCH failed")?;
+        let fetch_sql = format!("FETCH FORWARD {} FROM ls_cursor", self.batch_size);
+        let fetch = DbOp::new("FETCH", &self.namespace, None, Some(&fetch_sql));
+        let span = fetch.span().clone();
+        let messages =
+            fetch.run(async { client.simple_query(&fetch_sql).await.context("FETCH failed") }).await?;
 
         let rows: Vec<tokio_postgres::SimpleQueryRow> = messages
             .into_iter()
@@ -270,9 +293,15 @@ impl SourcePlugin for PostgresSourcePlugin {
             })
             .collect();
 
+        span.record("db.response.returned_rows", rows.len() as u64);
+
         if rows.is_empty() {
             self.exhausted = true;
-            let _ = client.batch_execute("CLOSE ls_cursor; COMMIT").await;
+            let close = "CLOSE ls_cursor; COMMIT";
+            let _ = op("COMMIT", &self.namespace, None, Some(close), async {
+                client.batch_execute(close).await.context("CLOSE/COMMIT failed")
+            })
+            .await;
             return Ok(None);
         }
 
@@ -397,6 +426,16 @@ mod tests {
         p.query = query.to_string();
         p.cursor_column = cursor.map(String::from);
         p
+    }
+
+    #[test]
+    fn telemetry_statement_text_never_carries_the_watermark() {
+        let mut p = plugin_with("SELECT id, updated_at FROM t", Some("updated_at"));
+        p.resume_value = Some("2026-05-01 10:00:00".into());
+        assert!(p.cursor_query().contains("'2026-05-01 10:00:00'"));
+        let text = p.cursor_query_with(true);
+        assert!(!text.contains("2026"), "{text}");
+        assert!(text.contains("WHERE _ls.\"updated_at\" > ?"), "{text}");
     }
 
     #[test]

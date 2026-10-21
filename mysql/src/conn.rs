@@ -179,8 +179,29 @@ pub fn build_opts(cfg: &ConnectionConfig) -> Result<Opts> {
 }
 
 /// Connects to MySQL with the configured TLS mode and session setup.
+/// One `connect` span covers TCP, TLS, authentication and the init
+/// statements.
 pub async fn connect(cfg: &ConnectionConfig) -> Result<Conn> {
-    Conn::new(build_opts(cfg)?).await.context("mysql connect failed")
+    let opts = build_opts(cfg)?;
+    if !loadsmith_plugin_sdk::telemetry::enabled() {
+        return Conn::new(opts).await.context("mysql connect failed");
+    }
+    let tls_mode = cfg.tls.as_ref().map(|t| t.mode).unwrap_or_default().as_str();
+    let span = tracing::info_span!(
+        "connect",
+        otel.kind = "client",
+        db.system.name = crate::telemetry::SYSTEM,
+        db.namespace = cfg.dbname.as_str(),
+        server.address = cfg.host.as_str(),
+        server.port = cfg.port,
+        loadsmith.tls.mode = tls_mode,
+        error = tracing::field::Empty,
+    );
+    let result = tracing::Instrument::instrument(Conn::new(opts), span.clone()).await.context("mysql connect failed");
+    if let Err(e) = &result {
+        span.record("error", format!("{e:#}"));
+    }
+    result
 }
 
 #[cfg(test)]

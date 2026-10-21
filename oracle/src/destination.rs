@@ -8,6 +8,7 @@ use oracledb::{Connection, DbType, ToDbValue};
 use serde::Deserialize;
 
 use crate::conn::ConnectionConfig;
+use crate::telemetry::{op, DbOp};
 use crate::types::{cell_to_bind, fold_ident, quote_ident, typed_expr, Bind};
 use crate::vocab::config_enum;
 
@@ -209,13 +210,15 @@ impl DestinationPlugin for OracleDestPlugin {
         let target = quote_ident(&cfg.target_table);
         let describe = format!("SELECT * FROM {target} WHERE 1 = 0");
 
+        let ns = crate::conn::namespace(&cfg.conn);
         let (conn, target_types) = tokio::task::block_in_place(|| -> Result<_> {
             let conn = crate::conn::connect(&cfg.conn)?;
-            let rs = conn
-                .query(&describe, &[])
-                .map_err(|e| anyhow::anyhow!("describing target table failed: {e}"))?;
-            let target_types: HashMap<String, &'static DbType> =
-                rs.columns().iter().map(|c| (c.name().to_uppercase(), c.db_type())).collect();
+            let target_types = op("SELECT", ns, Some(&cfg.target_table), Some(&describe), || {
+                let rs = conn
+                    .query(&describe, &[])
+                    .map_err(|e| anyhow::anyhow!("describing target table failed: {e}"))?;
+                Ok(rs.columns().iter().map(|c| (c.name().to_uppercase(), c.db_type())).collect::<HashMap<_, _>>())
+            })?;
             Ok((conn, target_types))
         })?;
 
@@ -226,8 +229,12 @@ impl DestinationPlugin for OracleDestPlugin {
             // it could not roll back with a failed load.
             WriteMode::Overwrite => {
                 let delete = format!("DELETE FROM {target}");
-                tokio::task::block_in_place(|| conn.execute(&delete, &[]))
-                    .map_err(|e| anyhow::anyhow!("{delete} failed: {e}"))?;
+                let phase = DbOp::new("DELETE", ns, Some(&cfg.target_table), Some(&delete));
+                let span = phase.span().clone();
+                let rows = tokio::task::block_in_place(|| {
+                    phase.run(|| conn.execute(&delete, &[]).map_err(|e| anyhow::anyhow!("{delete} failed: {e}")))
+                })?;
+                span.record("loadsmith.db.affected_rows", rows.rows_affected());
             }
             // `merge` stages into a session-private global temporary table with
             // the target's columns plus the load-order column. Created here (DDL
@@ -244,8 +251,11 @@ impl DestinationPlugin for OracleDestPlugin {
                     stg = quote_ident(&staging),
                     seq = quote_ident(STAGING_SEQ),
                 );
-                tokio::task::block_in_place(|| conn.execute(&create, &[]))
-                    .map_err(|e| anyhow::anyhow!("creating staging table failed: {e}"))?;
+                tokio::task::block_in_place(|| {
+                    op("CREATE TABLE", ns, Some(&staging), Some(&create), || {
+                        conn.execute(&create, &[]).map_err(|e| anyhow::anyhow!("creating staging table failed: {e}"))
+                    })
+                })?;
                 staging_table = Some(staging);
             }
         }
@@ -283,14 +293,23 @@ impl DestinationPlugin for OracleDestPlugin {
 
         let sql = self.sql.clone().context("oracle destination: no INSERT statement")?;
         let conn = self.conn.as_ref().context("oracle destination: not prepared")?;
+        // One span per array insert: the statement with its binds, never the
+        // bound rows.
+        let cfg = self.cfg()?;
+        let into = self.staging_table.as_deref().unwrap_or(&cfg.target_table);
+        let insert = DbOp::new("INSERT", crate::conn::namespace(&cfg.conn), Some(into), Some(&sql));
+        insert.span().record("db.operation.batch.size", nrows as u64);
+        insert.span().record("loadsmith.db.affected_rows", nrows as u64);
         tokio::task::block_in_place(|| -> Result<()> {
-            // Array DML: one execute_batch over a 2-D slice of `&dyn ToDbValue`.
-            let params: Vec<Vec<&dyn ToDbValue>> =
-                rows.iter().map(|row| row.iter().map(|b| b.as_sql()).collect()).collect();
-            let slices: Vec<&[&dyn ToDbValue]> = params.iter().map(|r| r.as_slice()).collect();
-            conn.execute_batch(&sql, slices.as_slice())
-                .map_err(|e| anyhow::anyhow!("array DML failed: {e}"))?;
-            Ok(())
+            insert.run(|| {
+                // Array DML: one execute_batch over a 2-D slice of `&dyn ToDbValue`.
+                let params: Vec<Vec<&dyn ToDbValue>> =
+                    rows.iter().map(|row| row.iter().map(|b| b.as_sql()).collect()).collect();
+                let slices: Vec<&[&dyn ToDbValue]> = params.iter().map(|r| r.as_slice()).collect();
+                conn.execute_batch(&sql, slices.as_slice())
+                    .map_err(|e| anyhow::anyhow!("array DML failed: {e}"))?;
+                Ok(())
+            })
         })?;
 
         self.rows_written += nrows as u64;
@@ -299,13 +318,21 @@ impl DestinationPlugin for OracleDestPlugin {
 
     async fn finalize(&mut self) -> Result<u64> {
         let conn = self.conn.as_ref().context("oracle destination: not prepared")?;
+        let cfg = self.cfg()?;
+        let ns = crate::conn::namespace(&cfg.conn);
         // merge: a single set-based MERGE from the staging table into the
         // target, in the same transaction as the staging inserts, then commit.
         if let Some(merge_sql) = self.merge_sql.clone() {
-            tokio::task::block_in_place(|| conn.execute(&merge_sql, &[]))
-                .map_err(|e| anyhow::anyhow!("staged MERGE failed: {e}"))?;
+            let phase = DbOp::new("MERGE", ns, Some(&cfg.target_table), Some(&merge_sql));
+            let span = phase.span().clone();
+            let rows = tokio::task::block_in_place(|| {
+                phase.run(|| conn.execute(&merge_sql, &[]).map_err(|e| anyhow::anyhow!("staged MERGE failed: {e}")))
+            })?;
+            span.record("loadsmith.db.affected_rows", rows.rows_affected());
         }
-        tokio::task::block_in_place(|| conn.commit().map_err(|e| anyhow::anyhow!("COMMIT failed: {e}")))?;
+        tokio::task::block_in_place(|| {
+            op("COMMIT", ns, None, None, || conn.commit().map_err(|e| anyhow::anyhow!("COMMIT failed: {e}")))
+        })?;
         Ok(self.rows_written)
     }
 

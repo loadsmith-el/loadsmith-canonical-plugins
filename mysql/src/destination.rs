@@ -7,6 +7,7 @@ use mysql_async::{Conn, Value};
 use serde::Deserialize;
 
 use crate::conn::ConnectionConfig;
+use crate::telemetry::{op, DbOp};
 use crate::vocab::config_enum;
 
 /// Staging table of `mode: merge`. Session-scoped (`TEMPORARY`).
@@ -170,31 +171,44 @@ impl DestinationPlugin for MysqlDestPlugin {
         let cfg = self.cfg()?;
         let target = quote_table(&cfg.target_table)?;
         let mut conn = crate::conn::connect(&cfg.conn).await?;
+        let ns = cfg.conn.dbname.as_str();
 
         if cfg.mode == WriteMode::Merge {
             // Created before the transaction: CREATE TEMPORARY TABLE … SELECT
             // is not allowed inside one under GTID consistency. Only the
             // column types are copied (no indexes), so duplicate keys within
             // the load reach the merge, where the last row of a key wins.
-            conn.query_drop(format!(
+            let sql = format!(
                 "CREATE TEMPORARY TABLE {STAGING} ({seq} BIGINT AUTO_INCREMENT PRIMARY KEY) \
                  SELECT * FROM {target} LIMIT 0",
                 seq = quote_ident(STAGING_SEQ),
-            ))
-            .await
-            .context("create staging table failed")?;
+            );
+            op("CREATE TABLE", ns, Some(STAGING), Some(&sql), async {
+                conn.query_drop(&sql).await.context("create staging table failed")
+            })
+            .await?;
         }
 
         // One transaction for the whole load — nothing is durable until
         // finalize() commits.
-        conn.query_drop("START TRANSACTION").await.context("START TRANSACTION failed")?;
+        op("START TRANSACTION", ns, None, Some("START TRANSACTION"), async {
+            conn.query_drop("START TRANSACTION").await.context("START TRANSACTION failed")
+        })
+        .await?;
 
         if cfg.mode == WriteMode::Overwrite {
             // DELETE, not TRUNCATE: TRUNCATE commits implicitly in MySQL, so it
             // could not roll back with a failed load.
-            conn.query_drop(format!("DELETE FROM {target}"))
-                .await
-                .with_context(|| format!("DELETE FROM {target} failed"))?;
+            let sql = format!("DELETE FROM {target}");
+            let delete = DbOp::new("DELETE", ns, Some(&cfg.target_table), Some(&sql));
+            let span = delete.span().clone();
+            let rows = delete
+                .run(async {
+                    conn.query_drop(&sql).await.with_context(|| format!("DELETE FROM {target} failed"))?;
+                    Ok(conn.affected_rows())
+                })
+                .await?;
+            span.record("loadsmith.db.affected_rows", rows);
         }
 
         self.conn = Some(conn);
@@ -223,10 +237,18 @@ impl DestinationPlugin for MysqlDestPlugin {
 
         let col_list = self.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
         let placeholders = vec!["?"; self.columns.len()].join(", ");
-        let sql = format!("INSERT INTO {} ({col_list}) VALUES ({placeholders})", self.insert_target()?);
+        let target = self.insert_target()?;
+        let sql = format!("INSERT INTO {target} ({col_list}) VALUES ({placeholders})");
 
+        // One span per batch insert: the statement with its `?` placeholders,
+        // never the bound rows.
+        let cfg = self.config.as_ref().context("mysql destination: not configured")?;
+        let collection = if cfg.mode == WriteMode::Merge { STAGING } else { cfg.target_table.as_str() };
+        let insert = DbOp::new("INSERT", &cfg.conn.dbname, Some(collection), Some(&sql));
+        insert.span().record("db.operation.batch.size", nrows as u64);
+        insert.span().record("loadsmith.db.affected_rows", nrows as u64);
         let conn = self.conn.as_mut().context("mysql destination: not prepared")?;
-        conn.exec_batch(sql, params).await.context("INSERT failed")?;
+        insert.run(async { conn.exec_batch(sql.as_str(), params).await.context("INSERT failed") }).await?;
         Ok(())
     }
 
@@ -244,11 +266,24 @@ impl DestinationPlugin for MysqlDestPlugin {
         } else {
             Vec::new()
         };
+        let cfg = self.config.as_ref().context("mysql destination: not configured")?;
+        let ns = cfg.conn.dbname.as_str();
         let conn = self.conn.as_mut().context("mysql destination: not prepared")?;
         for sql in statements {
-            conn.query_drop(sql).await.context("merge from staging failed")?;
+            // Each merge phase (UPDATE … JOIN, INSERT … SELECT) is one span.
+            let operation = if sql.starts_with("UPDATE") { "UPDATE" } else { "INSERT" };
+            let phase = DbOp::new(operation, ns, Some(&cfg.target_table), Some(&sql));
+            let span = phase.span().clone();
+            let rows = phase
+                .run(async {
+                    conn.query_drop(&sql).await.context("merge from staging failed")?;
+                    Ok(conn.affected_rows())
+                })
+                .await?;
+            span.record("loadsmith.db.affected_rows", rows);
         }
-        conn.query_drop("COMMIT").await.context("COMMIT failed")?;
+        op("COMMIT", ns, None, Some("COMMIT"), async { conn.query_drop("COMMIT").await.context("COMMIT failed") })
+            .await?;
         Ok(self.rows_written)
     }
 

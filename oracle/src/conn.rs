@@ -246,6 +246,34 @@ pub fn build_descriptor(cfg: &ConnectionConfig) -> Result<String> {
 ///
 /// Synchronous; call inside [`tokio::task::block_in_place`].
 pub fn connect(cfg: &ConnectionConfig) -> Result<Connection> {
+    // One `connect` span over TCP, TLS, authentication and the session setup.
+    if !loadsmith_plugin_sdk::telemetry::enabled() {
+        return connect_inner(cfg);
+    }
+    let tls_mode = cfg.tls.as_ref().map(|t| t.mode).unwrap_or_default().as_str();
+    let span = tracing::info_span!(
+        "connect",
+        otel.kind = "client",
+        db.system.name = crate::telemetry::SYSTEM,
+        db.namespace = namespace(cfg),
+        server.address = cfg.host.as_str(),
+        server.port = cfg.port,
+        loadsmith.tls.mode = tls_mode,
+        error = tracing::field::Empty,
+    );
+    let result = span.in_scope(|| connect_inner(cfg));
+    if let Err(e) = &result {
+        span.record("error", format!("{e:#}"));
+    }
+    result
+}
+
+/// `db.namespace` of the telemetry spans: the service name, else the SID.
+pub fn namespace(cfg: &ConnectionConfig) -> &str {
+    cfg.service_name.as_deref().or(cfg.sid.as_deref()).unwrap_or_default()
+}
+
+fn connect_inner(cfg: &ConnectionConfig) -> Result<Connection> {
     // The driver builds its rustls config from the process-default provider;
     // make that the canon's pure-Rust rustls-rustcrypto (idempotent).
     loadsmith_tls::install_provider();

@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::conn::ConnectionConfig;
+use crate::telemetry::op;
 use crate::vocab::TimestampUnit;
 
 // ── Config structs ────────────────────────────────────────────────────────────
@@ -74,6 +75,8 @@ pub struct MysqlSourcePlugin {
     initial_value: Option<String>,
     resume_value: Option<String>,
     last_cursor_value: Option<String>,
+    /// `db.namespace` of the telemetry spans (the database name).
+    namespace: String,
 }
 
 impl Default for MysqlSourcePlugin {
@@ -96,6 +99,7 @@ impl MysqlSourcePlugin {
             initial_value: None,
             resume_value: None,
             last_cursor_value: None,
+            namespace: String::new(),
         }
     }
 
@@ -105,12 +109,19 @@ impl MysqlSourcePlugin {
     /// high watermark. The watermark is embedded as an escaped single-quoted
     /// literal so MySQL coerces it to the cursor column's own type.
     fn cursor_query(&self) -> String {
+        self.cursor_query_with(false)
+    }
+
+    /// The cursor query; `redacted` puts a `?` in place of the watermark
+    /// literal — the statement text telemetry records (never a value).
+    fn cursor_query_with(&self, redacted: bool) -> String {
         match &self.cursor_column {
             None => self.query.clone(),
             Some(col) => {
                 let ident = format!("`{}`", col.replace('`', "``"));
                 let bound = self.resume_value.as_ref().or(self.initial_value.as_ref());
                 let where_clause = match bound {
+                    Some(_) if redacted => format!(" WHERE _ls.{ident} > ?"),
                     Some(v) => format!(" WHERE _ls.{ident} > '{}'", v.replace('\'', "''").replace('\\', "\\\\")),
                     None => String::new(),
                 };
@@ -127,7 +138,12 @@ impl MysqlSourcePlugin {
         }
         let query = self.cursor_query();
         let conn = self.conn.take().context("mysql source: not configured")?;
-        let stream: RowStream = query.stream::<Row, _>(conn).await.context("query failed")?;
+        // One span for the query's execution, up to its first row.
+        let text = loadsmith_plugin_sdk::telemetry::enabled().then(|| self.cursor_query_with(true));
+        let stream: RowStream = op("SELECT", &self.namespace, None, text.as_deref(), async {
+            query.stream::<Row, _>(conn).await.context("query failed")
+        })
+        .await?;
         self.stream = Some(stream);
         Ok(())
     }
@@ -167,7 +183,11 @@ impl SourcePlugin for MysqlSourcePlugin {
 
         // Schema inference via a prepared statement; the incremental wrapper
         // preserves the column set, so the base query's columns are authoritative.
-        let stmt = conn.prep(&cfg.query).await.context("failed to prepare query")?;
+        let ns = cfg.conn.dbname.as_str();
+        let stmt = op("PREPARE", ns, None, Some(&cfg.query), async {
+            conn.prep(&cfg.query).await.context("failed to prepare query")
+        })
+        .await?;
         let schema = crate::types::columns_to_schema(stmt.columns().as_ref(), cfg.timestamp_unit.arrow());
         conn.close(stmt).await.context("closing the prepared statement")?;
 
@@ -179,6 +199,7 @@ impl SourcePlugin for MysqlSourcePlugin {
             self.initial_value = inc.initial_value.clone();
         }
 
+        self.namespace = cfg.conn.dbname.clone();
         self.query = cfg.query;
         self.schema = Some(Arc::new(schema));
         self.batch_size = cfg.batch_size.max(1);
@@ -342,6 +363,15 @@ mod tests {
             "SELECT * FROM (SELECT id, updated_at FROM t) AS _ls \
              WHERE _ls.`updated_at` > '2026-06-09 08:00:00' ORDER BY _ls.`updated_at` ASC"
         );
+    }
+
+    #[test]
+    fn telemetry_statement_text_never_carries_the_watermark() {
+        let mut p = plugin_with("SELECT id, updated_at FROM t", Some("updated_at"));
+        p.resume_value = Some("2026-06-09 08:00:00".into());
+        let text = p.cursor_query_with(true);
+        assert!(!text.contains("2026"), "{text}");
+        assert!(text.contains("WHERE _ls.`updated_at` > ? ORDER BY"), "{text}");
     }
 
     #[test]

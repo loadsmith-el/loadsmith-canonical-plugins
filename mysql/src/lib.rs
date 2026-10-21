@@ -6,6 +6,7 @@
 pub mod conn;
 pub mod destination;
 pub mod source;
+pub mod telemetry;
 pub mod types;
 pub mod vocab;
 

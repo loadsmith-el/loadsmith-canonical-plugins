@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::conn::ConnectionConfig;
+use crate::telemetry::{op, DbOp};
 use crate::types::{self, quote_ident, typed_expr, Cell};
 
 // ── Config structs ────────────────────────────────────────────────────────────
@@ -68,6 +69,8 @@ pub struct OracleSourcePlugin {
     rows: Vec<Vec<Cell>>,
     pos: usize,
     loaded: bool,
+    /// `db.namespace` of the telemetry spans.
+    namespace: String,
 }
 
 impl Default for OracleSourcePlugin {
@@ -93,6 +96,7 @@ impl OracleSourcePlugin {
             rows: Vec::new(),
             pos: 0,
             loaded: false,
+            namespace: String::new(),
         }
     }
 
@@ -100,6 +104,12 @@ impl OracleSourcePlugin {
     /// subquery, optionally filtered `> watermark` and ordered by the cursor so
     /// the last row seen is the new high watermark.
     fn build_query(&self) -> String {
+        self.build_query_with(false)
+    }
+
+    /// The query; `redacted` puts a `?` in place of the watermark literal —
+    /// the statement text telemetry records (never a value).
+    fn build_query_with(&self, redacted: bool) -> String {
         let base = format!("SELECT {} FROM ({}) \"_LS\"", self.select_list, self.query);
         match &self.cursor_column {
             None => base,
@@ -107,6 +117,7 @@ impl OracleSourcePlugin {
                 let ident = quote_ident(col);
                 let bound = self.resume_value.as_ref().or(self.initial_value.as_ref());
                 let where_clause = match bound {
+                    Some(_) if redacted => format!(" WHERE \"_LS\".{ident} > ?"),
                     Some(v) => {
                         // The watermark is text; wrap it in the cursor column's
                         // explicit TO_* conversion so the comparison never relies
@@ -132,15 +143,22 @@ impl OracleSourcePlugin {
         let query = self.build_query();
         let conn = self.conn.as_ref().context("not configured")?;
         let schema = self.schema.as_ref().context("not configured")?;
-        let rs = conn.query(&query, &[]).map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
-
-        let ncols = schema.fields().len();
-        let mut out = Vec::new();
-        for row in rs {
-            let row = row.map_err(|e| anyhow::anyhow!("row fetch failed: {e}"))?;
-            let cells = (0..ncols).map(|i| types::read_cell(&row, i)).collect::<Result<Vec<_>>>()?;
-            out.push(cells);
-        }
+        // One span for the query: execution and the fetch of every row.
+        let text = loadsmith_plugin_sdk::telemetry::enabled().then(|| self.build_query_with(true));
+        let select = DbOp::new("SELECT", &self.namespace, None, text.as_deref());
+        let span = select.span().clone();
+        let out = select.run(|| {
+            let rs = conn.query(&query, &[]).map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+            let ncols = schema.fields().len();
+            let mut out = Vec::new();
+            for row in rs {
+                let row = row.map_err(|e| anyhow::anyhow!("row fetch failed: {e}"))?;
+                let cells = (0..ncols).map(|i| types::read_cell(&row, i)).collect::<Result<Vec<_>>>()?;
+                out.push(cells);
+            }
+            Ok(out)
+        })?;
+        span.record("db.response.returned_rows", out.len() as u64);
         Ok(out)
     }
 
@@ -189,10 +207,12 @@ impl SourcePlugin for OracleSourcePlugin {
             let conn = crate::conn::connect(&cfg.conn)?;
             // Describe the column set without fetching data.
             let describe_sql = format!("SELECT * FROM ({}) \"_LS\" WHERE 1 = 0", cfg.query);
-            let rs = conn
-                .query(&describe_sql, &[])
-                .map_err(|e| anyhow::anyhow!("schema describe failed: {e}"))?;
-            let cols = types::describe(rs.columns());
+            let cols = op("SELECT", crate::conn::namespace(&cfg.conn), None, Some(&describe_sql), || {
+                let rs = conn
+                    .query(&describe_sql, &[])
+                    .map_err(|e| anyhow::anyhow!("schema describe failed: {e}"))?;
+                Ok(types::describe(rs.columns()))
+            })?;
             Ok((conn, cols))
         })?;
 
@@ -219,6 +239,7 @@ impl SourcePlugin for OracleSourcePlugin {
             self.initial_value = inc.initial_value.clone();
         }
 
+        self.namespace = crate::conn::namespace(&cfg.conn).to_string();
         self.query = cfg.query;
         self.select_list = select_list;
         self.schema = Some(Arc::new(schema));
@@ -316,6 +337,15 @@ mod tests {
             p.build_query(),
             "SELECT \"ID\", \"TS\" FROM (SELECT id, ts FROM t) \"_LS\" ORDER BY \"_LS\".\"TS\" ASC"
         );
+    }
+
+    #[test]
+    fn telemetry_statement_text_never_carries_the_watermark() {
+        let mut p = plugin_with("SELECT id, ts FROM t", Some("TS"));
+        p.resume_value = Some("2026-06-09 08:00:00.000000".into());
+        let text = p.build_query_with(true);
+        assert!(!text.contains("2026"), "{text}");
+        assert!(text.contains("WHERE \"_LS\".\"TS\" > ? ORDER BY"), "{text}");
     }
 
     #[test]

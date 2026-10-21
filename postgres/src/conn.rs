@@ -152,6 +152,34 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 /// session GUCs. Returns a live `Client`; the connection task is spawned
 /// internally. The caller owns transactions/cursors/queries.
 pub async fn connect(cfg: &ConnectionConfig) -> Result<Client> {
+    // One `connect` span over DNS, TCP, TLS, authentication and the session
+    // GUCs (only built when telemetry is on).
+    if !loadsmith_plugin_sdk::telemetry::enabled() {
+        return connect_inner(cfg).await;
+    }
+    let host = match &cfg.host {
+        HostSpec::One(h) => h.clone(),
+        HostSpec::Many(hosts) => hosts.join(","),
+    };
+    let tls_mode = cfg.tls.as_ref().map(|t| t.mode.as_str()).unwrap_or(TlsMode::default().as_str());
+    let span = tracing::info_span!(
+        "connect",
+        otel.kind = "client",
+        db.system.name = crate::telemetry::SYSTEM,
+        db.namespace = cfg.dbname.as_str(),
+        server.address = host.as_str(),
+        server.port = cfg.port,
+        loadsmith.tls.mode = tls_mode,
+        error = tracing::field::Empty,
+    );
+    let result = tracing::Instrument::instrument(connect_inner(cfg), span.clone()).await;
+    if let Err(e) = &result {
+        span.record("error", format!("{e:#}"));
+    }
+    result
+}
+
+async fn connect_inner(cfg: &ConnectionConfig) -> Result<Client> {
     // ── Build tokio_postgres::Config ───────────────────────────────────────
     let mut pg = tokio_postgres::Config::new();
 

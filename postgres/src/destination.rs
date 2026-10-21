@@ -9,6 +9,7 @@ use tokio_postgres::Client;
 
 use crate::conn::ConnectionConfig;
 use crate::copy::batch_to_copy_text;
+use crate::telemetry::{op, DbOp};
 use crate::vocab::config_enum;
 
 /// Staging table of `mode: merge`. Temporary, dropped on commit.
@@ -149,10 +150,12 @@ impl DestinationPlugin for PostgresDestPlugin {
         let cfg = self.cfg()?;
         // Shared connection layer — full TLS parity with the source plugin.
         let client = crate::conn::connect(&cfg.conn).await?;
+        let ns = cfg.conn.dbname.as_str();
 
         // One transaction for the whole load — nothing is durable in the target
         // until finalize() commits.
-        client.batch_execute("BEGIN").await.context("BEGIN failed")?;
+        op("BEGIN", ns, None, Some("BEGIN"), async { client.batch_execute("BEGIN").await.context("BEGIN failed") })
+            .await?;
 
         let target = &cfg.target_table;
         match cfg.mode {
@@ -160,18 +163,24 @@ impl DestinationPlugin for PostgresDestPlugin {
             // TRUNCATE is transactional in Postgres: readers keep seeing the old
             // contents (they wait on the lock) until the load commits, and a
             // failed load rolls the truncation back.
-            WriteMode::Overwrite => client
-                .batch_execute(&format!("TRUNCATE TABLE {target}"))
-                .await
-                .with_context(|| format!("TRUNCATE {target} failed"))?,
-            WriteMode::Merge => client
-                .batch_execute(&format!(
+            WriteMode::Overwrite => {
+                let sql = format!("TRUNCATE TABLE {target}");
+                op("TRUNCATE", ns, Some(target), Some(&sql), async {
+                    client.batch_execute(&sql).await.with_context(|| format!("TRUNCATE {target} failed"))
+                })
+                .await?
+            }
+            WriteMode::Merge => {
+                let sql = format!(
                     "CREATE TEMP TABLE {STAGING} (LIKE {target} INCLUDING DEFAULTS, \
                      {seq} bigint GENERATED ALWAYS AS IDENTITY) ON COMMIT DROP",
                     seq = quote_ident(STAGING_SEQ),
-                ))
-                .await
-                .context("create staging table failed")?,
+                );
+                op("CREATE TABLE", ns, Some(STAGING), Some(&sql), async {
+                    client.batch_execute(&sql).await.context("create staging table failed")
+                })
+                .await?
+            }
         }
 
         self.client = Some(client);
@@ -187,21 +196,31 @@ impl DestinationPlugin for PostgresDestPlugin {
         }
         self.rows_written += batch.num_rows() as u64;
 
+        let target = self.copy_target()?;
         let cols = self.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-        let sql = format!("COPY {} ({cols}) FROM STDIN WITH (FORMAT text)", self.copy_target()?);
+        let sql = format!("COPY {target} ({cols}) FROM STDIN WITH (FORMAT text)");
         let payload = batch_to_copy_text(&batch)?;
 
         let client = self.client()?;
-        let sink = client.copy_in(&sql).await.context("COPY start failed")?;
-        futures_util::pin_mut!(sink);
-        sink.as_mut().send(Bytes::from(payload)).await.context("COPY send failed")?;
-        sink.finish().await.context("COPY finish failed")?;
+        // One span per COPY (per batch); the payload never goes into it.
+        let copy = DbOp::new("COPY", &self.cfg()?.conn.dbname, Some(target), Some(&sql));
+        let span = copy.span().clone();
+        let rows = copy
+            .run(async {
+                let sink = client.copy_in(&sql).await.context("COPY start failed")?;
+                futures_util::pin_mut!(sink);
+                sink.as_mut().send(Bytes::from(payload)).await.context("COPY send failed")?;
+                sink.finish().await.context("COPY finish failed")
+            })
+            .await?;
+        span.record("loadsmith.db.affected_rows", rows);
         Ok(())
     }
 
     async fn finalize(&mut self) -> Result<u64> {
         let cfg = self.cfg()?;
         let client = self.client()?;
+        let ns = cfg.conn.dbname.as_str();
         if cfg.mode == WriteMode::Merge && !self.columns.is_empty() {
             let merge = build_merge_sql(
                 &cfg.target_table,
@@ -209,11 +228,15 @@ impl DestinationPlugin for PostgresDestPlugin {
                 &cfg.merge_key,
                 cfg.update_columns.as_deref(),
             )?;
-            client.batch_execute(&merge).await.context("MERGE failed")?;
+            let phase = DbOp::new("MERGE", ns, Some(&cfg.target_table), Some(&merge));
+            let span = phase.span().clone();
+            let rows = phase.run(async { client.execute(&merge, &[]).await.context("MERGE failed") }).await?;
+            span.record("loadsmith.db.affected_rows", rows);
         }
         // The commit is the durability point: the truncation, COPY and MERGE
         // land together.
-        client.batch_execute("COMMIT").await.context("COMMIT failed")?;
+        op("COMMIT", ns, None, Some("COMMIT"), async { client.batch_execute("COMMIT").await.context("COMMIT failed") })
+            .await?;
         Ok(self.rows_written)
     }
 
