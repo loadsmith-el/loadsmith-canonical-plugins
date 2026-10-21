@@ -4,7 +4,7 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased — SDK for engine 1.0
+## 2026-10-21 — SDK for engine 1.0
 
 Every plugin moves to the Loadsmith SDK at engine commit `757edf6`, which
 wires the engine's parser stage and OpenTelemetry. What that brings to all
