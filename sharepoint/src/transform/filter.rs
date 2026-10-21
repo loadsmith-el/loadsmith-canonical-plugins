@@ -13,37 +13,25 @@ use serde_json::Value;
 use super::Transform;
 use crate::table::{Cell, Table};
 
-/// Leaf comparison operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Op {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    In,
-    Null,
-    NotNull,
+crate::vocab::config_enum! {
+    /// Leaf comparison operator (`op`).
+    pub enum Op for "op" {
+        Eq = "eq",
+        Ne = "ne",
+        Lt = "lt",
+        Le = "le",
+        Gt = "gt",
+        Ge = "ge",
+        In = "in",
+        Null = "null",
+        NotNull = "not-null",
+    }
+    retired { "is-null" => "null", "is-not-null" => "not-null" }
 }
 
 impl Op {
     fn parse(s: &str, path: &str) -> Result<Op> {
-        Ok(match s {
-            "eq" => Op::Eq,
-            "ne" => Op::Ne,
-            "lt" => Op::Lt,
-            "le" => Op::Le,
-            "gt" => Op::Gt,
-            "ge" => Op::Ge,
-            "in" => Op::In,
-            "null" => Op::Null,
-            "not_null" => Op::NotNull,
-            other => bail!(
-                "{path}.op: unknown operator '{other}' \
-                 (expected eq/ne/lt/le/gt/ge/in/null/not_null)"
-            ),
-        })
+        crate::vocab::choose("op", s, Op::VALUES, Op::RETIRED).map_err(|e| anyhow::anyhow!("{path}.op: {e}"))
     }
 
     fn needs_value(self) -> bool {
@@ -62,21 +50,27 @@ pub enum Predicate {
 
 impl Predicate {
     /// Recursively parses a predicate from a raw config value, with a path for
-    /// precise errors.
-    pub fn parse(v: &Value, path: &str) -> Result<Predicate> {
+    /// precise errors. Keys a node does not use (`{column, op, valeu}`, a
+    /// second key next to `all`) are pushed to `unknown` as config paths, for
+    /// the caller to apply the unknown-keys policy.
+    pub fn parse(v: &Value, path: &str, unknown: &mut Vec<String>) -> Result<Predicate> {
         let obj = v
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("{path}: predicate must be a mapping"))?;
 
-        if let Some(inner) = obj.get("all") {
-            return Ok(Predicate::All(Self::parse_list(inner, &format!("{path}.all"))?));
+        for combinator in ["all", "any", "not"] {
+            let Some(inner) = obj.get(combinator) else { continue };
+            unknown.extend(obj.keys().filter(|k| *k != combinator).map(|k| format!("{path}.{k}")));
+            let at = format!("{path}.{combinator}");
+            return Ok(match combinator {
+                "all" => Predicate::All(Self::parse_list(inner, &at, unknown)?),
+                "any" => Predicate::Any(Self::parse_list(inner, &at, unknown)?),
+                _ => Predicate::Not(Box::new(Self::parse(inner, &at, unknown)?)),
+            });
         }
-        if let Some(inner) = obj.get("any") {
-            return Ok(Predicate::Any(Self::parse_list(inner, &format!("{path}.any"))?));
-        }
-        if let Some(inner) = obj.get("not") {
-            return Ok(Predicate::Not(Box::new(Self::parse(inner, &format!("{path}.not"))?)));
-        }
+        unknown.extend(
+            obj.keys().filter(|k| !matches!(k.as_str(), "column" | "op" | "value")).map(|k| format!("{path}.{k}")),
+        );
 
         // Otherwise it's a leaf: { column, op, value? }.
         let column = obj
@@ -100,13 +94,13 @@ impl Predicate {
         Ok(Predicate::Leaf { column, op, value })
     }
 
-    fn parse_list(v: &Value, path: &str) -> Result<Vec<Predicate>> {
+    fn parse_list(v: &Value, path: &str, unknown: &mut Vec<String>) -> Result<Vec<Predicate>> {
         let arr = v
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("{path}: expected a list of predicates"))?;
         arr.iter()
             .enumerate()
-            .map(|(i, item)| Predicate::parse(item, &format!("{path}[{i}]")))
+            .map(|(i, item)| Predicate::parse(item, &format!("{path}[{i}]"), unknown))
             .collect()
     }
 
@@ -239,13 +233,13 @@ mod tests {
     }
 
     fn apply(json: serde_json::Value) -> Table {
-        let pred = Predicate::parse(&json, "transform[0].where").unwrap();
+        let pred = Predicate::parse(&json, "transform[0].where", &mut Vec::new()).unwrap();
         Filter::new(pred).apply(table()).unwrap()
     }
 
     #[test]
     fn not_null_keeps_only_filled() {
-        let out = apply(serde_json::json!({ "column": "atuacao", "op": "not_null" }));
+        let out = apply(serde_json::json!({ "column": "atuacao", "op": "not-null" }));
         // rows 0 and 3 have non-blank atuacao
         assert_eq!(out.num_rows(), 2);
     }
@@ -254,7 +248,7 @@ mod tests {
     fn all_combines_with_in() {
         let out = apply(serde_json::json!({
             "all": [
-                { "column": "atuacao", "op": "not_null" },
+                { "column": "atuacao", "op": "not-null" },
                 { "column": "area", "op": "in", "value": ["CIVEL", "CRIMINAL"] }
             ]
         }));
@@ -273,7 +267,7 @@ mod tests {
         let out = apply(serde_json::json!({
             "any": [
                 { "column": "area", "op": "eq", "value": "TRAB" },
-                { "not": { "column": "atuacao", "op": "not_null" } }
+                { "not": { "column": "atuacao", "op": "not-null" } }
             ]
         }));
         // area=TRAB (row3) OR atuacao blank (rows 1,2) → 3 rows
@@ -285,16 +279,33 @@ mod tests {
         let err = Predicate::parse(
             &serde_json::json!({ "column": "a", "op": "approx" }),
             "transform[0].where",
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("transform[0].where.op"));
+        let err = Predicate::parse(&serde_json::json!({ "column": "a", "op": "not_null" }), "w", &mut Vec::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("did you mean `not-null`?"), "{err}");
+    }
+
+    #[test]
+    fn unused_keys_are_reported() {
+        let mut unknown = Vec::new();
+        Predicate::parse(
+            &serde_json::json!({ "all": [{ "column": "a", "op": "eq", "valeu": 1, "value": 1 }], "x": 1 }),
+            "w",
+            &mut unknown,
+        )
+        .unwrap();
+        assert_eq!(unknown, ["w.x", "w.all[0].valeu"]);
     }
 
     #[test]
     fn missing_column_errors_at_apply() {
         let pred = Predicate::parse(
-            &serde_json::json!({ "column": "nope", "op": "not_null" }),
+            &serde_json::json!({ "column": "nope", "op": "not-null" }),
             "transform[0].where",
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(Filter::new(pred).apply(table()).is_err());
@@ -304,7 +315,8 @@ mod tests {
     fn in_requires_array() {
         assert!(Predicate::parse(
             &serde_json::json!({ "column": "area", "op": "in", "value": "CIVEL" }),
-            "w"
+            "w",
+            &mut Vec::new()
         )
         .is_err());
     }

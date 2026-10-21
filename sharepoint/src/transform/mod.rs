@@ -6,7 +6,7 @@
 //!
 //! Applicability is documented, not enforced: transforms are source-agnostic, so
 //! all run on both `file` and `list` data. In practice `normalize` and `filter`
-//! suit both; `drop_empty_rows` is low-value on lists; and `fix_merged_columns` is
+//! suit both; `drop-empty-rows` is low-value on lists; and `fix-merged-columns` is
 //! a spreadsheet (merged-cell) concept that does not make sense for lists.
 
 pub mod drop_empty;
@@ -30,7 +30,8 @@ pub fn build(cfg: &TransformConfig, index: usize) -> Result<Box<dyn Transform>> 
     Ok(match cfg {
         TransformConfig::Filter { predicate } => {
             let path = format!("transform[{index}].where");
-            Box::new(filter::Filter::new(filter::Predicate::parse(predicate, &path)?))
+            // Unknown keys were already reported by `configure`.
+            Box::new(filter::Filter::new(filter::Predicate::parse(predicate, &path, &mut Vec::new())?))
         }
         TransformConfig::Normalize { columns, filler } => {
             Box::new(normalize::Normalize::new(*columns, filler.clone()))

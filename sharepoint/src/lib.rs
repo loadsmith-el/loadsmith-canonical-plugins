@@ -12,5 +12,6 @@ pub mod parse;
 pub mod source;
 pub mod table;
 pub mod transform;
+pub mod vocab;
 
 pub use source::SharepointSourcePlugin;

@@ -31,11 +31,27 @@ Uses the OAuth 2.0 **client-credentials** grant (an app registration with
 | `site_id` | string | — | Pre-resolved site id (skips lookup). |
 | `drive` | string | — | Document library by display name; resolved via Graph. File mode only. Provide this **or** `drive_id`. |
 | `drive_id` | string | — | Pre-resolved drive id (skips lookup). File mode only. |
-| `graph_base_url` | string | `https://graph.microsoft.com` | Graph base URL. Override to point tests at a mock. Sovereign clouds are not supported yet: the token scope is fixed to the global Graph (`https://graph.microsoft.com/.default`). |
-| `authority_url` | string | `https://login.microsoftonline.com` | Login authority base URL. |
+| `graph_base_url` | string | `https://graph.microsoft.com` | Graph base URL: a sovereign cloud's (`https://graph.microsoft.us`, `https://dod-graph.microsoft.us`, `https://microsoftgraph.chinacloudapi.cn`), or a mock in tests. |
+| `authority_url` | string | `https://login.microsoftonline.com` | Login authority base URL (`https://login.microsoftonline.us`, `https://login.chinacloudapi.cn` for sovereign clouds). |
+| `scope` | string | `<graph_base_url origin>/.default` | OAuth scope of the token. Derived from `graph_base_url`, so a sovereign cloud needs only the two URLs above; set it when the token audience differs from the Graph host. |
+| `request_timeout` | duration | `60s` | Per-request HTTP timeout (`30s`, `2m`, `500ms`; a bare number is rejected). |
+| `max_retries` | integer | `5` | Retries of a request answered `429 Too Many Requests` or `503 Service Unavailable` — or that timed out or failed to connect — before the run fails. `0` disables retrying. |
 | `batch_size` | integer | `1000` | Rows per Arrow batch. |
 | `input` | object | — | The input mode (below). |
 | `transform` | list | `[]` | Transform chain (below), applied in order. |
+
+Unknown keys are rejected at any depth — including inside `input`, `parser`,
+each `transform` step and each `filter` node — or only warned about with
+`--ignore-unknown-keys`. `kind` and `op` values are kebab-case; a snake_case
+spelling is rejected with the kebab-case one named
+(``did you mean `drop-empty-rows`?``).
+
+### Retries
+
+A throttled (`429`) or unavailable (`503`) answer is retried after the
+`Retry-After` the server sent (in seconds), or else an exponential backoff (1 s,
+2 s, 4 s, …); either wait is capped at 120 s. After `max_retries` retries the
+last answer fails the run. Other errors (`4xx`, `500`) fail at once.
 
 ## Input modes
 
@@ -88,8 +104,8 @@ guidance, not enforcement.
 |---|---|---|
 | `filter` | `where` (predicate) | Keep matching rows. Structured predicate (below). Suits both modes. |
 | `normalize` | `columns` (bool, default true), `filler` (default `_`) | Normalize column names: NFKD→ASCII (strips accents), lowercase, non-alphanumeric runs → `filler`, de-duplicate. Especially useful for lists (SharePoint's internal field names are noisy, e.g. `_x0020_`). |
-| `fix_merged_columns` | `column` | Forward-fill blanks in a column (un-merge merged spreadsheet cells). A **spreadsheet** concept — not meaningful for lists. |
-| `drop_empty_rows` | `zero_is_empty` (bool, default false) | Drop fully-empty rows. With `zero_is_empty`, numeric/string zeros also count as empty (booleans never do). Low value on lists. |
+| `fix-merged-columns` | `column` | Forward-fill blanks in a column (un-merge merged spreadsheet cells). A **spreadsheet** concept — not meaningful for lists. |
+| `drop-empty-rows` | `zero_is_empty` (bool, default false) | Drop fully-empty rows. With `zero_is_empty`, numeric/string zeros also count as empty (booleans never do). Low value on lists. |
 
 ### The `filter` predicate
 
@@ -99,8 +115,8 @@ errors point at the exact node (e.g. `transform[0].where.all[1].op`).
 A node is either a **leaf** or a **combinator**:
 
 - Leaf: `{ column: <name>, op: <op>, value: <v?> }` where `op` ∈ `eq`, `ne`,
-  `lt`, `le`, `gt`, `ge`, `in` (value is a list), `null`, `not_null` (no value).
-  `null`/`not_null` treat whitespace-only strings as blank.
+  `lt`, `le`, `gt`, `ge`, `in` (value is a list), `null`, `not-null` (no value).
+  `null`/`not-null` treat whitespace-only strings as blank.
 - Combinator: `all: [ ... ]` (AND), `any: [ ... ]` (OR), `not: <node>`.
 
 ```yaml
@@ -108,9 +124,9 @@ transform:
   - kind: filter
     where:
       all:
-        - { column: ATUACAO, op: not_null }
+        - { column: ATUACAO, op: not-null }
         - { column: area, op: in, value: [CIVEL, CRIMINAL] }
-  - { kind: fix_merged_columns, column: "ENT." }
+  - { kind: fix-merged-columns, column: "ENT." }
   - { kind: normalize, columns: true, filler: "_" }
 ```
 
@@ -131,8 +147,18 @@ source:
       parser: { kind: excel, sheet: "DATA", header: true, skip_rows: 10 }
     transform:
       - kind: filter
-        where: { column: ATUACAO, op: not_null }
+        where: { column: ATUACAO, op: not-null }
       - { kind: normalize, columns: true }
     batch_size: 1000
 # destination/sink: reuse parquet/jsonl/local-copy (the load half is unchanged)
 ```
+
+## Migrating from 0.1
+
+| 0.1 | 0.2 |
+|---|---|
+| `kind: fix_merged_columns` / `drop_empty_rows` | `fix-merged-columns` / `drop-empty-rows` |
+| `op: not_null` | `op: not-null` |
+| token scope always `https://graph.microsoft.com/.default` | derived from `graph_base_url`, or `scope` |
+| no HTTP timeout, no retry | `request_timeout` (`60s`), `max_retries` (`5`) honoring `Retry-After` |
+| unknown keys ignored | rejected at any depth (or warned with `--ignore-unknown-keys`) |

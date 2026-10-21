@@ -105,3 +105,66 @@ async fn list_mode_paginates() {
     let batch = plugin.next_batch().await.unwrap().expect("a batch");
     assert_eq!(batch.num_rows(), 2); // both pages collected
 }
+
+fn plugin_config(v: serde_json::Value) -> loadsmith_plugin_sdk::PluginConfig {
+    loadsmith_plugin_sdk::PluginConfig::new(v, loadsmith_plugin_sdk::UnknownKeys::Error)
+}
+
+#[tokio::test]
+async fn throttling_is_retried_then_bounded() {
+    let server = MockServer::start_async().await;
+    let scope = format!("{}/.default", server.base_url());
+    // The token scope follows `graph_base_url` (here the mock's origin).
+    let token = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/tenant-1/oauth2/v2.0/token").x_www_form_urlencoded_tuple("scope", &scope);
+            then.status(200).json_body(serde_json::json!({ "access_token": "tok", "expires_in": 3600 }));
+        })
+        .await;
+    let busy = server
+        .mock_async(|when, then| {
+            when.method(GET).path_contains("/content");
+            then.status(503).header("Retry-After", "0").body("busy");
+        })
+        .await;
+
+    let cfg = serde_json::json!({
+        "tenant_id": "tenant-1", "client_id": "c", "client_secret": "s",
+        "site_id": "site-1", "drive_id": "drive-1",
+        "graph_base_url": server.base_url(), "authority_url": server.base_url(),
+        "max_retries": 2, "request_timeout": "5s",
+        "input": { "kind": "file", "file": "/data.csv", "parser": { "kind": "csv" } }
+    });
+    let err = SharepointSourcePlugin::new().configure(plugin_config(cfg)).await.unwrap_err();
+    assert!(format!("{err:#}").contains("503"), "{err:#}");
+    token.assert_hits_async(1).await;
+    busy.assert_hits_async(3).await; // the first try + 2 retries
+}
+
+#[tokio::test]
+async fn config_is_strict_before_any_request() {
+    let base = serde_json::json!({
+        "tenant_id": "t", "client_id": "c", "client_secret": "s", "site_id": "s", "drive_id": "d",
+        "graph_base_url": "http://127.0.0.1:9", "authority_url": "http://127.0.0.1:9",
+        "input": { "kind": "file", "file": "/a.csv", "parser": { "kind": "csv" } }
+    });
+    let err = |patch: serde_json::Value| {
+        let mut cfg = base.clone();
+        for (k, v) in patch.as_object().unwrap() {
+            cfg[k] = v.clone();
+        }
+        async move { format!("{:#}", SharepointSourcePlugin::new().configure(plugin_config(cfg)).await.unwrap_err()) }
+    };
+    let e = err(serde_json::json!({ "input": { "kind": "file", "file": "/a.csv", "parser": { "kind": "csv", "delimitr": ";" } } })).await;
+    assert!(e.contains("`input.parser.delimitr`"), "{e}");
+    let e = err(serde_json::json!({ "transform": [{ "kind": "drop_empty_rows" }] })).await;
+    assert!(e.contains("did you mean `drop-empty-rows`?"), "{e}");
+    let e = err(serde_json::json!({ "transform": [{ "kind": "normalize", "fillr": "_" }] })).await;
+    assert!(e.contains("`transform[0].fillr`"), "{e}");
+    let e = err(serde_json::json!({ "transform": [{ "kind": "filter", "where": { "column": "a", "op": "eq", "valu": 1 } }] })).await;
+    assert!(e.contains("`transform[0].where.valu`"), "{e}");
+    let e = err(serde_json::json!({ "request_timeout": "30" })).await;
+    assert!(e.contains("request_timeout"), "{e}");
+    let e = err(serde_json::json!({ "scope": " " })).await;
+    assert!(e.contains("`scope` is empty"), "{e}");
+}

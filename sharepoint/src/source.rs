@@ -9,8 +9,41 @@ use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::SourcePlugin;
 
-use crate::config::{InputConfig, SharepointConfig};
+use crate::config::{InputConfig, SharepointConfig, TransformConfig};
 use crate::graph::GraphClient;
+
+/// Parses every `filter` predicate up front (before any network call), and
+/// applies the unknown-keys policy to the keys they do not use: the `where`
+/// trees are free-form values that the SDK's typed parse cannot see into.
+fn check_filters(cfg: &SharepointConfig, policy: loadsmith_plugin_sdk::UnknownKeys) -> Result<()> {
+    let mut unknown = Vec::new();
+    let mut parsed = Ok(());
+    for (i, step) in cfg.transform.iter().enumerate() {
+        if let TransformConfig::Filter { predicate } = step {
+            let path = format!("transform[{i}].where");
+            if let Err(e) = crate::transform::filter::Predicate::parse(predicate, &path, &mut unknown) {
+                parsed = Err(e);
+                break;
+            }
+        }
+    }
+    if unknown.is_empty() {
+        return parsed;
+    }
+    if policy == loadsmith_plugin_sdk::UnknownKeys::Warn {
+        for key in &unknown {
+            tracing::warn!("ignoring unknown config key `{key}`");
+        }
+        return parsed;
+    }
+    // A misspelled key (`valu`) usually also explains the parse error (no
+    // `value`): name it first.
+    let keys = unknown
+        .into_iter()
+        .map(|path| loadsmith_plugin_sdk::config::UnknownKey { path, suggestion: None })
+        .collect();
+    Err(loadsmith_plugin_sdk::ConfigRejection::UnknownKeys(keys).into())
+}
 
 pub struct SharepointSourcePlugin {
     batch_size: usize,
@@ -41,19 +74,15 @@ impl SourcePlugin for SharepointSourcePlugin {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        let cfg: SharepointConfig =
-            serde_json::from_value(config).map_err(|e| anyhow::anyhow!("invalid sharepoint source config: {e}"))?;
+        let unknown_keys = config.unknown_keys();
+        let cfg: SharepointConfig = config.parse().map_err(crate::vocab::hint_unknown_variant)?;
+        if cfg.batch_size == 0 {
+            anyhow::bail!("`batch_size` must be at least 1");
+        }
         self.batch_size = cfg.batch_size;
+        check_filters(&cfg, unknown_keys)?;
 
-        let mut graph = GraphClient::new(
-            cfg.tenant_id,
-            cfg.client_id,
-            cfg.client_secret,
-            cfg.graph_base_url,
-            cfg.authority_url,
-        )?;
+        let mut graph = GraphClient::new(&cfg)?;
 
         let site_id = graph
             .resolve_site_id(cfg.site.as_deref(), cfg.site_id.as_deref())

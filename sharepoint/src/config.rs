@@ -19,8 +19,37 @@ fn default_delimiter() -> char {
 fn default_graph_base() -> String {
     "https://graph.microsoft.com".to_string()
 }
+fn default_request_timeout() -> String {
+    "60s".to_string()
+}
+fn default_max_retries() -> u32 {
+    5
+}
 fn default_authority() -> String {
     "https://login.microsoftonline.com".to_string()
+}
+
+/// Parses a duration with a unit (`500ms`, `30s`, `2m`, `1h`, `1d`); a bare number
+/// is rejected, like every duration in the canonical plugins.
+pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    use std::time::Duration;
+    let t = s.trim();
+    let err = || anyhow::anyhow!("invalid duration '{s}': expected a number followed by ms/s/m/h/d (e.g. '30s', '500ms')");
+    let (n, mult_ms) = if let Some(n) = t.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = t.strip_suffix('s') {
+        (n, 1_000)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = t.strip_suffix('h') {
+        (n, 3_600_000)
+    } else if let Some(n) = t.strip_suffix('d') {
+        (n, 86_400_000)
+    } else {
+        return Err(err());
+    };
+    let n: u64 = n.trim().parse().map_err(|_| err())?;
+    Ok(Duration::from_millis(n.checked_mul(mult_ms).ok_or_else(err)?))
 }
 
 /// Top-level source config.
@@ -44,6 +73,20 @@ pub struct SharepointConfig {
     pub graph_base_url: String,
     #[serde(default = "default_authority")]
     pub authority_url: String,
+    /// OAuth scope of the token. Default: `<graph_base_url origin>/.default`
+    /// (`https://graph.microsoft.us/.default` for US Government L4), so a
+    /// sovereign cloud needs only `graph_base_url` + `authority_url`.
+    pub scope: Option<String>,
+
+    /// Per-request HTTP timeout (a duration: `60s`, `2m`); a bare number is
+    /// rejected.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: String,
+    /// Retries of a request answered `429 Too Many Requests` or `503 Service
+    /// Unavailable` (or that timed out / failed to connect) before the run
+    /// fails. `0` disables retrying.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
 
     pub input: InputConfig,
 
@@ -57,7 +100,7 @@ pub struct SharepointConfig {
 /// How data is obtained from the source: a file download (then parsed) or a
 /// SharePoint List read.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum InputConfig {
     /// Download a file from the drive at `file` (a path like `/folder/sheet.xlsx`)
     /// and parse it.
@@ -68,7 +111,7 @@ pub enum InputConfig {
 
 /// Bytes → table parser (file mode only).
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ParserConfig {
     Excel {
         sheet: Option<String>,
@@ -89,7 +132,7 @@ pub enum ParserConfig {
 /// One transform step. The `kind` tag is the compiled "registry": each variant
 /// maps to a `Transform` impl in [`crate::transform`].
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TransformConfig {
     /// Keep rows matching a structured predicate (see [`crate::transform::filter`]).
     /// The `where` value is parsed into a `Predicate` at build time so we can emit
@@ -163,5 +206,17 @@ mod tests {
     fn unknown_transform_kind_is_rejected() {
         let json = serde_json::json!({ "kind": "explode" });
         assert!(serde_json::from_value::<TransformConfig>(json).is_err());
+        let json = serde_json::json!({ "kind": "drop-empty-rows" });
+        assert!(serde_json::from_value::<TransformConfig>(json).is_ok());
+    }
+
+    #[test]
+    fn durations_need_a_unit() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert!(parse_duration("60").is_err());
+        assert!(parse_duration("1y").is_err());
     }
 }
