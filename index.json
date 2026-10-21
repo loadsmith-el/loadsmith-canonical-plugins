@@ -39,10 +39,11 @@
       }
     },
     "mysql": {
-      "latest": "0.1.1",
+      "latest": "0.2.0",
       "versions": {
         "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/mysql-v0.1.0/loadsmith-plugin.yaml",
-        "0.1.1": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/mysql-v0.1.1/loadsmith-plugin.yaml"
+        "0.1.1": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/mysql-v0.1.1/loadsmith-plugin.yaml",
+        "0.2.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/mysql-v0.2.0/loadsmith-plugin.yaml"
       }
     },
     "null": {
