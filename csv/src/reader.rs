@@ -169,7 +169,7 @@ mod tests {
     use std::rc::Rc;
 
     fn opts(v: serde_json::Value) -> CsvOptions {
-        CsvOptions::from_config(v).unwrap()
+        CsvOptions::from_value(v).unwrap()
     }
 
     fn read_all(bytes: &[u8], o: &CsvOptions) -> Result<(SchemaRef, Vec<RecordBatch>)> {

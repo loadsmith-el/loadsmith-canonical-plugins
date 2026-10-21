@@ -38,7 +38,7 @@ then released before the next file. (The [`csv`](./csv.md) parser streams.)
 | `columns` | list | no | Declared columns, as for [`csv`](./csv.md#declared-columns): the stream's schema instead of inference. |
 | `batch_size` | integer | no (default `1000`) | Rows per Arrow batch. At least `1`. |
 
-The `config:` block may be omitted entirely. Unknown fields are rejected.
+The `config:` block may be omitted entirely. Unknown keys are rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about with `--ignore-unknown-keys`.
 
 The sheet's used range defines its width: rows are padded with nulls to the
 widest one. A cell with an Excel error (`#N/A`, `#DIV/0!`) is a null.

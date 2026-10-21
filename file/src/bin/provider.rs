@@ -29,7 +29,6 @@ const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const RESOLVE_FAILED: &str = "RESOLVE_FAILED";
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FileConfig {
     /// Directory that relative reference paths resolve against.
     base_dir: Option<PathBuf>,
@@ -50,13 +49,8 @@ impl ProviderPlugin for FileProvider {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        let cfg: FileConfig = if config.is_null() {
-            FileConfig::default()
-        } else {
-            serde_json::from_value(config).context("invalid file provider config")?
-        };
+        // No `config:` block at all is every default.
+        let cfg: FileConfig = if config.is_null() { FileConfig::default() } else { config.parse()? };
         if let Some(dir) = &cfg.base_dir {
             let meta = std::fs::metadata(dir)
                 .with_context(|| format!("base_dir {} is not accessible", dir.display()))?;
@@ -353,7 +347,10 @@ mod tests {
         let file = s.write("f", "x");
         assert!(p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "base_dir": file }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.is_err());
         assert!(p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "base_dir": s.0.join("nope") }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.is_err());
-        assert!(p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "uri": "file:///x" }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.is_err());
+        let e = p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "uri": "file:///x" }), loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap_err();
+        assert!(format!("{e:#}").contains("unknown config key `uri`"), "{e:#}");
+        // Under `--ignore-unknown-keys` the key is only warned about.
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(serde_json::json!({ "uri": "file:///x" }), loadsmith_plugin_sdk::UnknownKeys::Warn)).await.unwrap();
     }
 
     #[tokio::test]

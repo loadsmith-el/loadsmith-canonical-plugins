@@ -33,7 +33,6 @@ enum RawSheet {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawOptions {
     sheet: Option<RawSheet>,
     #[serde(default = "default_true")]
@@ -69,10 +68,13 @@ impl Default for ExcelOptions {
 }
 
 impl ExcelOptions {
-    /// Reads and validates a `config` object (`null` = every default).
-    pub fn from_config(config: Value) -> Result<Self> {
-        let config = if config.is_null() { Value::Object(Default::default()) } else { config };
-        let raw: RawOptions = serde_json::from_value(config).context("invalid excel parser config")?;
+    /// Reads and validates the plugin's `config` (`null` = every default).
+    pub fn from_config(config: &loadsmith_plugin_sdk::PluginConfig) -> Result<Self> {
+        let raw: RawOptions = if config.is_null() {
+            loadsmith_plugin_sdk::PluginConfig::new(Value::Object(Default::default()), config.unknown_keys()).parse()?
+        } else {
+            config.parse()?
+        };
         if raw.batch_size == 0 {
             bail!("batch_size must be at least 1");
         }
@@ -87,6 +89,12 @@ impl ExcelOptions {
             Some(v) => Some(Arc::new(declared_schema(v).context("invalid `columns`")?)),
         };
         Ok(Self { sheet, header: raw.header, skip_rows: raw.skip_rows, columns, batch_size: raw.batch_size })
+    }
+
+    /// [`from_config`](Self::from_config) for a bare value, rejecting unknown
+    /// keys.
+    pub fn from_value(config: Value) -> Result<Self> {
+        Self::from_config(&loadsmith_plugin_sdk::PluginConfig::new(config, loadsmith_plugin_sdk::UnknownKeys::Error))
     }
 }
 
@@ -192,9 +200,7 @@ impl ParserPlugin for ExcelParser {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        self.opts = ExcelOptions::from_config(config)?;
+        self.opts = ExcelOptions::from_config(&config)?;
         Ok(())
     }
 
@@ -271,7 +277,7 @@ mod tests {
     }
 
     fn opts(v: Value) -> ExcelOptions {
-        ExcelOptions::from_config(v).unwrap()
+        ExcelOptions::from_value(v).unwrap()
     }
 
     fn read_all(path: &Path, o: &ExcelOptions) -> Result<(SchemaRef, Vec<RecordBatch>)> {
@@ -329,10 +335,10 @@ mod tests {
 
     #[test]
     fn config_is_validated() {
-        let err = |v: Value| format!("{:#}", ExcelOptions::from_config(v).unwrap_err());
+        let err = |v: Value| format!("{:#}", ExcelOptions::from_value(v).unwrap_err());
         assert!(err(json!({"sheet": ""})).contains("empty"));
         assert!(err(json!({"batch_size": 0})).contains("batch_size"));
-        assert!(err(json!({"delimiter": ","})).contains("unknown field"));
+        assert!(err(json!({"delimiter": ","})).contains("unknown config key"));
         assert!(err(json!({"columns": []})).contains("empty"));
     }
 

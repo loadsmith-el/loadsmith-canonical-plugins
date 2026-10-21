@@ -192,26 +192,24 @@ fn text_array(values: &[Option<&str>], dt: &DataType) -> Result<ArrayRef, (usize
             let mut b = $builder;
             for (i, v) in values.iter().enumerate() {
                 match v {
-                    _ if blank(v) => b.append_null(),
-                    Some(s) => match $parse(s.trim()) {
+                    Some(s) if !blank(v) => match $parse(s.trim()) {
                         Some(x) => b.append_value(x),
                         None => return Err(bad(i, s)),
                     },
-                    None => unreachable!(),
+                    _ => b.append_null(),
                 }
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }};
     }
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date");
+    let epoch = chrono::DateTime::UNIX_EPOCH.date_naive();
     match dt {
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(values.len(), values.len() * 16);
             for v in values {
                 match v {
-                    _ if blank(v) => b.append_null(),
-                    Some(s) => b.append_value(s),
-                    None => unreachable!(),
+                    Some(s) if !blank(v) => b.append_value(s),
+                    _ => b.append_null(),
                 }
             }
             Ok(Arc::new(b.finish()))

@@ -39,9 +39,7 @@ impl ParserPlugin for CsvParser {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        self.opts = CsvOptions::from_config(config)?;
+        self.opts = CsvOptions::from_config(&config)?;
         Ok(())
     }
 

@@ -217,7 +217,7 @@ pub fn infer_type<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> DataType {
 }
 
 fn epoch() -> NaiveDate {
-    NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+    chrono::DateTime::UNIX_EPOCH.date_naive()
 }
 
 /// Builds one column of `rows` as an Arrow array of type `dt` (the type
@@ -290,7 +290,7 @@ pub fn build_array(rows: &[Vec<Cell>], col: usize, dt: &DataType) -> Result<Arra
                 match get(row) {
                     Cell::DateTime(dt) => b.append_value(dt.and_utc().timestamp_millis()),
                     Cell::Date(d) => b.append_value(
-                        d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis(),
+                        d.and_time(chrono::NaiveTime::MIN).and_utc().timestamp_millis(),
                     ),
                     _ => b.append_null(),
                 }

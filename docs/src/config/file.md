@@ -45,7 +45,7 @@ destination:
 | `glob` | string | no (default `*`) | A pattern matched against each file's **name**: `*`, `?`, `[abc]`, `[!abc]`. It cannot contain `/`. `*` and `?` do not match a leading `.`: hidden files need a pattern that starts with `.`. |
 | `recursive` | bool | no (default `false`) | Also list the subdirectories, at any depth (hidden directories are skipped). The pattern still matches file names. |
 
-Unknown fields are rejected.
+Unknown keys are rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about with `--ignore-unknown-keys`.
 
 ### Behavior
 
@@ -99,7 +99,7 @@ source:
 |---|---|---|---|
 | `base_dir` | string | no | Directory that **relative** reference paths resolve against. Must exist and be a directory, or the config is rejected. Without it, relative paths resolve against the engine's working directory. |
 
-The `config:` block may be omitted entirely. Unknown fields are rejected.
+The `config:` block may be omitted entirely. Unknown keys are rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about with `--ignore-unknown-keys`.
 
 ### References
 

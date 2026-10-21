@@ -37,7 +37,7 @@ than memory loads fine.
 | `columns` | list | no | [Declared columns](#declared-columns): the stream's schema, instead of inference. |
 | `batch_size` | integer | no (default `1000`) | Rows per Arrow batch. At least `1`. |
 
-The `config:` block may be omitted entirely. Unknown fields are rejected.
+The `config:` block may be omitted entirely. Unknown keys are rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about with `--ignore-unknown-keys`.
 
 Quoting follows RFC 4180: a field in double quotes may contain the delimiter,
 newlines and doubled quotes (`"say ""hi"""`). Empty lines are skipped.

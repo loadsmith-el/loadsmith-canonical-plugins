@@ -7,6 +7,8 @@ the extract path alone, or to drive large volume/scale cases.
 - Destination binary: `loadsmith-destination-null`
 
 **No configuration.** It takes no fields; pass an empty `config` (or omit it).
+Since 0.2 a key in it is rejected like an unknown key in any other plugin (or
+only warned about with `--ignore-unknown-keys`); 0.1 ignored the block.
 
 ```yaml
 destination:

@@ -20,10 +20,8 @@ use async_trait::async_trait;
 use glob::{MatchOptions, Pattern};
 use loadsmith_plugin_sdk::ObjectSourcePlugin;
 use serde::Deserialize;
-use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SourceConfig {
     /// The directory to list.
     path: PathBuf,
@@ -53,8 +51,8 @@ const MATCH: MatchOptions = MatchOptions {
 };
 
 impl Listing {
-    fn from_config(config: Value) -> Result<Self> {
-        let cfg: SourceConfig = serde_json::from_value(config).context("invalid file source config")?;
+    fn from_config(config: &loadsmith_plugin_sdk::PluginConfig) -> Result<Self> {
+        let cfg: SourceConfig = config.parse()?;
         if cfg.glob.contains('/') {
             bail!("glob `{}` matches file names: it cannot contain `/` (use `recursive: true`)", cfg.glob);
         }
@@ -124,9 +122,7 @@ impl ObjectSourcePlugin for FileSource {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
-        // Plugin config as raw JSON (unknown-key checks: see `PluginConfig::parse`).
-        let config = config.into_value();
-        self.listing = Some(Listing::from_config(config)?);
+        self.listing = Some(Listing::from_config(&config)?);
         Ok(())
     }
 
@@ -164,7 +160,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     struct Dir(PathBuf);
 
@@ -195,7 +191,14 @@ mod tests {
     }
 
     fn listing(config: Value) -> Result<Listing> {
-        Listing::from_config(config)
+        Listing::from_config(&loadsmith_plugin_sdk::PluginConfig::new(config, loadsmith_plugin_sdk::UnknownKeys::Error))
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let d = Dir::new("strict");
+        let e = format!("{:#}", listing(json!({"path": d.0, "globb": "*.csv"})).err().unwrap());
+        assert!(e.contains("`globb` (did you mean `glob`?)"), "{e}");
     }
 
     #[test]
@@ -261,7 +264,7 @@ mod tests {
         assert!(err(json!({"path": d.0.join("f.csv")})).contains("not a directory"));
         assert!(err(json!({"path": d.0, "glob": "[a"})).contains("invalid glob"));
         assert!(err(json!({"path": d.0, "glob": "sub/*.csv"})).contains("cannot contain `/`"));
-        assert!(err(json!({"path": d.0, "extra": 1})).contains("unknown field"));
+        assert!(err(json!({"path": d.0, "extra": 1})).contains("unknown config key `extra`"));
     }
 
     #[test]
