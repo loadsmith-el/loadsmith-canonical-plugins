@@ -88,7 +88,7 @@ by a unit suffix. Accepted units: `ms`, `s`, `m`, `h`, `d`. Examples: `"500ms"`,
 
 ### Size strings
 
-Byte-size fields (e.g. parquet's `max_file_size`) accept a Docker-style size
-string: binary suffixes `KiB`/`MiB`/`GiB` are 1024-based, SI suffixes
-`kB`/`MB`/`GB` are 1000-based. See the [Parquet page](./parquet.md) for the
-per-field specifics (including how a bare number is interpreted there).
+Byte-size fields (e.g. parquet's `max_file_size`) accept a size with a unit:
+binary suffixes `KiB`/`MiB`/`GiB` are 1024-based, SI suffixes `kB`/`MB`/`GB`
+are 1000-based, `B` is bytes. Like a duration, a bare number with no unit is
+**rejected**. See the [Parquet page](./parquet.md) for the per-field specifics.

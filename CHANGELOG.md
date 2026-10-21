@@ -43,6 +43,9 @@ the sink still work with older engines.
 - References: `path` (the trimmed file) or `path#key` (a scalar picked by a
   dotted key from a JSON or YAML document). Errors `NOT_FOUND`,
   `INVALID_REF`, `ACCESS_DENIED`; no message carries a value.
+- Config is parsed with the SDK's `PluginConfig::parse`: an unknown key is
+  rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about
+  with `--ignore-unknown-keys`.
 
 ### csv 0.1.0 (new)
 
@@ -57,6 +60,9 @@ the sink still work with older engines.
   dates). Values that do not fit their column, ragged records and duplicate
   header names fail with the file, line and column; a later file whose schema
   differs fails with `SCHEMA_MISMATCH`. See [CSV](docs/src/config/csv.md).
+- Config is parsed with the SDK's `PluginConfig::parse`: an unknown key is
+  rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about
+  with `--ignore-unknown-keys`.
 
 ### excel 0.1.0 (new)
 
@@ -66,14 +72,28 @@ the sink still work with older engines.
   declared `columns:`. Types are inferred over the whole sheet with the
   `sharepoint` rules; a workbook is read whole, one file at a time. See
   [Excel](docs/src/config/excel.md).
+- Config is parsed with the SDK's `PluginConfig::parse`: an unknown key is
+  rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about
+  with `--ignore-unknown-keys`.
 
-### jsonl 0.2.0
+### jsonl 0.2.0 (breaking)
 
+- **`path` is required** (writing to stdout is gone: stdout is the protocol's
+  control channel).
+- **Dates, times, timestamps and durations are ISO-8601 text** with the
+  column's own precision (`2026-10-20T12:00:00.123456` for a microsecond
+  column, `Z` for a zoned one, `2026-10-20`, `12:00:00.123`, `PT1.500S`).
+  `temporal_format: epoch` (new) writes integers instead, in `epoch_unit:
+  column | s | ms | us | ns` (default `ms`, the 0.1 output; `column` keeps each
+  column's unit).
+- The plugin owns its JSON mapping (no longer the engine's): every Arrow type
+  has a defined form and none panics — 0.1 panicked on a non-millisecond
+  timestamp and wrote `null` for decimals, lists, structs, unsigned integers…
+  Decimals are exact strings, NaN/±Infinity are `null` (they were `0`). See
+  [JSONL](docs/src/config/jsonl.md#value-mapping).
+- **Unknown config keys are rejected** (or warned with `--ignore-unknown-keys`);
+  enum values are kebab-case with a "did you mean".
 - `cancel()` deletes the partial output file (it only flushed before).
-- Values follow the SDK's total Arrow → JSON mapping: decimals are exact
-  strings, lists are arrays, structs and maps are objects, every timestamp
-  unit is written as epoch milliseconds, and NaN/±Infinity are `null` (they
-  were `0`). See [JSONL](docs/src/config/jsonl.md#value-mapping).
 
 ### postgres 0.3.0 (breaking)
 
@@ -163,21 +183,57 @@ the sink still work with older engines.
   column type), `Time32`/`Time64`, `Date64`, decimals, all integer widths,
   view/large strings and binaries.
 
-### sharepoint 0.2.0
+### sharepoint 0.2.0 (breaking)
 
 - SDK bump (abort rules, exact schema messages).
+- **Unknown config keys are rejected** at any depth — `input`, `parser`, each
+  `transform` step and each `filter` node included — or warned with
+  `--ignore-unknown-keys`.
+- **`kind`/`op` values are kebab-case**: `fix-merged-columns`,
+  `drop-empty-rows`, `not-null`; the snake_case spellings are rejected with the
+  new one named.
+- HTTP: a per-request **`request_timeout`** (default `60s`; there was none) and
+  **bounded retries** (`max_retries`, default `5`) of `429`/`503` answers —
+  after their `Retry-After`, else an exponential backoff, capped at 120 s —
+  and of timeouts and failed connections.
+- The token **`scope`** is derived from `graph_base_url` (sovereign clouds work
+  with the two base URLs alone) and can be set explicitly; it was fixed to the
+  global Graph.
 - Internal: the CSV/Excel parsing and the cell table moved to the shared
   `tabular` library (also used by the `csv` and `excel` parsers), with no
   behavior change.
 
-### parquet 0.1.2
+### parquet 0.2.0 (breaking)
 
 - SDK bump (abort rules). `cancel()` already removed the run's files.
+- **Re-runs replace the prefix's previous output**: a chunked run removes the
+  previous set before writing (a run with fewer chunks left stale ones behind);
+  a single-file run renames its new file over the old one, then removes other
+  files of the prefix. Only files named `<prefix>[.<seq>].<codec>.parquet` are
+  touched.
+- Every file is written under a hidden temp name and renamed when complete: a
+  reader or a sink never sees a partial file.
+- **`max_file_size` needs a unit**: a bare number (it meant KiB) is rejected
+  with the spelling it meant (`"500"` → `"500KiB"`).
+- `path` is created when missing.
+- New `compression_level` (gzip 0–10, zstd 1–22) and `row_group_size`.
+- **Unknown config keys are rejected** (or warned with
+  `--ignore-unknown-keys`); a wrong `compression` gets a "did you mean".
 
-### null 0.1.3
+### null 0.2.0 (breaking)
 
 - SDK bump (abort rules).
+- A key in its (empty) config block is rejected like any unknown key (or warned
+  with `--ignore-unknown-keys`); it used to be ignored.
 
-### local-copy 0.1.2
+### local-copy 0.2.0 (breaking)
 
 - SDK bump (abort rules).
+- **Atomic delivery**: each file is copied to a hidden temp name in `dest`,
+  synced, and renamed, so `dest` never holds a partial copy. Same-name objects:
+  the last one delivered wins (documented).
+- **`LOADSMITH_SINK_CRASH_AFTER` is gone from the released binary.** The lab's
+  sink-resume case uses `local-copy-chaos`, a never-released workspace member
+  (binary `loadsmith-sink-local-copy-chaos`) wrapping the same delivery code.
+- **Unknown config keys are rejected** (or warned with
+  `--ignore-unknown-keys`).
