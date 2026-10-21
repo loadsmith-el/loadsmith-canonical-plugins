@@ -31,6 +31,7 @@ async-trait          = { workspace = true }
 arrow-array          = { workspace = true }
 arrow-schema         = { workspace = true }
 loadsmith-plugin-sdk = { workspace = true }
+tracing              = { workspace = true }
 mimalloc             = { workspace = true }
 tabular              = { path = "../tabular" }
 csv                  = "1.3"

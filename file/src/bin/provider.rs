@@ -98,7 +98,35 @@ fn resolve_ref(base_dir: Option<&Path>, reference: &str) -> Result<String, Resol
     }
 }
 
+/// Reads the referenced file — a `read <file>` span (`file.path`,
+/// `file.size`; `error.type` = the failure code). Never the contents.
 fn read_file(path: &Path) -> Result<String, ResolveFailure> {
+    if !loadsmith_plugin_sdk::telemetry::enabled() {
+        return read_file_inner(path);
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let span = tracing::info_span!(
+        "read",
+        otel.name = format!("read {name}"),
+        file.path = %path.display(),
+        file.size = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    let result = span.in_scope(|| read_file_inner(path));
+    match &result {
+        Ok(text) => {
+            span.record("file.size", text.len() as u64);
+        }
+        Err(e) => {
+            span.record("error.type", e.code.as_str());
+            span.record("error", e.message.as_str());
+        }
+    }
+    result
+}
+
+fn read_file_inner(path: &Path) -> Result<String, ResolveFailure> {
     let shown = path.display();
     let bytes = std::fs::read(path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => fail(NOT_FOUND, format!("{shown} does not exist")),

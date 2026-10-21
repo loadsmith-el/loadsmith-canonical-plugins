@@ -35,5 +35,6 @@ serde_json           = { workspace = true }
 serde_yaml           = { workspace = true }
 async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { workspace = true }
+tracing              = { workspace = true }
 mimalloc             = { workspace = true }
 glob                 = "0.3"

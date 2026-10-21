@@ -22,6 +22,26 @@ use loadsmith_plugin_sdk::ParserPlugin;
 pub use options::CsvOptions;
 pub use reader::CsvReader;
 
+/// The span of opening one file (inside the SDK's `loadsmith.parse` span,
+/// which carries its path and rows): `read <file>` with `file.path`,
+/// `file.size`, the column count and whether the schema was inferred (the
+/// inference sample is read here).
+fn read_span(path: &Path, declared: bool) -> tracing::Span {
+    if !loadsmith_plugin_sdk::telemetry::enabled() {
+        return tracing::Span::none();
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    tracing::info_span!(
+        "read",
+        otel.name = format!("read {name}"),
+        file.path = %path.display(),
+        file.size = tracing::field::Empty,
+        loadsmith.schema.columns = tracing::field::Empty,
+        loadsmith.schema.inferred = !declared,
+        error = tracing::field::Empty,
+    )
+}
+
 /// The parser plugin.
 #[derive(Default)]
 pub struct CsvParser {
@@ -49,9 +69,21 @@ impl ParserPlugin for CsvParser {
 
     async fn open(&mut self, path: &Path) -> Result<Schema> {
         self.current = None;
-        let file = File::open(path).context("cannot open the file")?;
-        let reader = CsvReader::open(file, &self.opts)?;
+        let span = read_span(path, self.opts.declared().is_some());
+        let reader = span.in_scope(|| -> Result<CsvReader<File>> {
+            let file = File::open(path).context("cannot open the file")?;
+            if !span.is_none() {
+                if let Ok(meta) = file.metadata() {
+                    span.record("file.size", meta.len());
+                }
+            }
+            CsvReader::open(file, &self.opts)
+        });
+        let reader = reader.inspect_err(|e| {
+            span.record("error", format!("{e:#}"));
+        })?;
         let schema = reader.schema().as_ref().clone();
+        span.record("loadsmith.schema.columns", schema.fields().len() as u64);
         self.current = Some(reader);
         Ok(schema)
     }

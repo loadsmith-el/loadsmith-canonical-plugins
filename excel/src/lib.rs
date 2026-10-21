@@ -210,8 +210,30 @@ impl ParserPlugin for ExcelParser {
 
     async fn open(&mut self, path: &Path) -> Result<Schema> {
         self.current = None;
-        let reader = SheetReader::open(path, &self.opts)?;
+        // `read <file>`: the workbook is read whole here (file.size, the
+        // sheet's rows and columns); the SDK's `loadsmith.parse` span around
+        // it carries the path and rows.
+        let span = if loadsmith_plugin_sdk::telemetry::enabled() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            tracing::info_span!(
+                "read",
+                otel.name = format!("read {name}"),
+                file.path = %path.display(),
+                file.size = std::fs::metadata(path).map(|m| m.len()).ok(),
+                loadsmith.excel.sheet.rows = tracing::field::Empty,
+                loadsmith.schema.columns = tracing::field::Empty,
+                loadsmith.schema.inferred = self.opts.columns.is_none(),
+                error = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
+        let reader = span.in_scope(|| SheetReader::open(path, &self.opts)).inspect_err(|e| {
+            span.record("error", format!("{e:#}"));
+        })?;
         let schema = reader.schema().as_ref().clone();
+        span.record("loadsmith.excel.sheet.rows", reader.table.rows.len() as u64);
+        span.record("loadsmith.schema.columns", schema.fields().len() as u64);
         self.current = Some(reader);
         Ok(schema)
     }

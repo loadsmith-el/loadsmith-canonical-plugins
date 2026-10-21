@@ -94,6 +94,35 @@ impl Listing {
         Ok(out)
     }
 
+    /// [`list`](Self::list) in a `list` span (`file.directory`,
+    /// `loadsmith.glob`, `loadsmith.files.matched`, `loadsmith.files.bytes`).
+    fn list_traced(&self) -> Result<Vec<PathBuf>> {
+        if !loadsmith_plugin_sdk::telemetry::enabled() {
+            return self.list();
+        }
+        let span = tracing::info_span!(
+            "list",
+            file.directory = %self.dir.display(),
+            loadsmith.glob = self.pattern.as_str(),
+            loadsmith.recursive = self.recursive,
+            loadsmith.files.matched = tracing::field::Empty,
+            loadsmith.files.bytes = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        let result = span.in_scope(|| self.list());
+        match &result {
+            Ok(files) => {
+                let bytes: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+                span.record("loadsmith.files.matched", files.len() as u64);
+                span.record("loadsmith.files.bytes", bytes);
+            }
+            Err(e) => {
+                span.record("error", format!("{e:#}"));
+            }
+        }
+        result
+    }
+
     fn matches(&self, path: &Path) -> bool {
         path.file_name()
             .and_then(|n| n.to_str())
@@ -129,7 +158,7 @@ impl ObjectSourcePlugin for FileSource {
     async fn next_object(&mut self) -> Result<Option<PathBuf>> {
         if self.pending.is_none() {
             let listing = self.listing.as_ref().context("not configured")?;
-            let files = listing.list()?;
+            let files = listing.list_traced()?;
             if files.is_empty() {
                 eprintln!(
                     "no file in {} matches `{}`",

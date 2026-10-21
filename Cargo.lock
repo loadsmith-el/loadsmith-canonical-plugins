@@ -2395,6 +2395,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2459,6 +2460,7 @@ dependencies = [
  "serde_json",
  "tabular",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2476,6 +2478,7 @@ dependencies = [
  "serde_json",
  "tabular",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
