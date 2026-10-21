@@ -103,3 +103,15 @@ A value with no representation — a date or timestamp outside the years
 | decimals, times, durations, lists, structs, unsigned and small integers, … → `null` | their full value (see [Value mapping](#value-mapping)) |
 | NaN / ±Infinity → `0` | `null` |
 | unknown keys ignored | rejected (or warned with `--ignore-unknown-keys`) |
+
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)). On top of it, one `write <file>` span from the file's creation
+(`start`) to its final flush (`finish`), with `file.path`, `file.size` and
+`loadsmith.object.rows`; a cancelled run marks it `error`.

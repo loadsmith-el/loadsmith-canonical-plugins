@@ -98,3 +98,21 @@ starts with the prefix (`events2.snappy.parquet`, `events.v2.snappy.parquet`).
 | re-runs left stale chunks / a file being written was visible | the prefix's previous files are replaced; files appear only when complete |
 | — | `compression_level`, `row_group_size` (new) |
 | unknown keys ignored | rejected (or warned with `--ignore-unknown-keys`) |
+
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)). On top of it:
+
+| Span | When | Attributes |
+|---|---|---|
+| `write <file>` | each file, from its creation to its rename into place (a chunk in chunked mode) | `file.path`, `file.size`, `loadsmith.object.rows` |
+| `rename` | the finished temp file moved to its final name (inside `write <file>`) | `file.path` (the temp file), `loadsmith.file.target` |
+| `cleanup` | removing the previous run's dataset files | `file.directory`, `loadsmith.files.removed` |
+
+A cancelled run marks the open file's span `error`.

@@ -162,3 +162,30 @@ source:
 | token scope always `https://graph.microsoft.com/.default` | derived from `graph_base_url`, or `scope` |
 | no HTTP timeout, no retry | `request_timeout` (`60s`), `max_retries` (`5`) honoring `Retry-After` |
 | unknown keys ignored | rejected at any depth (or warned with `--ignore-unknown-keys`) |
+
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)). On top of it, following the OpenTelemetry HTTP semantic
+conventions:
+
+| Span | When | Attributes |
+|---|---|---|
+| `token` | minting an access token (cached tokens record nothing) | `oauth.grant_type` |
+| `POST` / `GET` (`client`) | each Graph or token call, its retries and body read included | `http.request.method`, `url.full`, `server.address`, `server.port`, `http.response.status_code`, `http.request.resend_count`, `http.response.body.size` (file downloads); on failure `error.type` (the status code, `timeout`, `connect` or `_OTHER`) |
+
+Each retry is a `retry` event on its call's span (`http.request.resend_count`,
+`loadsmith.retry.cause` = the status or `timeout`/`connect`,
+`loadsmith.retry.wait` in seconds, and `http.response.header.retry_after`
+when the server sent one). Metric: `http.client.request.duration` (histogram,
+seconds; by method, server, status and `error.type`).
+
+`url.full` never carries a secret: the query string keeps only the values of
+`$select`, `$expand` and `$top` (others, like `$skiptoken`, read
+`REDACTED`). The client secret, the token and request bodies are never
+recorded.

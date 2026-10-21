@@ -145,3 +145,22 @@ own output as well.
 `uri` with an optional `base_dir` and reference files through `secret()`.
 Engines before the provider kind cannot install it, and this engine skips the
 0.1.x manifest on `plugin install --all`.
+
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)).
+
+- **Source:** the SDK records one `loadsmith.object` span per announced file
+  (`loadsmith.object.path`); the plugin adds one `list` span for the
+  directory listing: `file.directory`, `loadsmith.glob`,
+  `loadsmith.recursive`, `loadsmith.files.matched`, `loadsmith.files.bytes`.
+- **Provider:** the SDK records one `loadsmith.resolve` span per reference
+  (`loadsmith.provider.ref`); the plugin adds a `read <file>` span with
+  `file.path`, `file.size` and, on failure, `error.type` (`NOT_FOUND`,
+  `ACCESS_DENIED`, …). A value never appears in a span, attribute or log.

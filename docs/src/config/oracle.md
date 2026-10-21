@@ -186,3 +186,36 @@ tls:
 - **Build-time C.** The driver pulls rustls with default features, so
   `aws-lc-sys` is compiled (it needs `cmake` and a C compiler) even though the
   runtime crypto is `rustls-rustcrypto` (oracle/rust-oracledb#34).
+
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)). On top of it, following the OpenTelemetry database semantic
+conventions:
+
+| Span (`client`) | When | Attributes |
+|---|---|---|
+| `connect` | each connection (TCP, TLS, authentication, session setup) | `db.system.name` = `oracle.db`, `db.namespace`, `server.address`, `server.port`, `loadsmith.tls.mode` |
+| `SELECT` | source: the column describe, then the query (execution and fetch of every row) | `db.response.returned_rows` |
+| `SELECT <table>` | destination: describing the target table | |
+| `DELETE <table>` | destination, `mode: overwrite` | `loadsmith.db.affected_rows` |
+| `CREATE TABLE LS_MRG_…` | destination, `mode: merge` (create-if-missing) | |
+| `INSERT <table>` | destination: once per batch (the array insert; into the staging table for `merge`) | `db.operation.batch.size`, `loadsmith.db.affected_rows` |
+| `MERGE <table>` | destination, `mode: merge`, at the end | `loadsmith.db.affected_rows` |
+| `COMMIT` | destination | |
+
+Every statement span carries `db.system.name`, `db.namespace` (the `service_name`, else the `sid`),
+`db.collection.name` (when it targets a table), `db.operation.name` and
+`db.query.text`; a failure marks it `error` with `error.type` and
+`db.response.status_code` (the server's error code). Metric:
+`db.client.operation.duration` (histogram, seconds; by `db.system.name`,
+`db.namespace`, `db.operation.name`, `db.collection.name`, `error.type`).
+
+`db.query.text` is only the statement the plugin generates or runs — with
+placeholders, and the incremental watermark shown as `?` — never a bound value
+or row data. One span per statement, batch or merge phase, never per row.

@@ -58,3 +58,19 @@ the same config as `local-copy`.
 | copied in place (a partial file was visible during the copy) | temp name + rename |
 | `LOADSMITH_SINK_CRASH_AFTER` honored by the release binary | removed; lab-only `local-copy-chaos` |
 | unknown keys ignored | rejected (or warned with `--ignore-unknown-keys`) |
+
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)). The SDK records one `loadsmith.deliver` span per object
+(`loadsmith.object.path`); inside it the plugin adds:
+
+| Span | Attributes |
+|---|---|
+| `copy <file>` — the copy to the temp name and its sync | `file.path` (the target), `file.size` |
+| `rename` — the atomic move into place | `file.path` (the temp file), `loadsmith.file.target` |

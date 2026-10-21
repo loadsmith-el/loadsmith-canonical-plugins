@@ -135,3 +135,17 @@ is cancelled, also for the files parsed before the failing one.
 | `NO_INPUT` | No file arrived and `columns` is not declared. |
 
 A blank header name becomes `col_<i>` (0-based position).
+
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)). The SDK records one `loadsmith.parse` span per file
+(`loadsmith.object.path`, `loadsmith.object.rows`) with a `loadsmith.batch`
+span per batch inside it. The parser adds a `read <file>` span for opening
+the file and reading its inference sample: `file.path`, `file.size`,
+`loadsmith.schema.columns`, `loadsmith.schema.inferred`.

@@ -245,3 +245,35 @@ destination:
 The old mode spellings are rejected with the new one named:
 ``unknown `mode` value `atomic` (did you mean `append`?)``.
 
+## Telemetry
+
+When the run has telemetry on (the engine's `telemetry:` block or `OTEL_*`
+settings), the plugin records spans and metrics in-process and the engine
+exports them over OTLP under the run's trace — the plugin itself opens no
+connection for it, and records nothing when telemetry is off. Every plugin gets
+the SDK's baseline: spans `configure`, `start`, `finish` and the per-batch /
+per-object `loadsmith.*` spans, plus the `loadsmith.plugin.*` metrics
+([engine design](https://github.com/loadsmith-el/loadsmith/blob/main/docs/src/architecture/telemetry.md)). On top of it, following the OpenTelemetry database semantic
+conventions:
+
+| Span (`client`) | When | Attributes |
+|---|---|---|
+| `connect` | each connection (TCP, TLS, authentication, session setup) | `db.system.name` = `postgresql`, `db.namespace`, `server.address`, `server.port`, `loadsmith.tls.mode` |
+| `SET`, `PREPARE`, `BEGIN`, `DECLARE`, `COMMIT` | source: session pinning, schema inference, opening the cursor, closing it | statement attributes below |
+| `FETCH` | source: once per batch | `db.response.returned_rows` |
+| `BEGIN`, `COMMIT` | destination: the load's transaction | |
+| `TRUNCATE <table>` | destination, `mode: overwrite` | |
+| `CREATE TABLE _ls_staging` | destination, `mode: merge` | |
+| `COPY <table>` | destination: once per batch (into the staging table for `merge`) | `loadsmith.db.affected_rows` |
+| `MERGE <table>` | destination, `mode: merge`, at the end | `loadsmith.db.affected_rows` |
+
+Every statement span carries `db.system.name`, `db.namespace` (the `dbname`),
+`db.collection.name` (when it targets a table), `db.operation.name` and
+`db.query.text`; a failure marks it `error` with `error.type` and
+`db.response.status_code` (the server's error code). Metric:
+`db.client.operation.duration` (histogram, seconds; by `db.system.name`,
+`db.namespace`, `db.operation.name`, `db.collection.name`, `error.type`).
+
+`db.query.text` is only the statement the plugin generates or runs — with
+placeholders, and the incremental watermark shown as `?` — never a bound value
+or row data. One span per statement, batch or merge phase, never per row.

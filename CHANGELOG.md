@@ -6,8 +6,9 @@ format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased — SDK for engine 1.0
 
-Every plugin moves to the Loadsmith SDK at engine commit `7648368`, which
-wires the engine's parser stage. What that brings to all of them:
+Every plugin moves to the Loadsmith SDK at engine commit `757edf6`, which
+wires the engine's parser stage and OpenTelemetry. What that brings to all
+of them:
 
 - **Abort rules.** The SDK reads the control channel while the plugin works,
   answers `ping` and `resend`, and calls `cancel()` whenever a run will not
@@ -19,6 +20,14 @@ wires the engine's parser stage. What that brings to all of them:
   Arrow schema exactly (timestamp unit and time zone, decimal precision and
   scale, lists, per-field `nullable`) instead of nine lossy labels. The engine
   no longer warns that the `schema` message disagrees with the stream.
+- **Telemetry (OpenTelemetry).** When the run has telemetry on, the SDK
+  records spans (`configure`, `start`, `loadsmith.batch`, `finish`, …) and the
+  `loadsmith.plugin.*` metrics, and each plugin adds its own domain spans and
+  metrics under the OpenTelemetry semantic conventions (listed below and in
+  each plugin's *Telemetry* section). The engine exports them over OTLP; the
+  plugins open no connection and record nothing when telemetry is off. Spans
+  are per statement, batch, request or file — never per row — and never
+  carry a bound value, row data, token or secret.
 
 **Compatibility.** The wire protocol is still v1, but the new `schema`
 vocabulary (`timestamp` with a `unit`, `decimal128`, `list`, …) is only
@@ -46,6 +55,9 @@ the sink still work with older engines.
 - Config is parsed with the SDK's `PluginConfig::parse`: an unknown key is
   rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about
   with `--ignore-unknown-keys`.
+- Telemetry: a `list` span for the source's directory listing (matched files,
+  bytes); a `read <file>` span per provider reference (`file.path`,
+  `file.size`, `error.type`), never the value.
 
 ### csv 0.1.0 (new)
 
@@ -63,6 +75,8 @@ the sink still work with older engines.
 - Config is parsed with the SDK's `PluginConfig::parse`: an unknown key is
   rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about
   with `--ignore-unknown-keys`.
+- Telemetry: a `read <file>` span per file opened (`file.path`, `file.size`,
+  column count, inferred or declared).
 
 ### excel 0.1.0 (new)
 
@@ -75,6 +89,8 @@ the sink still work with older engines.
 - Config is parsed with the SDK's `PluginConfig::parse`: an unknown key is
   rejected (`UNKNOWN_CONFIG_KEYS`, with a "did you mean"), or only warned about
   with `--ignore-unknown-keys`.
+- Telemetry: a `read <file>` span per workbook read (`file.path`,
+  `file.size`, sheet rows, column count).
 
 ### jsonl 0.2.0 (breaking)
 
@@ -94,6 +110,8 @@ the sink still work with older engines.
 - **Unknown config keys are rejected** (or warned with `--ignore-unknown-keys`);
   enum values are kebab-case with a "did you mean".
 - `cancel()` deletes the partial output file (it only flushed before).
+- Telemetry: a `write <file>` span (`file.path`, `file.size`,
+  `loadsmith.object.rows`).
 
 ### postgres 0.3.0 (breaking)
 
@@ -126,6 +144,12 @@ the sink still work with older engines.
 - Source: `cancel()` bounds its `CLOSE`/`ROLLBACK` to 5 s. After the SDK drops
   an in-flight batch its FETCH still runs server-side, and the rollback could
   otherwise outlast the core's grace period.
+- Telemetry: `connect` span (TLS mode, server); one `client` span per
+  statement, `COPY` (per batch) and merge phase (`TRUNCATE`, staging `CREATE
+  TABLE`, `MERGE`) with `db.system.name=postgresql`, `db.namespace`,
+  `db.collection.name`, `db.operation.name`, `db.query.text` (generated
+  statement only; the watermark shows as `?`), returned/affected rows,
+  SQLSTATE `error.type`; `db.client.operation.duration` histogram.
 
 ### mysql 0.2.0 (breaking)
 
@@ -161,6 +185,11 @@ the sink still work with older engines.
   `Date64`, decimals, all integer widths, view/large strings and binaries.
 - Source: `cancel()` bounds the disconnect to 2 s, then drops the connection.
   The connection can be mid-result after the SDK drops an in-flight batch.
+- Telemetry: `connect` span; one `client` span per statement, batch insert
+  and merge phase (`DELETE` for overwrite, staging, `UPDATE`/`INSERT` merge)
+  with the `db.*` attributes (`db.system.name=mysql`; `db.query.text` with
+  `?` placeholders, never values), affected rows, server-code `error.type`;
+  `db.client.operation.duration` histogram.
 
 ### oracle 0.4.0 (breaking)
 
@@ -182,6 +211,11 @@ the sink still work with older engines.
 - Destination: accepts every timestamp unit and zone (spelled for the target
   column type), `Time32`/`Time64`, `Date64`, decimals, all integer widths,
   view/large strings and binaries.
+- Telemetry: `connect` span; one `client` span per describe, query, array
+  insert and merge phase (`DELETE` for overwrite, staging, `MERGE`, `COMMIT`)
+  with the `db.*` attributes (`db.system.name=oracle.db`; `db.query.text`
+  with binds, never values), returned/affected rows, `ORA-NNNNN`
+  `error.type`; `db.client.operation.duration` histogram.
 
 ### sharepoint 0.2.0 (breaking)
 
@@ -202,6 +236,12 @@ the sink still work with older engines.
 - Internal: the CSV/Excel parsing and the cell table moved to the shared
   `tabular` library (also used by the `csv` and `excel` parsers), with no
   behavior change.
+- Telemetry: an HTTP `client` span per Graph/token call
+  (`http.request.method`, `url.full` with query values redacted,
+  `server.address`, `http.response.status_code`, resend count), a `retry`
+  event per retry (cause, wait, `Retry-After`), a `token` span when minting a
+  token (never the token or secret); `http.client.request.duration`
+  histogram.
 
 ### parquet 0.2.0 (breaking)
 
@@ -219,12 +259,16 @@ the sink still work with older engines.
 - New `compression_level` (gzip 0–10, zstd 1–22) and `row_group_size`.
 - **Unknown config keys are rejected** (or warned with
   `--ignore-unknown-keys`); a wrong `compression` gets a "did you mean".
+- Telemetry: a `write <file>` span per file (`file.path`, `file.size`,
+  `loadsmith.object.rows`), a `rename` span into place, a `cleanup` span for
+  the previous run's files.
 
 ### null 0.2.0 (breaking)
 
 - SDK bump (abort rules).
 - A key in its (empty) config block is rejected like any unknown key (or warned
   with `--ignore-unknown-keys`); it used to be ignored.
+- Telemetry: the SDK baseline only.
 
 ### local-copy 0.2.0 (breaking)
 
@@ -237,3 +281,5 @@ the sink still work with older engines.
   (binary `loadsmith-sink-local-copy-chaos`) wrapping the same delivery code.
 - **Unknown config keys are rejected** (or warned with
   `--ignore-unknown-keys`).
+- Telemetry: inside the SDK's `loadsmith.deliver`, a `copy <file>` span
+  (`file.path`, `file.size`) and a `rename` span for the atomic move.
