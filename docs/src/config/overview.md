@@ -35,6 +35,7 @@ These pages cover only what goes *inside* each plugin's `config:`.
 | `parquet` | destination | [Parquet](./parquet.md) |
 | `null` | destination | [Null](./null.md) |
 | `local-copy` | sink | [Local-copy](./local-copy.md) |
+| `s3` | sink | [S3](./s3.md) |
 | `file` | source + provider | [File](./file.md) |
 | `csv` | parser | [CSV](./csv.md) |
 | `excel` | parser | [Excel](./excel.md) |

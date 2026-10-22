@@ -23,6 +23,7 @@
 - [Parquet](./config/parquet.md)
 - [Null](./config/null.md)
 - [Local-copy sink](./config/local-copy.md)
+- [S3 sink](./config/s3.md)
 - [File (source + provider)](./config/file.md)
 - [CSV parser](./config/csv.md)
 - [Excel parser](./config/excel.md)

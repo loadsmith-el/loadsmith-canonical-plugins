@@ -27,6 +27,7 @@ members = [
     "tabular",
     "csv",
     "excel",
+    "s3",
 ]
 
 [workspace.package]
@@ -34,11 +35,11 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Pinned Loadsmith SDK (one rev for all four; see the note at the top).
-loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "757edf66105b6c65189913e5d13a84dc53329b2c" }
-loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "757edf66105b6c65189913e5d13a84dc53329b2c" }
-loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "757edf66105b6c65189913e5d13a84dc53329b2c" }
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "27e692d344c20d48576c1704f841369a84c70280" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "27e692d344c20d48576c1704f841369a84c70280" }
+loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "27e692d344c20d48576c1704f841369a84c70280" }
 # The wire vocabulary (declared `columns:` of the tabular parsers).
-loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "757edf66105b6c65189913e5d13a84dc53329b2c" }
+loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "27e692d344c20d48576c1704f841369a84c70280" }
 
 # Common deps (versions mirror the loadsmith workspace).
 tokio          = { version = "1", features = ["full"] }

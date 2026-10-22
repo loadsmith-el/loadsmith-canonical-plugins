@@ -1,0 +1,44 @@
+[package]
+name    = "loadsmith-sink-s3"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[package.metadata.loadsmith]
+name     = "s3"
+summary  = "S3 sink — delivers finalized objects to an S3 bucket (AWS or S3-compatible; pure-Rust SigV4 + TLS)"
+protocol = "^1"
+provides = [
+    { kind = "sink", bin = "loadsmith-sink-s3" },
+]
+
+[lib]
+name = "loadsmith_s3"
+
+[[bin]]
+name = "loadsmith-sink-s3"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }
+loadsmith-tls        = { workspace = true }
+mimalloc             = { workspace = true }
+# SigV4 signing (presigned URLs) with the RustCrypto hmac/sha2 — pure Rust, no
+# ring/aws-lc-rs. Sans-IO: the HTTP goes through reqwest below.
+rusty-s3 = { version = "0.10", default-features = false, features = ["rustcrypto", "full"] }
+# rustls with the *installed* crypto provider (rustls-rustcrypto, set via
+# loadsmith-tls::install_provider) + webpki roots, like sharepoint.
+reqwest = { version = "0.12", default-features = false, features = [
+    "http2",
+    "rustls-tls-webpki-roots-no-provider",
+] }
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+httpmock = "0.7"

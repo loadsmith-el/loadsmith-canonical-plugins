@@ -29,6 +29,7 @@ destination). Each plugin is a self-describing directory:
 | `parquet` | destination |
 | `null` | destination (throughput testing) |
 | `local-copy` | sink |
+| `s3` | sink (AWS S3 or S3-compatible; pure-Rust SigV4, TLS via rustls) |
 | `file` | source (raw: lists a local directory for a parser) + provider (`secret()` values from local files) |
 | `csv` | parser (streams CSV files into Arrow) |
 | `excel` | parser (one sheet of xlsx/xlsm/xlsb/xls/ods workbooks into Arrow) |
