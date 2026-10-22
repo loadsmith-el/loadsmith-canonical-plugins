@@ -39,6 +39,16 @@ struct OracleConfig {
     /// `TIMESTAMP(9)` whole, within 1677–2262).
     #[serde(default)]
     timestamp_unit: crate::vocab::TimestampUnit,
+
+    /// Scale of a `NUMBER` without a declared precision (a bare `NUMBER`
+    /// column, `SUM(x)`, …), emitted as `Decimal128(38, number_scale)`
+    /// (default 10). A value with more decimal places fails the run.
+    #[serde(default = "default_number_scale")]
+    number_scale: u8,
+}
+
+fn default_number_scale() -> u8 {
+    types::DEFAULT_NUMBER_SCALE as u8
 }
 
 fn default_batch_size() -> usize {
@@ -202,6 +212,9 @@ impl SourcePlugin for OracleSourcePlugin {
         // operator's policy: an error by default, a warning with
         // `--ignore-unknown-keys`.
         let cfg: OracleConfig = config.parse()?;
+        if cfg.number_scale > 38 {
+            anyhow::bail!("number_scale must be at most 38 (got {})", cfg.number_scale);
+        }
 
         let (conn, cols) = tokio::task::block_in_place(|| -> Result<_> {
             let conn = crate::conn::connect(&cfg.conn)?;
@@ -216,7 +229,7 @@ impl SourcePlugin for OracleSourcePlugin {
             Ok((conn, cols))
         })?;
 
-        let (select_list, schema) = types::projected_select(&cols, cfg.timestamp_unit.arrow());
+        let (select_list, schema) = types::projected_select(&cols, cfg.timestamp_unit.arrow(), cfg.number_scale as i8);
 
         if let Some(inc) = &cfg.incremental {
             // Resolve the config cursor name against the catalog's upper-cased

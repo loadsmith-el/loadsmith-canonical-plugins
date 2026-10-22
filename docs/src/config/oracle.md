@@ -39,10 +39,16 @@ ignored, as with every thin driver.)
 | `batch_size` | integer | `1000` | Rows per Arrow batch. |
 | `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. `cursor_column` must be one of the query's columns (a plain name folds to upper case, like unquoted SQL); any other name fails at startup. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `DATE`/`TIMESTAMP` columns. The default is the same in every canonical plugin and truncates below the millisecond; **`ns` keeps `TIMESTAMP(9)` whole** (years 1677–2262 only), `us` covers the default `TIMESTAMP(6)`. |
+| `number_scale` | integer 0–38 | `10` | Scale of a `NUMBER` **without a declared precision** (a bare `NUMBER` column, `SUM(x)`, `COUNT(*)`, …), emitted as `Decimal128(38, number_scale)`. A value with more decimal places (or more than 38 digits) fails the run, naming the column — nothing is rounded. Declare the type in the query instead (`CAST(x AS NUMBER(19))`) for an exact integer or decimal. |
 
 | Oracle type | Arrow type | Notes |
 |---|---|---|
-| `NUMBER` | `Utf8` | Exact decimal text, any precision. |
+| `NUMBER(p)` / `NUMBER(p,0)`, p ≤ 9 | `Int32` | |
+| `NUMBER(p)`, 10 ≤ p ≤ 18 | `Int64` | |
+| `NUMBER(p)`, p ≥ 19 | `Decimal128(p, 0)` | Past `Int64`'s 18 guaranteed digits. |
+| `NUMBER(p,s)` | `Decimal128(p, s)` | Exact. A scale above the precision (`NUMBER(2,5)`) is `Decimal128(5, 5)`; a negative scale (`NUMBER(5,-2)`) is `Decimal128(7, 0)`. |
+| `NUMBER` (no precision: a bare column, or a computed one) | `Decimal128(38, number_scale)` | Default scale 10; a value that doesn't fit fails the run (see `number_scale`). |
+| `FLOAT(b)` | `Float64` | Oracle's binary-precision `NUMBER`. |
 | `BINARY_FLOAT` / `BINARY_DOUBLE` | `Float32` / `Float64` | |
 | `BOOLEAN` (23ai+) | `Boolean` | |
 | `DATE` | `Timestamp(unit, None)` | Oracle `DATE` carries a time of day. |
@@ -137,6 +143,12 @@ other spelling is rejected with the valid values.
 | a duplicate key within one load failed the `MERGE` (ORA-30926) | the last row of the key wins |
 | `DATE`/`TIMESTAMP`/`TIMESTAMP WITH TZ` → text (`FF6`) | `Timestamp(ms)` / `Timestamp(ms, "UTC")`; `timestamp_unit` for finer units |
 | unknown keys ignored (except in `tls`) | rejected (or warned with `--ignore-unknown-keys`) |
+
+### Migrating from 0.4
+
+| 0.4 | 0.5 |
+|---|---|
+| `NUMBER` (any precision) → `Utf8` text | an exact Arrow number: `Int32`/`Int64`/`Decimal128(p, s)` by the declared precision and scale, `Decimal128(38, number_scale)` without one (see the type table). Parquet columns become `INT32`/`INT64`/`DECIMAL`. An incremental pipeline's next run sees the new schema: its `state:` refuses it (`on_schema_change: refuse`, the default) until the state is reset (`loadsmith state rm`) or the run uses `on_schema_change: continue`. |
 
 ## TLS (TCPS)
 

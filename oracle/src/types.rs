@@ -1,8 +1,11 @@
 //! Oracle ⇄ Arrow type mapping, for the pure-Rust `oracledb` thin driver.
 //!
-//! `NUMBER` (any precision/scale), `INTERVAL`, `ROWID` and the character types
-//! cross as exact text (`Utf8`); `RAW`/`BLOB` as `Binary`; the IEEE
-//! `BINARY_FLOAT`/`BINARY_DOUBLE` as Arrow floats; `DATE`, `TIMESTAMP` and
+//! `NUMBER` crosses as the closest exact Arrow number (see [`number_to_arrow`]):
+//! `NUMBER(p)` as `Int32`/`Int64` (or `Decimal128(p, 0)` past 18 digits),
+//! `NUMBER(p,s)` as `Decimal128(p, s)`, a `NUMBER` without a declared precision
+//! as `Decimal128(38, number_scale)`, `FLOAT(b)` as `Float64`. `INTERVAL`,
+//! `ROWID` and the character types cross as exact text (`Utf8`); `RAW`/`BLOB`
+//! as `Binary`; the IEEE `BINARY_FLOAT`/`BINARY_DOUBLE` as Arrow floats; `DATE`, `TIMESTAMP` and
 //! `TIMESTAMP WITH [LOCAL] TIME ZONE` as Arrow timestamps in the source's
 //! `timestamp_unit` (the zoned ones normalized to UTC).
 //!
@@ -20,7 +23,10 @@ use arrow::datatypes::{
     UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{
-    builder::{BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, StringBuilder},
+    builder::{
+        BinaryBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder, Int32Builder,
+        Int64Builder, StringBuilder,
+    },
     Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
@@ -34,9 +40,54 @@ use crate::vocab::{epoch_in, from_epoch, time_of_day};
 
 // ── Schema inference (source) ───────────────────────────────────────────────
 
-/// Maps an Oracle column type to an Arrow `DataType`.
+/// Scale of a `NUMBER` without a declared precision (a bare `NUMBER`
+/// column, or a computed one such as `SUM(x)`), unless the source sets
+/// `number_scale`.
+pub const DEFAULT_NUMBER_SCALE: i8 = 10;
+
+/// Arrow's widest exact decimal (`Decimal128`), and Oracle's `NUMBER` maximum.
+const MAX_DECIMAL_PRECISION: u8 = 38;
+
+/// Maps a `NUMBER` column, by its declared precision and scale, to the closest
+/// exact Arrow type. Oracle reports precision `0` when none was declared, and
+/// scale `-127` for a floating scale (`FLOAT(b)`, or a bare `NUMBER`).
+pub fn number_to_arrow(precision: u8, scale: i8, number_scale: i8) -> DataType {
+    match (precision, scale) {
+        // FLOAT(b): binary precision, no fixed scale — the closest is an IEEE double.
+        (p, -127) if p > 0 => DataType::Float64,
+        // No declared precision: up to 38 significant digits. A value with more
+        // fractional digits than `number_scale` fails the batch instead of
+        // being rounded.
+        (0, -127) => DataType::Decimal128(MAX_DECIMAL_PRECISION, number_scale),
+        (0, s) => DataType::Decimal128(MAX_DECIMAL_PRECISION, s.max(0)),
+        (p, 0) if p <= 9 => DataType::Int32,
+        (p, 0) if p <= 18 => DataType::Int64,
+        // A negative scale rounds to the left of the point: whole numbers of up
+        // to `p - s` digits.
+        (p, s) if s < 0 => DataType::Decimal128((p as i16 - s as i16).min(MAX_DECIMAL_PRECISION as i16) as u8, 0),
+        // Oracle allows a scale above the precision (`NUMBER(2,5)` = 0.000dd);
+        // Arrow needs precision >= scale.
+        (p, s) => DataType::Decimal128(p.max(s as u8).min(MAX_DECIMAL_PRECISION), s),
+    }
+}
+
+/// Maps a described column to an Arrow `DataType`.
+pub fn column_to_arrow(c: &ColumnDesc, unit: TimeUnit, number_scale: i8) -> DataType {
+    if c.oracle_type == oracledb::DB_TYPE_NUMBER {
+        number_to_arrow(c.precision, c.scale, number_scale)
+    } else {
+        oracle_to_arrow(c.oracle_type, unit)
+    }
+}
+
+/// Maps an Oracle column type to an Arrow `DataType`. `NUMBER` needs its
+/// precision and scale: see [`column_to_arrow`].
 pub fn oracle_to_arrow(t: &DbType, unit: TimeUnit) -> DataType {
-    if t == oracledb::DB_TYPE_BINARY_FLOAT {
+    if t == oracledb::DB_TYPE_NUMBER {
+        number_to_arrow(0, -127, DEFAULT_NUMBER_SCALE)
+    } else if t == oracledb::DB_TYPE_BINARY_INTEGER {
+        DataType::Int32
+    } else if t == oracledb::DB_TYPE_BINARY_FLOAT {
         DataType::Float32
     } else if t == oracledb::DB_TYPE_BINARY_DOUBLE {
         DataType::Float64
@@ -49,8 +100,8 @@ pub fn oracle_to_arrow(t: &DbType, unit: TimeUnit) -> DataType {
     } else if is_zoned(t) {
         DataType::Timestamp(unit, Some("UTC".into()))
     } else {
-        // NUMBER, INTERVAL, CHAR/VARCHAR2/CLOB/LONG, ROWID, JSON, and anything
-        // exotic → text-preserving Utf8.
+        // INTERVAL, CHAR/VARCHAR2/CLOB/LONG, ROWID, JSON, and anything exotic
+        // → text-preserving Utf8.
         DataType::Utf8
     }
 }
@@ -99,7 +150,7 @@ fn to_char_expr(col: &str, t: &DbType) -> Option<String> {
 /// Builds the projected `SELECT` list and the matching Arrow `Schema` from the
 /// described columns. Temporal/CLOB columns are wrapped in `TO_CHAR(...) AS
 /// "name"`; every other column is selected verbatim. All fields are nullable.
-pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit) -> (String, Schema) {
+pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit, number_scale: i8) -> (String, Schema) {
     let mut select = Vec::with_capacity(cols.len());
     let mut fields = Vec::with_capacity(cols.len());
     for c in cols {
@@ -108,22 +159,39 @@ pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit) -> (String, Schema)
             None => quote_ident(&c.name),
         };
         select.push(expr);
-        fields.push(Field::new(&c.name, oracle_to_arrow(c.oracle_type, unit), true));
+        fields.push(Field::new(&c.name, column_to_arrow(c, unit, number_scale), true));
     }
     (select.join(", "), Schema::new(fields))
 }
 
-/// A minimal, owned description of one result column (name + Oracle type).
+/// A minimal, owned description of one result column (name, Oracle type, and
+/// the declared precision/scale that type `NUMBER`).
 #[derive(Debug, Clone)]
 pub struct ColumnDesc {
     pub name: String,
     pub oracle_type: &'static DbType,
+    pub precision: u8,
+    pub scale: i8,
+}
+
+impl ColumnDesc {
+    /// A column with no precision or scale (anything but `NUMBER`).
+    pub fn new(name: impl Into<String>, oracle_type: &'static DbType) -> Self {
+        Self { name: name.into(), oracle_type, precision: 0, scale: 0 }
+    }
 }
 
 /// Extracts column descriptions from a result set's column metadata (obtained by
 /// running the query with a `WHERE 1 = 0` describe wrapper).
 pub fn describe(cols: &[oracledb::Metadata]) -> Vec<ColumnDesc> {
-    cols.iter().map(|c| ColumnDesc { name: c.name().to_string(), oracle_type: c.db_type() }).collect()
+    cols.iter()
+        .map(|c| ColumnDesc {
+            name: c.name().to_string(),
+            oracle_type: c.db_type(),
+            precision: c.precision(),
+            scale: c.scale(),
+        })
+        .collect()
 }
 
 /// Wraps a SQL token (`:1`, or a quoted literal) in the explicit `TO_*`
@@ -213,6 +281,35 @@ fn cell_at(row: &[Cell], idx: usize) -> &Cell {
     row.get(idx).unwrap_or(&NULL_CELL)
 }
 
+/// Parses an `OracleNumber`'s exact decimal text (`-12.5`, `0.001`, `42`; never
+/// an exponent) into a `Decimal128` value at `scale`. A value with more
+/// significant fractional digits than `scale`, or more digits than `precision`,
+/// is an error: nothing is rounded or truncated.
+fn parse_decimal(s: &str, precision: u8, scale: i8) -> Result<i128> {
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    if int_part.is_empty() && frac_part.is_empty()
+        || !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit())
+    {
+        bail!("not a decimal number");
+    }
+    let scale = scale.max(0) as usize;
+    let frac = frac_part.trim_end_matches('0');
+    if frac.len() > scale {
+        bail!("has {} decimal places, more than the column's scale {scale}", frac.len());
+    }
+    let unscaled = format!("{int_part}{frac:0<scale$}");
+    let unscaled = unscaled.trim_start_matches('0');
+    if unscaled.len() > precision as usize {
+        bail!("needs {} digits, more than the column's precision {precision}", unscaled.len());
+    }
+    let v = if unscaled.is_empty() { 0 } else { unscaled.parse::<i128>()? };
+    Ok(if negative { -v } else { v })
+}
+
 /// Parses a `TO_CHAR` temporal rendering — `YYYY-MM-DD HH24:MI:SS[.fffffffff][
 /// ±HH:MM]` — into an epoch value in `unit` (UTC), floored to the unit.
 fn parse_temporal(s: &str, unit: TimeUnit) -> Result<i64> {
@@ -240,6 +337,47 @@ fn build_column(rows: &[Vec<Cell>], idx: usize, field: &Field) -> Result<ArrayRe
                     Some(v) => b.append_value(
                         v.parse::<f32>().map_err(|e| anyhow::anyhow!("col {name}: f32 '{v}': {e}"))?,
                     ),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Int32 => {
+            let mut b = Int32Builder::with_capacity(rows.len());
+            for row in rows {
+                match cell_at(row, idx).text() {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(
+                        v.parse::<i32>().map_err(|e| anyhow::anyhow!("col {name}: int32 '{v}': {e}"))?,
+                    ),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Int64 => {
+            let mut b = Int64Builder::with_capacity(rows.len());
+            for row in rows {
+                match cell_at(row, idx).text() {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(
+                        v.parse::<i64>().map_err(|e| anyhow::anyhow!("col {name}: int64 '{v}': {e}"))?,
+                    ),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let mut b = Decimal128Builder::with_capacity(rows.len())
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| anyhow::anyhow!("col {name}: {e}"))?;
+            for row in rows {
+                match cell_at(row, idx).text() {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(parse_decimal(v, *precision, *scale).map_err(|e| {
+                        anyhow::anyhow!(
+                            "col {name}: NUMBER '{v}' {e} (Decimal128({precision}, {scale})); \
+                             declare the column's precision with a CAST in the query, or raise `number_scale`"
+                        )
+                    })?),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -499,7 +637,8 @@ mod tests {
     #[test]
     fn type_mapping() {
         let ms = TimeUnit::Millisecond;
-        assert_eq!(oracle_to_arrow(oracledb::DB_TYPE_NUMBER, ms), DataType::Utf8);
+        assert_eq!(oracle_to_arrow(oracledb::DB_TYPE_NUMBER, ms), DataType::Decimal128(38, 10));
+        assert_eq!(oracle_to_arrow(oracledb::DB_TYPE_BINARY_INTEGER, ms), DataType::Int32);
         assert_eq!(oracle_to_arrow(oracledb::DB_TYPE_TIMESTAMP_TZ, ms), DataType::Timestamp(ms, Some("UTC".into())));
         assert_eq!(oracle_to_arrow(oracledb::DB_TYPE_DATE, TimeUnit::Second), DataType::Timestamp(TimeUnit::Second, None));
         assert_eq!(oracle_to_arrow(oracledb::DB_TYPE_BLOB, ms), DataType::Binary);
@@ -509,19 +648,74 @@ mod tests {
     #[test]
     fn projection_wraps_temporal_only() {
         let cols = vec![
-            ColumnDesc { name: "EVENT_ID".into(), oracle_type: oracledb::DB_TYPE_NUMBER },
-            ColumnDesc { name: "EVENT_TSTZ".into(), oracle_type: oracledb::DB_TYPE_TIMESTAMP_TZ },
-            ColumnDesc { name: "TS".into(), oracle_type: oracledb::DB_TYPE_TIMESTAMP },
+            ColumnDesc { precision: 19, ..ColumnDesc::new("EVENT_ID", oracledb::DB_TYPE_NUMBER) },
+            ColumnDesc::new("EVENT_TSTZ", oracledb::DB_TYPE_TIMESTAMP_TZ),
+            ColumnDesc::new("TS", oracledb::DB_TYPE_TIMESTAMP),
         ];
-        let (select, schema) = projected_select(&cols, TimeUnit::Nanosecond);
+        let (select, schema) = projected_select(&cols, TimeUnit::Nanosecond, DEFAULT_NUMBER_SCALE);
         assert_eq!(
             select,
             "\"EVENT_ID\", TO_CHAR(\"EVENT_TSTZ\" AT TIME ZONE '+00:00', 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM') \
              AS \"EVENT_TSTZ\", TO_CHAR(\"TS\", 'YYYY-MM-DD HH24:MI:SS.FF9') AS \"TS\""
         );
         assert_eq!(schema.fields().len(), 3);
-        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(19, 0));
         assert_eq!(schema.field(2).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, None));
+    }
+
+    #[test]
+    fn number_mapping_follows_precision_and_scale() {
+        assert_eq!(number_to_arrow(1, 0, 10), DataType::Int32);
+        assert_eq!(number_to_arrow(9, 0, 10), DataType::Int32);
+        assert_eq!(number_to_arrow(10, 0, 10), DataType::Int64);
+        assert_eq!(number_to_arrow(18, 0, 10), DataType::Int64);
+        assert_eq!(number_to_arrow(19, 0, 10), DataType::Decimal128(19, 0));
+        assert_eq!(number_to_arrow(18, 6, 10), DataType::Decimal128(18, 6));
+        assert_eq!(number_to_arrow(38, 38, 10), DataType::Decimal128(38, 38));
+        assert_eq!(number_to_arrow(2, 5, 10), DataType::Decimal128(5, 5));
+        assert_eq!(number_to_arrow(5, -2, 10), DataType::Decimal128(7, 0));
+        assert_eq!(number_to_arrow(126, -127, 10), DataType::Float64);
+        assert_eq!(number_to_arrow(0, -127, 10), DataType::Decimal128(38, 10));
+        assert_eq!(number_to_arrow(0, -127, 4), DataType::Decimal128(38, 4));
+        assert_eq!(number_to_arrow(0, 2, 10), DataType::Decimal128(38, 2));
+    }
+
+    #[test]
+    fn decimal_text_parses_exactly_or_fails() {
+        assert_eq!(parse_decimal("123.45", 18, 6).unwrap(), 123_450_000);
+        assert_eq!(parse_decimal("-0.5", 9, 2).unwrap(), -50);
+        assert_eq!(parse_decimal("0", 9, 2).unwrap(), 0);
+        assert_eq!(parse_decimal("42", 19, 0).unwrap(), 42);
+        assert_eq!(parse_decimal(".25", 5, 2).unwrap(), 25);
+        assert_eq!(parse_decimal("1.500", 5, 1).unwrap(), 15);
+        let max = "9".repeat(38);
+        assert_eq!(parse_decimal(&max, 38, 0).unwrap(), max.parse::<i128>().unwrap());
+        assert!(parse_decimal("1.234", 9, 2).unwrap_err().to_string().contains("scale 2"));
+        assert!(parse_decimal("12345", 4, 0).unwrap_err().to_string().contains("precision 4"));
+        assert!(parse_decimal("1e5", 9, 0).is_err());
+        assert!(parse_decimal("", 9, 0).is_err());
+        assert!(parse_decimal("-", 9, 0).is_err());
+    }
+
+    #[test]
+    fn numbers_build_typed_columns() {
+        let schema = Schema::new(vec![
+            Field::new("I", DataType::Int32, true),
+            Field::new("L", DataType::Int64, true),
+            Field::new("D", DataType::Decimal128(18, 6), true),
+        ]);
+        let rows = vec![
+            vec![Cell::Text("7".into()), Cell::Text("9000000000".into()), Cell::Text("-12.5".into())],
+            vec![Cell::Null, Cell::Null, Cell::Null],
+        ];
+        let batch = rows_to_batch(&rows, &schema).unwrap();
+        assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 7);
+        assert_eq!(batch.column(1).as_primitive::<Int64Type>().value(0), 9_000_000_000);
+        let d = batch.column(2).as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(d.value_as_string(0), "-12.500000");
+        assert!(d.is_null(1));
+        let bad = vec![vec![Cell::Null, Cell::Null, Cell::Text("0.0000001".into())]];
+        assert!(rows_to_batch(&bad, &schema).unwrap_err().to_string().contains("number_scale"));
     }
 
     #[test]

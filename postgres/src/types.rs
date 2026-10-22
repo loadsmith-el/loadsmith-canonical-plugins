@@ -1,9 +1,10 @@
 use anyhow::{bail, Result};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::datatypes::i256;
 use arrow_array::{
     builder::{
-        BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
-        Int32Builder, Int64Builder, StringBuilder,
+        BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
+        Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
     },
     ArrayRef, ListArray, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
@@ -27,20 +28,63 @@ fn unix_epoch() -> NaiveDate {
     *UNIX_EPOCH.get_or_init(NaiveDate::default) // 1970-01-01
 }
 
-/// Maps a Postgres type to an Arrow DataType.
+/// Scale of a `numeric` without a declared precision, unless the source sets
+/// `number_scale`.
+pub const DEFAULT_NUMBER_SCALE: i8 = 10;
+
+/// Arrow's widest `Decimal128`; a declared precision above it maps to `Decimal256`.
+const MAX_DECIMAL128_PRECISION: u8 = 38;
+const MAX_DECIMAL256_PRECISION: u8 = 76;
+
+/// Maps a `numeric` column, by its type modifier, to the closest exact Arrow
+/// decimal. `numeric(p,s)` is `Decimal128(p, s)` (`Decimal256` past 38 digits);
+/// an unconstrained `numeric` (typmod `-1`) is `Decimal128(38, number_scale)`,
+/// and a value that doesn't fit it (or `NaN`/`Infinity`) fails the batch
+/// instead of being rounded.
+pub fn numeric_to_arrow(typmod: i32, number_scale: i8) -> DataType {
+    if typmod < 4 {
+        return DataType::Decimal128(MAX_DECIMAL128_PRECISION, number_scale);
+    }
+    // typmod = ((precision << 16) | scale) + VARHDRSZ; the scale is an 11-bit
+    // signed field since Postgres 15 (negative scales).
+    let t = typmod - 4;
+    let precision = ((t >> 16) & 0xffff) as u8;
+    let scale = ((((t & 0x7ff) ^ 1024) - 1024) as i16).clamp(i8::MIN as i16, i8::MAX as i16) as i8;
+    if scale < 0 {
+        // Rounded to the left of the point: whole numbers of up to p - s digits.
+        let p = (precision as i16 - scale as i16).min(MAX_DECIMAL256_PRECISION as i16) as u8;
+        return decimal_of(p, 0);
+    }
+    // A scale above the precision (`numeric(2,5)`): Arrow needs precision >= scale.
+    decimal_of(precision.max(scale as u8), scale)
+}
+
+fn decimal_of(precision: u8, scale: i8) -> DataType {
+    if precision <= MAX_DECIMAL128_PRECISION {
+        DataType::Decimal128(precision, scale)
+    } else {
+        DataType::Decimal256(precision.min(MAX_DECIMAL256_PRECISION), scale)
+    }
+}
+
+/// Maps a Postgres type (and its type modifier, which carries `numeric`'s
+/// precision and scale) to an Arrow DataType.
 ///
 /// - `array` (any element type) → `DataType::List` with a recursively-mapped inner type
 /// - `hstore` → `DataType::Utf8` (JSON-encoded; see HSTORE_TYPE_KEY metadata on the Field)
-/// - everything else → mapped by type name (NUMERIC/UUID/etc. fall through to Utf8)
-pub fn pg_type_to_arrow(pg_type: &PgType, unit: TimeUnit) -> DataType {
+/// - `numeric` → an exact decimal (see [`numeric_to_arrow`])
+/// - everything else → mapped by type name (UUID/JSON/etc. fall through to Utf8)
+pub fn pg_type_to_arrow(pg_type: &PgType, typmod: i32, unit: TimeUnit, number_scale: i8) -> DataType {
     if pg_type.name() == "hstore" {
         return DataType::Utf8;
     }
     if let Kind::Array(inner) = pg_type.kind() {
-        let inner_dt = pg_type_to_arrow(inner, unit);
+        // An array column's typmod is its element's.
+        let inner_dt = pg_type_to_arrow(inner, typmod, unit, number_scale);
         return DataType::List(Arc::new(Field::new("item", inner_dt, true)));
     }
     match pg_type.name() {
+        "numeric" => numeric_to_arrow(typmod, number_scale),
         "int2" | "int4" => DataType::Int32,
         "int8" => DataType::Int64,
         "float4" => DataType::Float32,
@@ -57,11 +101,11 @@ pub fn pg_type_to_arrow(pg_type: &PgType, unit: TimeUnit) -> DataType {
 }
 
 /// Builds an Arrow Schema from a slice of tokio-postgres columns.
-pub fn columns_to_schema(cols: &[Column], unit: TimeUnit) -> Schema {
+pub fn columns_to_schema(cols: &[Column], unit: TimeUnit, number_scale: i8) -> Schema {
     let fields: Vec<Field> = cols
         .iter()
         .map(|c| {
-            let dt = pg_type_to_arrow(c.type_(), unit);
+            let dt = pg_type_to_arrow(c.type_(), c.type_modifier(), unit, number_scale);
             if c.type_().name() == "hstore" {
                 let meta = HashMap::from([(
                     HSTORE_TYPE_KEY.to_string(),
@@ -160,6 +204,37 @@ fn build_values(values: &[Option<&str>], field: &Field, col_name: &str) -> Resul
         DataType::Float32 => parsed!(Float32Builder, |v: &str| v.parse::<f32>()),
         DataType::Float64 => parsed!(Float64Builder, |v: &str| v.parse::<f64>()),
         DataType::Boolean => parsed!(BooleanBuilder, parse_bool),
+        DataType::Decimal128(precision, scale) => {
+            let mut b = Decimal128Builder::with_capacity(values.len())
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| anyhow::anyhow!("col {col_name}: {e}"))?;
+            for v in values {
+                match v {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(
+                        parse_decimal(v, *precision, *scale)
+                            .and_then(|d| d.to_i128().ok_or_else(|| anyhow::anyhow!("is out of range")))
+                            .map_err(|e| decimal_error(col_name, v, *precision, *scale, e))?,
+                    ),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
+        DataType::Decimal256(precision, scale) => {
+            let mut b = Decimal256Builder::with_capacity(values.len())
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| anyhow::anyhow!("col {col_name}: {e}"))?;
+            for v in values {
+                match v {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(
+                        parse_decimal(v, *precision, *scale)
+                            .map_err(|e| decimal_error(col_name, v, *precision, *scale, e))?,
+                    ),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
         DataType::Date32 => parsed!(Date32Builder, parse_date_days),
         DataType::Timestamp(unit, tz) => {
             let with_offset = tz.is_some();
@@ -211,6 +286,45 @@ fn build_values(values: &[Option<&str>], field: &Field, col_name: &str) -> Resul
         }
         other => bail!("col {col_name}: unsupported arrow type {other:?}"),
     })
+}
+
+fn decimal_error(col_name: &str, v: &str, precision: u8, scale: i8, e: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "col {col_name}: numeric '{v}' {e} (Decimal({precision}, {scale})); declare the column's \
+         precision with a cast in the query (`::numeric(p,s)`, or `::text`/`::float8`), or raise `number_scale`"
+    )
+}
+
+/// Parses Postgres' exact `numeric` text (`-12.5`, `0.001`, `42`; never an
+/// exponent) into an unscaled decimal value at `scale`. More significant
+/// fractional digits than `scale`, more digits than `precision`, or a
+/// `NaN`/`Infinity` is an error: nothing is rounded or truncated.
+fn parse_decimal(s: &str, precision: u8, scale: i8) -> Result<i256> {
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    if int_part.is_empty() && frac_part.is_empty()
+        || !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit())
+    {
+        bail!("is not a finite decimal number");
+    }
+    let scale = scale.max(0) as usize;
+    let frac = frac_part.trim_end_matches('0');
+    if frac.len() > scale {
+        bail!("has {} decimal places, more than the column's scale {scale}", frac.len());
+    }
+    let unscaled = format!("{int_part}{frac:0<scale$}");
+    let unscaled = unscaled.trim_start_matches('0');
+    if unscaled.len() > precision as usize {
+        bail!("needs {} digits, more than the column's precision {precision}", unscaled.len());
+    }
+    let mut v = i256::ZERO;
+    for d in unscaled.bytes() {
+        v = v.wrapping_mul(i256::from_i128(10)).wrapping_add(i256::from_i128((d - b'0') as i128));
+    }
+    Ok(if negative { v.wrapping_neg() } else { v })
 }
 
 fn parse_bool(v: &str) -> Result<bool> {
@@ -601,7 +715,7 @@ mod tests {
     #[test]
     fn type_int4_array_becomes_list_of_int32() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::INT4_ARRAY, TimeUnit::Millisecond);
+        let dt = pg_type_to_arrow(&Type::INT4_ARRAY, -1, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE);
         assert!(matches!(dt, DataType::List(_)));
         if let DataType::List(inner) = dt {
             assert_eq!(inner.data_type(), &DataType::Int32);
@@ -611,15 +725,65 @@ mod tests {
     #[test]
     fn type_text_becomes_utf8() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::TEXT, TimeUnit::Millisecond);
+        let dt = pg_type_to_arrow(&Type::TEXT, -1, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE);
         assert_eq!(dt, DataType::Utf8);
     }
 
     #[test]
     fn type_float8_becomes_float64() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::FLOAT8, TimeUnit::Millisecond);
+        let dt = pg_type_to_arrow(&Type::FLOAT8, -1, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE);
         assert_eq!(dt, DataType::Float64);
+    }
+
+    #[test]
+    fn numeric_follows_its_type_modifier() {
+        // typmod of numeric(p,s) = ((p << 16) | s) + 4.
+        let typmod = |p: i32, s: i32| ((p << 16) | (s & 0x7ff)) + 4;
+        assert_eq!(numeric_to_arrow(-1, 10), DataType::Decimal128(38, 10));
+        assert_eq!(numeric_to_arrow(-1, 4), DataType::Decimal128(38, 4));
+        assert_eq!(numeric_to_arrow(typmod(10, 2), 10), DataType::Decimal128(10, 2));
+        assert_eq!(numeric_to_arrow(typmod(18, 0), 10), DataType::Decimal128(18, 0));
+        assert_eq!(numeric_to_arrow(typmod(50, 5), 10), DataType::Decimal256(50, 5));
+        assert_eq!(numeric_to_arrow(typmod(5, -2), 10), DataType::Decimal128(7, 0));
+        assert_eq!(numeric_to_arrow(typmod(2, 5), 10), DataType::Decimal128(5, 5));
+        use tokio_postgres::types::Type;
+        let dt = pg_type_to_arrow(&Type::NUMERIC_ARRAY, typmod(9, 3), TimeUnit::Millisecond, 10);
+        let DataType::List(inner) = dt else { panic!("{dt:?}") };
+        assert_eq!(inner.data_type(), &DataType::Decimal128(9, 3));
+    }
+
+    #[test]
+    fn numeric_text_parses_exactly_or_fails() {
+        let v = |s: &str, p, sc| parse_decimal(s, p, sc).map(|d| d.as_i128());
+        assert_eq!(v("12345.6789", 38, 10).unwrap(), 123_456_789_000_000);
+        assert_eq!(v("-99.95", 10, 2).unwrap(), -9995);
+        assert_eq!(v("0", 10, 2).unwrap(), 0);
+        assert_eq!(v("-0.000001", 38, 10).unwrap(), -10_000);
+        let big = format!("{}.5", "9".repeat(60));
+        let d = parse_decimal(&big, 61, 1).unwrap();
+        assert_eq!(d.to_string(), format!("{}5", "9".repeat(60)));
+        assert!(v("1.234", 10, 2).unwrap_err().to_string().contains("scale 2"));
+        assert!(v("123456789012345678901234567890.1", 38, 10).unwrap_err().to_string().contains("precision 38"));
+        assert!(v("NaN", 38, 10).unwrap_err().to_string().contains("finite"));
+        assert!(v("-Infinity", 38, 10).is_err());
+    }
+
+    #[test]
+    fn numeric_columns_build_decimals() {
+        let field = Field::new("n", DataType::Decimal128(10, 2), true);
+        let arr = build_values(&[Some("99.95"), None, Some("-12345678.99")], &field, "n").unwrap();
+        use arrow_array::Array;
+        let d = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(d.value_as_string(0), "99.95");
+        assert!(d.is_null(1));
+        assert_eq!(d.value_as_string(2), "-12345678.99");
+        let err = build_values(&[Some("NaN")], &field, "n").unwrap_err().to_string();
+        assert!(err.contains("number_scale") && err.contains("col n"), "{err}");
+        let wide = Field::new("w", DataType::Decimal256(50, 0), true);
+        let arr = build_values(&[Some(&"7".repeat(50))], &wide, "w").unwrap();
+        let d = arr.as_any().downcast_ref::<arrow_array::Decimal256Array>().unwrap();
+        assert_eq!(d.value_as_string(0), "7".repeat(50));
     }
 
     // ── parse_timestamp_millis / parse_bytea_hex (unchanged) ─────────────────

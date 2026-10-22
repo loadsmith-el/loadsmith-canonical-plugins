@@ -43,6 +43,7 @@ rejected with the valid values (`read_only` → "did you mean `read-only`?").
 | `transaction_isolation` | `read-committed` / `repeatable-read` / `serializable` | server default (`BEGIN`; normally `read-committed`) | Isolation for the cursor transaction. `repeatable-read` gives a consistent snapshot across all `FETCH`es. |
 | `incremental` | object | — | Activates incremental reads (below). Requires a pipeline `state:` block. |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `timestamp`/`timestamptz` columns (and arrays of them). The default is the same in every canonical plugin and truncates below the millisecond; **`us` keeps Postgres' full precision**. `ns` is the µs value × 1000 and only covers the years 1677–2262 (a value outside fails the batch). |
+| `number_scale` | integer 0–38 | `10` | Scale of a `NUMERIC` **without a declared precision** (a bare `numeric` column, `sum(x)`, …), emitted as `Decimal128(38, number_scale)`; see the type table. |
 
 The query runs through a server-side cursor (`DECLARE … CURSOR FOR`) in a
 transaction, streamed in `batch_size` chunks, so large results never buffer
@@ -81,8 +82,10 @@ State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.h
 | `TIMESTAMPTZ` | `Timestamp(unit, "UTC")` | The session zone's offset (incl. local-mean-time `+HH:MM:SS`) is parsed and the value normalized to UTC, so the session `TimeZone` doesn't change the instant. |
 | `BYTEA` | `Binary` | |
 | `anytype[]` (arrays) | `List(inner)` | Inner type follows the same mapping; `NULL` elements preserved, a quoted `"NULL"` element is the string. One-dimensional values only (explicit bounds like `[0:2]={…}` are fine): a multi-dimensional value fails with a hint — select `array_to_json(col)` to keep its shape as JSON, or `col::text`. |
+| `NUMERIC(p,s)` | `Decimal128(p, s)` | Exact; `Decimal256(p, s)` past 38 digits. A negative scale (Postgres 15+) is a whole-number decimal. |
+| `NUMERIC` (no precision) | `Decimal128(38, number_scale)` | Default scale 10. A value with more decimal places or more than 38 digits, or `NaN`/`Infinity`, fails the run naming the column — nothing is rounded. Declare the type in the query instead (`col::numeric(20,4)`), or keep it as text (`col::text`) / floating point (`col::float8`). |
 | `hstore` | `Utf8` (JSON) | `"k"=>"v"` → `{"k":"v"}`; null values become JSON `null`. |
-| Everything else (`NUMERIC`, `TEXT`, `UUID`, `TIME`, …) | `Utf8` | Text as returned by the Postgres text protocol — exact, so `NUMERIC` keeps every digit. |
+| Everything else (`TEXT`, `UUID`, `TIME`, `INTERVAL`, `JSON`, …) | `Utf8` | Text as returned by the Postgres text protocol. |
 
 Rows are read over the text protocol, so the source pins the two output
 settings its decoder depends on — `DateStyle = 'ISO'` (output style only; your
@@ -231,6 +234,12 @@ destination:
     merge_key: [id]          # required for merge
     update_columns: [status, updated_at]   # optional; default: every non-key column
 ```
+
+### Migrating from 0.3
+
+| 0.3 | 0.4 |
+|---|---|
+| `NUMERIC` → `Utf8` text | an exact `Decimal128(p, s)` (`Decimal256` past 38 digits); an unconstrained `NUMERIC` is `Decimal128(38, number_scale)` and fails on a value that doesn't fit (or `NaN`/`Infinity`) — cast it in the query (`::numeric(p,s)`, `::text`, `::float8`). Parquet columns become `DECIMAL`. An incremental pipeline's next run sees the new schema: its `state:` refuses it (`on_schema_change: refuse`, the default) until the state is reset (`loadsmith state rm`) or the run uses `on_schema_change: continue`. |
 
 ### Migrating from 0.2
 

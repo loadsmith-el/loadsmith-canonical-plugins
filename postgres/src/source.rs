@@ -57,6 +57,16 @@ struct PostgresConfig {
     /// precision, `ns` is µs × 1000 within 1677–2262).
     #[serde(default)]
     timestamp_unit: TimestampUnit,
+
+    /// Scale of a `numeric` without a declared precision, emitted as
+    /// `Decimal128(38, number_scale)` (default 10). A value with more decimal
+    /// places, more digits, or `NaN`/`Infinity` fails the run.
+    #[serde(default = "default_number_scale")]
+    number_scale: u8,
+}
+
+fn default_number_scale() -> u8 {
+    crate::types::DEFAULT_NUMBER_SCALE as u8
 }
 
 fn default_batch_size() -> usize {
@@ -210,6 +220,9 @@ impl SourcePlugin for PostgresSourcePlugin {
         // operator's policy: an error by default, a warning with
         // `--ignore-unknown-keys`.
         let cfg: PostgresConfig = config.parse()?;
+        if cfg.number_scale > 38 {
+            anyhow::bail!("number_scale must be at most 38 (got {})", cfg.number_scale);
+        }
 
         // ── Connect (shared TLS/connection layer) ──────────────────────────
         let client = crate::conn::connect(&cfg.conn).await?;
@@ -231,7 +244,7 @@ impl SourcePlugin for PostgresSourcePlugin {
             client.prepare(&cfg.query).await.context("failed to prepare query")
         })
         .await?;
-        let schema = Arc::new(crate::types::columns_to_schema(stmt.columns(), cfg.timestamp_unit.arrow()));
+        let schema = Arc::new(crate::types::columns_to_schema(stmt.columns(), cfg.timestamp_unit.arrow(), cfg.number_scale as i8));
 
         // The transaction + cursor are opened lazily on the first batch, after
         // `resume_from` has supplied the watermark (see `ensure_cursor`).

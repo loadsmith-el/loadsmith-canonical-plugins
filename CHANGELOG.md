@@ -4,6 +4,40 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-22 — S3 delivery and typed numbers
+
+Every plugin moves to the SDK at engine commit `27e692d` (`configure.run`:
+the run's id, pipeline and start time reach every plugin).
+
+### s3 0.1.0 (new)
+
+- A sink that delivers staged files (e.g. Parquet) to AWS S3 or any
+  S3-compatible store: SigV4 in pure Rust, TLS via rustls, nothing to install
+  on the host. One `PUT` per file up to `part_size_mib`, multipart above it
+  (aborted on failure); retries on network errors, `429` and `5xx`. Keys are
+  `prefix` + a template naming the run (`{run_date}/{run_id}/{file}` by
+  default), so incremental runs add objects side by side. Static credentials
+  in the config or the `AWS_*` variables. See [S3](docs/src/config/s3.md).
+
+### oracle 0.5.0 — breaking
+
+- `NUMBER` is an exact Arrow number instead of text: `Int32`/`Int64` for
+  `NUMBER(p)` up to 18 digits, `Decimal128(p, s)` for `NUMBER(p,s)` (and
+  `NUMBER(p)` past 18 digits), `Float64` for `FLOAT(b)`, and
+  `Decimal128(38, number_scale)` for a `NUMBER` without a declared precision
+  (new option `number_scale`, default 10; a value that doesn't fit fails the
+  run). Parquet columns become `INT32`/`INT64`/`DECIMAL`. An incremental
+  pipeline's saved schema no longer matches: reset its state or run once with
+  `on_schema_change: continue`.
+
+### postgres 0.4.0 — breaking
+
+- `NUMERIC(p,s)` is an exact `Decimal128(p, s)` (`Decimal256` past 38 digits)
+  instead of text; an unconstrained `NUMERIC` is `Decimal128(38,
+  number_scale)` (new option, default 10) and fails on a value that doesn't
+  fit or on `NaN`/`Infinity` — cast it in the query to keep it as text. Same
+  state note as oracle.
+
 ## 2026-10-21 — SDK for engine 1.0
 
 Every plugin moves to the Loadsmith SDK at engine commit `757edf6`, which
