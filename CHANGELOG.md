@@ -4,6 +4,24 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-22 — sinks on slow links
+
+The sinks move to the SDK at engine commit `08291ff`.
+
+### s3 0.1.1
+
+- An upload that takes longer than the core's 5 s liveness ping no longer
+  looks like a hang. The sink used to stop answering `ping` while it
+  uploaded, so the core respawned it and re-sent the object: two extra
+  attempts per run for 64 MiB objects at 100 Mbit/s, and a failed run
+  ("sink failed after 5 restarts") at 20 Mbit/s. Now the same 1M-row load
+  completes at 20 Mbit/s in one attempt per object.
+
+### local-copy 0.2.1
+
+- The same fix for a copy slower than the ping interval (a slow network
+  mount).
+
 ## 2026-10-22 — bounded memory for large tables
 
 ### oracle 0.5.1
