@@ -57,8 +57,10 @@ fn default_batch_size() -> usize {
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
-/// Oracle source. Rows are fetched once (the driver streams the full result set) and
-/// then handed out in `batch_size` chunks.
+/// Oracle source. The query's cursor stays open across batches, owned by a
+/// fetch thread that reads `batch_size` rows per driver round trip, one batch
+/// ahead of the pump (a bounded channel): memory holds a few batches whatever
+/// the result set's size, and the database fetch overlaps the write.
 pub struct OracleSourcePlugin {
     conn: Option<Connection>,
     schema: Option<Arc<Schema>>,
@@ -76,9 +78,13 @@ pub struct OracleSourcePlugin {
     resume_value: Option<String>,
     last_cursor_value: Option<String>,
 
-    rows: Vec<Vec<Cell>>,
-    pos: usize,
-    loaded: bool,
+    /// Rows from the fetch thread (which owns the open cursor), from the first
+    /// batch until end of data. Dropping it stops the thread.
+    fetched: Option<std::sync::mpsc::Receiver<Result<Vec<Vec<Cell>>>>>,
+    /// The `SELECT` span: open while the cursor is, so it covers the fetch.
+    select_span: tracing::Span,
+    returned_rows: u64,
+    exhausted: bool,
     /// `db.namespace` of the telemetry spans.
     namespace: String,
 }
@@ -103,9 +109,10 @@ impl OracleSourcePlugin {
             initial_value: None,
             resume_value: None,
             last_cursor_value: None,
-            rows: Vec::new(),
-            pos: 0,
-            loaded: false,
+            fetched: None,
+            select_span: tracing::Span::none(),
+            returned_rows: 0,
+            exhausted: false,
             namespace: String::new(),
         }
     }
@@ -146,40 +153,80 @@ impl OracleSourcePlugin {
         }
     }
 
-    /// Runs the query and buffers all rows, deferred until the first batch so the
-    /// resume watermark (delivered after `configure`) is folded in. Synchronous
-    /// driver work, run on a blocking thread.
-    fn load_rows(&self) -> Result<Vec<Vec<Cell>>> {
+    /// Executes the query, deferred until the first batch so the resume
+    /// watermark (delivered after `configure`) is folded in. The driver fetches
+    /// `batch_size` rows per round trip. Synchronous driver work, run on a
+    /// blocking thread.
+    fn open_cursor(&mut self) -> Result<()> {
         let query = self.build_query();
         let conn = self.conn.as_ref().context("not configured")?;
-        let schema = self.schema.as_ref().context("not configured")?;
-        // One span for the query: execution and the fetch of every row.
+        let fetch = u32::try_from(self.batch_size).unwrap_or(u32::MAX);
+        // One span for the query: execution now, the fetch of every row until
+        // the cursor is exhausted (the span stays open meanwhile).
         let text = loadsmith_plugin_sdk::telemetry::enabled().then(|| self.build_query_with(true));
         let select = DbOp::new("SELECT", &self.namespace, None, text.as_deref());
-        let span = select.span().clone();
-        let out = select.run(|| {
-            let rs = conn.query(&query, &[]).map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
-            let ncols = schema.fields().len();
-            let mut out = Vec::new();
-            for row in rs {
-                let row = row.map_err(|e| anyhow::anyhow!("row fetch failed: {e}"))?;
-                let cells = (0..ncols).map(|i| types::read_cell(&row, i)).collect::<Result<Vec<_>>>()?;
-                out.push(cells);
-            }
-            Ok(out)
+        self.select_span = select.span().clone();
+        let cursor = tokio::task::block_in_place(|| {
+            select.run(|| {
+                conn.statement(&query)
+                    .and_then(|b| b.fetch_array_size(fetch).prefetch_rows(fetch).build())
+                    .and_then(|stmt| stmt.query(&[]))
+                    .map_err(|e| anyhow::anyhow!("query failed: {e}"))
+            })
         })?;
-        span.record("db.response.returned_rows", out.len() as u64);
-        Ok(out)
+        let ncols = self.schema.as_ref().context("not configured")?.fields().len();
+        let batch_size = self.batch_size;
+        // One batch queued while the pump writes the previous one.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("oracle-fetch".into())
+            .spawn(move || fetch_loop(cursor, ncols, batch_size, tx))
+            .context("spawn the fetch thread")?;
+        self.fetched = Some(rx);
+        Ok(())
     }
 
-    fn ensure_loaded(&mut self) -> Result<()> {
-        if self.loaded {
-            return Ok(());
+    /// The next up-to-`batch_size` rows (empty at the end of data).
+    fn next_rows(&mut self) -> Result<Vec<Vec<Cell>>> {
+        let rx = self.fetched.as_ref().context("no open cursor")?;
+        match tokio::task::block_in_place(|| rx.recv()) {
+            Ok(rows) => rows,
+            Err(_) => anyhow::bail!("the fetch thread stopped without a result"),
         }
-        let rows = tokio::task::block_in_place(|| self.load_rows())?;
-        self.rows = rows;
-        self.loaded = true;
-        Ok(())
+    }
+}
+
+/// Reads the cursor `batch_size` rows at a time until the end of data (sent as
+/// an empty batch) or an error; stops early when the receiver is gone.
+fn fetch_loop(
+    mut cursor: oracledb::Cursor,
+    ncols: usize,
+    batch_size: usize,
+    tx: std::sync::mpsc::SyncSender<Result<Vec<Vec<Cell>>>>,
+) {
+    loop {
+        let mut chunk = Vec::with_capacity(batch_size);
+        let mut failed = None;
+        for row in cursor.by_ref().take(batch_size) {
+            match row
+                .map_err(|e| anyhow::anyhow!("row fetch failed: {e}"))
+                .and_then(|row| (0..ncols).map(|i| types::read_cell(&row, i)).collect::<Result<Vec<_>>>())
+            {
+                Ok(cells) => chunk.push(cells),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        let last = failed.is_some() || chunk.is_empty();
+        let sent = match failed {
+            Some(e) => tx.send(Err(e)),
+            None => tx.send(Ok(chunk)),
+        };
+        if last || sent.is_err() {
+            return;
+        }
     }
 }
 
@@ -266,14 +313,23 @@ impl SourcePlugin for OracleSourcePlugin {
     }
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        self.ensure_loaded()?;
-
-        if self.pos >= self.rows.len() {
+        if self.exhausted {
             return Ok(None);
         }
-        let end = (self.pos + self.batch_size).min(self.rows.len());
+        if self.fetched.is_none() {
+            self.open_cursor()?;
+        }
+        let rows = self.next_rows()?;
+        if rows.is_empty() {
+            self.exhausted = true;
+            self.fetched = None;
+            self.select_span.record("db.response.returned_rows", self.returned_rows);
+            self.select_span = tracing::Span::none();
+            return Ok(None);
+        }
+        self.returned_rows += rows.len() as u64;
         let schema = self.schema.as_ref().context("oracle source: not configured")?.clone();
-        let slice = &self.rows[self.pos..end];
+        let slice = &rows[..];
 
         // High watermark: rows are ordered by the cursor ascending, so the last
         // row of this chunk carries the largest cursor value seen so far.
@@ -286,12 +342,13 @@ impl SourcePlugin for OracleSourcePlugin {
         }
 
         let batch = types::rows_to_batch(slice, &schema).context("RecordBatch build failed")?;
-        self.pos = end;
         Ok(Some(batch))
     }
 
     async fn cancel(&mut self) {
-        // Dropping the connection closes it; nothing async to await.
+        // Dropping the receiver stops the fetch thread (which then drops the
+        // cursor), and dropping the connection closes it.
+        self.fetched = None;
         self.conn = None;
     }
 }

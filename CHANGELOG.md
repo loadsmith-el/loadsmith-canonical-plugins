@@ -4,6 +4,22 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-22 — bounded memory for large tables
+
+### oracle 0.5.1
+
+- The source streams: the query's cursor stays open and a fetch thread reads
+  `batch_size` rows per round trip (`fetch_array_size`), one batch ahead of
+  the pump. Memory holds a few batches whatever the table's size — a
+  1M-row table drops from ~3 GiB to ~380 MiB peak at the same speed. Before,
+  the whole result set was buffered before the first batch.
+
+### parquet 0.2.1
+
+- `row_group_size` defaults to 131,072 rows (was the `parquet` crate's
+  1,048,576). A row group is buffered until written, so this bounds the
+  writer's memory: a 1M-row load drops from ~480 MiB to ~215 MiB peak.
+
 ## 2026-10-22 — S3 delivery and typed numbers
 
 Every plugin moves to the SDK at engine commit `27e692d` (`configure.run`:

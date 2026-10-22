@@ -71,9 +71,15 @@ struct ParquetConfig {
     compression_level: Option<u32>,
     /// Size with a unit ("500KiB", "10MB", "2GiB"). Absent ⇒ single file.
     max_file_size: Option<String>,
-    /// Rows per row group; the `parquet` crate's default (1Mi) when absent.
+    /// Rows per row group (default [`DEFAULT_ROW_GROUP_SIZE`]).
     row_group_size: Option<usize>,
 }
+
+/// Rows per row group unless `row_group_size` says otherwise. A row group is
+/// buffered in memory until written, so this bounds the writer's memory; 128Ki
+/// rows is the range DuckDB and Spark use (the `parquet` crate's own default,
+/// 1Mi rows, held a million-row table in memory).
+const DEFAULT_ROW_GROUP_SIZE: usize = 128 * 1024;
 
 /// Parses a size string with a unit into bytes ("500KiB", "10MB", "2GiB",
 /// "65536B"). A bare number is rejected: it used to mean KiB, and a unit makes
@@ -348,12 +354,11 @@ impl DestinationPlugin for ParquetPlugin {
             None => None,
         };
         let mut props = WriterProperties::builder().set_compression(cfg.compression.to_parquet(cfg.compression_level)?);
-        if let Some(rows) = cfg.row_group_size {
-            if rows == 0 {
-                bail!("row_group_size must be at least 1");
-            }
-            props = props.set_max_row_group_size(rows);
+        let rows = cfg.row_group_size.unwrap_or(DEFAULT_ROW_GROUP_SIZE);
+        if rows == 0 {
+            bail!("row_group_size must be at least 1");
         }
+        props = props.set_max_row_group_size(rows);
         self.settings = Some(Settings {
             dir: cfg.path,
             prefix: cfg.prefix,
