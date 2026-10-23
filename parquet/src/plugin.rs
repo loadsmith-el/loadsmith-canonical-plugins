@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{telemetry, DestinationPlugin};
+use loadsmith_plugin_sdk::{telemetry, BatchRange, DestinationPlugin, ReadyObject};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
@@ -202,6 +202,8 @@ struct OpenFile {
     /// The file's `write <file>` span, open until the file is closed.
     span: Span,
     rows: u64,
+    /// The ordinal of the first batch written to this file.
+    first_batch: u64,
 }
 
 /// The span of one file written: from its creation to its rename into place
@@ -230,16 +232,26 @@ pub struct ParquetPlugin {
     /// Every file created during the run (temp or final), so `cancel()` can
     /// remove all of them.
     created: Vec<PathBuf>,
-    /// Files finalized (footer written, renamed) since the last
-    /// `take_ready_objects`, announced to the core as `ObjectReady` so a sink
-    /// can deliver them.
-    ready: Vec<PathBuf>,
+    /// Files finalized (footer written, renamed) since the last `take_ready`,
+    /// with the batches each holds, announced to the core as `ObjectReady` so
+    /// a sink can deliver them.
+    ready: Vec<ReadyObject>,
     rows_written: u64,
+    /// Batches received so far: the ordinal of the last one (1-based).
+    batches: u64,
 }
 
 impl ParquetPlugin {
     pub fn new() -> Self {
-        Self { settings: None, current: None, seq: 0, created: Vec::new(), ready: Vec::new(), rows_written: 0 }
+        Self {
+            settings: None,
+            current: None,
+            seq: 0,
+            created: Vec::new(),
+            ready: Vec::new(),
+            rows_written: 0,
+            batches: 0,
+        }
     }
 
     fn settings(&self) -> Result<&Settings> {
@@ -266,7 +278,7 @@ impl ParquetPlugin {
         let writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
             .with_context(|| format!("cannot open parquet writer for {}", temp.display()))?;
         let span = file_span(&name, &path);
-        self.current = Some(OpenFile { writer, temp, path, span, rows: 0 });
+        self.current = Some(OpenFile { writer, temp, path, span, rows: 0, first_batch: self.batches });
         Ok(())
     }
 
@@ -275,6 +287,7 @@ impl ParquetPlugin {
     fn close_current(&mut self) -> Result<()> {
         if let Some(f) = self.current.take() {
             let span = f.span.clone();
+            let batches = BatchRange { first: f.first_batch, last: self.batches };
             let result = span.in_scope(|| -> Result<PathBuf> {
                 f.writer.close().context("parquet close error")?;
                 rename(&f.temp, &f.path)?;
@@ -289,7 +302,7 @@ impl ParquetPlugin {
             match result {
                 Ok(path) => {
                     self.created.push(path.clone());
-                    self.ready.push(path);
+                    self.ready.push(ReadyObject { path, batches: Some(batches) });
                 }
                 Err(e) => {
                     span.record("error", format!("{e:#}"));
@@ -322,7 +335,7 @@ impl DestinationPlugin for ParquetPlugin {
 
     fn capabilities(&self) -> Vec<String> {
         // `object_output` tells the core this destination stages files a sink
-        // can deliver — it announces each via `take_ready_objects`/`ObjectReady`.
+        // can deliver — it announces each via `take_ready`/`ObjectReady`.
         vec!["batch_write".into(), "object_output".into()]
     }
 
@@ -386,6 +399,7 @@ impl DestinationPlugin for ParquetPlugin {
     }
 
     async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        self.batches += 1;
         if self.current.is_none() {
             self.open_writer(&batch)?;
         }
@@ -407,7 +421,7 @@ impl DestinationPlugin for ParquetPlugin {
         Ok(())
     }
 
-    fn take_ready_objects(&mut self) -> Vec<PathBuf> {
+    fn take_ready(&mut self) -> Vec<ReadyObject> {
         std::mem::take(&mut self.ready)
     }
 
@@ -531,6 +545,35 @@ mod tests {
         run(&dir, json!({}), 1).await;
         assert_eq!(listing(&dir), ["ev.snappy.parquet", "unrelated.parquet"]);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// Every chunk announces its batches; together they cover 1..=n in order.
+    #[tokio::test]
+    async fn chunks_announce_contiguous_batch_ranges() {
+        let dir = scratch("ranges");
+        let cfg = json!({ "path": dir, "prefix": "ev", "max_file_size": "64KiB", "compression": "uncompressed",
+                          "row_group_size": 5000 });
+        let mut p = ParquetPlugin::new();
+        p.configure(loadsmith_plugin_sdk::PluginConfig::new(cfg, loadsmith_plugin_sdk::UnknownKeys::Error)).await.unwrap();
+        p.prepare().await.unwrap();
+        let mut ready = Vec::new();
+        for b in 0..9 {
+            let ids: ArrayRef = Arc::new(Int64Array::from_iter_values((0..20_000).map(|i| i * 7919 + b as i64)));
+            p.write_batch(RecordBatch::try_from_iter([("id", ids)]).unwrap()).await.unwrap();
+            ready.extend(p.take_ready());
+        }
+        p.finalize().await.unwrap();
+        ready.extend(p.take_ready());
+        assert!(ready.len() > 2, "{ready:?}");
+        let mut next = 1;
+        for o in &ready {
+            let r = o.batches.expect("every chunk has a range");
+            assert_eq!(r.first, next, "{ready:?}");
+            assert!(r.last >= r.first);
+            next = r.last + 1;
+        }
+        assert_eq!(next, 10, "the ranges cover all 9 batches");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

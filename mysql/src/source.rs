@@ -3,7 +3,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use loadsmith_plugin_sdk::SourcePlugin;
+use loadsmith_plugin_sdk::{SourcePlugin, TieSafeCursor};
 use mysql_async::prelude::{Query, Queryable};
 use mysql_async::{Conn, ResultSetStream, Row, TextProtocol};
 use serde::Deserialize;
@@ -74,7 +74,9 @@ pub struct MysqlSourcePlugin {
     cursor_idx: Option<usize>,
     initial_value: Option<String>,
     resume_value: Option<String>,
-    last_cursor_value: Option<String>,
+    /// The incremental cursor's values seen so far: the watermark reported is
+    /// tie-safe (a value no later row repeats; the last one at the end).
+    cursor: TieSafeCursor<String>,
     /// `db.namespace` of the telemetry spans (the database name).
     namespace: String,
 }
@@ -98,7 +100,7 @@ impl MysqlSourcePlugin {
             cursor_idx: None,
             initial_value: None,
             resume_value: None,
-            last_cursor_value: None,
+            cursor: TieSafeCursor::new(),
             namespace: String::new(),
         }
     }
@@ -170,7 +172,7 @@ impl SourcePlugin for MysqlSourcePlugin {
     }
 
     fn current_watermark(&self) -> Option<serde_json::Value> {
-        self.last_cursor_value.clone().map(serde_json::Value::String)
+        self.cursor.watermark().cloned().map(serde_json::Value::String)
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
@@ -214,6 +216,7 @@ impl SourcePlugin for MysqlSourcePlugin {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.ensure_stream().await?;
         let Some(stream) = self.stream.as_mut() else {
+            self.cursor.end();
             return Ok(None);
         };
 
@@ -231,15 +234,14 @@ impl SourcePlugin for MysqlSourcePlugin {
             }
         }
         if rows.is_empty() {
+            self.cursor.end();
             return Ok(None);
         }
 
-        // High watermark: rows are ordered by the cursor ascending, so the last
-        // row of this chunk carries the largest cursor value seen so far.
+        // Track the watermark: rows are ordered by the cursor ascending, so the
+        // chunk's values are read back from its last row.
         if let Some(idx) = self.cursor_idx {
-            if let Some(v) = rows.last().and_then(|last| last.as_ref(idx)).and_then(crate::types::value_text) {
-                self.last_cursor_value = Some(v);
-            }
+            self.cursor.batch(rows.iter().rev().filter_map(|r| r.as_ref(idx)).filter_map(crate::types::value_text));
         }
 
         let schema = self.schema.as_ref().context("mysql source: not configured")?.clone();

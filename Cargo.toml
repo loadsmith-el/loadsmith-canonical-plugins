@@ -35,11 +35,11 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Pinned Loadsmith SDK (one rev for all four; see the note at the top).
-loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "1ca7af3bbcb864e81948eba090acb6f195047110" }
-loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "1ca7af3bbcb864e81948eba090acb6f195047110" }
-loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "1ca7af3bbcb864e81948eba090acb6f195047110" }
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "aae0adf6975f2bf95b43573acd845623dadeaab8" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "aae0adf6975f2bf95b43573acd845623dadeaab8" }
+loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "aae0adf6975f2bf95b43573acd845623dadeaab8" }
 # The wire vocabulary (declared `columns:` of the tabular parsers).
-loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "1ca7af3bbcb864e81948eba090acb6f195047110" }
+loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "aae0adf6975f2bf95b43573acd845623dadeaab8" }
 
 # Common deps (versions mirror the loadsmith workspace).
 tokio          = { version = "1", features = ["full"] }

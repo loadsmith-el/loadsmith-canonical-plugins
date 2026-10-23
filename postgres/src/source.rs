@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{FlowGate, SourcePlugin};
+use loadsmith_plugin_sdk::{FlowGate, SourcePlugin, TieSafeCursor};
 use crate::conn::ConnectionConfig;
 use crate::telemetry::{op, DbOp};
 use crate::vocab::{config_enum, TimestampUnit};
@@ -105,8 +105,9 @@ pub struct PostgresSourcePlugin {
     initial_value: Option<String>,
     /// Watermark handed back by the core from the previous run.
     resume_value: Option<String>,
-    /// High watermark observed in this run (cursor value of the last row seen).
-    last_cursor_value: Option<String>,
+    /// The incremental cursor's values seen so far: the watermark reported is
+    /// tie-safe (a value no later row repeats; the last one at the end).
+    cursor: TieSafeCursor<String>,
     /// Cursor is declared lazily on the first batch, once the resume value is in.
     cursor_declared: bool,
     /// `db.namespace` of the telemetry spans (the database name).
@@ -134,7 +135,7 @@ impl PostgresSourcePlugin {
             cursor_column: None,
             initial_value: None,
             resume_value: None,
-            last_cursor_value: None,
+            cursor: TieSafeCursor::new(),
             cursor_declared: false,
             namespace: String::new(),
         }
@@ -287,7 +288,7 @@ impl SourcePlugin for PostgresSourcePlugin {
     }
 
     fn current_watermark(&self) -> Option<serde_json::Value> {
-        self.last_cursor_value.clone().map(serde_json::Value::String)
+        self.cursor.watermark().cloned().map(serde_json::Value::String)
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
@@ -371,18 +372,15 @@ impl SourcePlugin for PostgresSourcePlugin {
         if rows.is_empty() {
             // The fetch task closed the cursor and committed.
             self.exhausted = true;
+            self.cursor.end();
             return Ok(None);
         }
 
-        // Track the high watermark: rows are ordered by the cursor ascending, so
-        // the last row of this batch carries the largest cursor value seen.
+        // Track the watermark: rows are ordered by the cursor ascending, so the
+        // batch's values are read back from its last row.
         if let Some(col) = &self.cursor_column {
-            if let Some(last) = rows.last() {
-                if let Some(i) = last.columns().iter().position(|c| c.name() == col) {
-                    if let Some(v) = last.get(i) {
-                        self.last_cursor_value = Some(v.to_string());
-                    }
-                }
+            if let Some(i) = rows.first().and_then(|r| r.columns().iter().position(|c| c.name() == col)) {
+                self.cursor.batch(rows.iter().rev().filter_map(|r| r.get(i)).map(str::to_string));
             }
         }
 

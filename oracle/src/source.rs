@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{FlowGate, SourcePlugin};
+use loadsmith_plugin_sdk::{FlowGate, SourcePlugin, TieSafeCursor};
 use oracledb::{Connection, DbType, Row};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -79,7 +79,9 @@ pub struct OracleSourcePlugin {
     cursor_type: Option<&'static DbType>,
     initial_value: Option<String>,
     resume_value: Option<String>,
-    last_cursor_value: Option<String>,
+    /// The incremental cursor's values seen so far: the watermark reported is
+    /// tie-safe (a value no later row repeats; the last one at the end).
+    cursor: TieSafeCursor<String>,
 
     /// Rows from the fetch thread (which owns the open cursor), from the first
     /// batch until end of data. Dropping it stops the thread.
@@ -113,7 +115,7 @@ impl OracleSourcePlugin {
             cursor_type: None,
             initial_value: None,
             resume_value: None,
-            last_cursor_value: None,
+            cursor: TieSafeCursor::new(),
             fetched: None,
             gate: FlowGate::open(),
             select_span: tracing::Span::none(),
@@ -264,7 +266,7 @@ impl SourcePlugin for OracleSourcePlugin {
     }
 
     fn current_watermark(&self) -> Option<serde_json::Value> {
-        self.last_cursor_value.clone().map(serde_json::Value::String)
+        self.cursor.watermark().cloned().map(serde_json::Value::String)
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
@@ -335,6 +337,7 @@ impl SourcePlugin for OracleSourcePlugin {
         let rows = self.next_rows()?;
         if rows.is_empty() {
             self.exhausted = true;
+            self.cursor.end();
             self.fetched = None;
             self.select_span.record("db.response.returned_rows", self.returned_rows);
             self.select_span = tracing::Span::none();
@@ -344,14 +347,14 @@ impl SourcePlugin for OracleSourcePlugin {
         let schema = self.schema.as_ref().context("oracle source: not configured")?.clone();
         let slice = &rows[..];
 
-        // High watermark: rows are ordered by the cursor ascending, so the last
-        // row of this chunk carries the largest cursor value seen so far.
+        // Track the watermark: rows are ordered by the cursor ascending, so the
+        // chunk's values are read back from its last row. (A value that can't
+        // be read fails the batch build below.)
         if let Some(idx) = self.cursor_idx {
-            if let Some(last) = slice.last() {
-                if let Some(v) = types::read_value(last, idx)?.watermark(self.cursor_type) {
-                    self.last_cursor_value = Some(v);
-                }
-            }
+            let t = self.cursor_type;
+            self.cursor.batch(
+                slice.iter().rev().filter_map(|r| types::read_value(r, idx).ok().and_then(|v| v.watermark(t))),
+            );
         }
 
         let batch = types::rows_to_batch(slice, &schema).context("RecordBatch build failed")?;
