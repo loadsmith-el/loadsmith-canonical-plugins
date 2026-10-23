@@ -5,9 +5,12 @@ use arrow_array::{
     builder::{
         BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
         Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder,
     },
-    ArrayRef, ListArray, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    cast::AsArray,
+    types::{TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType},
+    ArrayRef, ListArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -212,8 +215,7 @@ fn build_values(values: &[Option<&str>], field: &Field, col_name: &str) -> Resul
                 match v {
                     None => b.append_null(),
                     Some(v) => b.append_value(
-                        parse_decimal(v, *precision, *scale)
-                            .and_then(|d| d.to_i128().ok_or_else(|| anyhow::anyhow!("is out of range")))
+                        parse_decimal128(v, *precision, *scale)
                             .map_err(|e| decimal_error(col_name, v, *precision, *scale, e))?,
                     ),
                 }
@@ -238,22 +240,19 @@ fn build_values(values: &[Option<&str>], field: &Field, col_name: &str) -> Resul
         DataType::Date32 => parsed!(Date32Builder, parse_date_days),
         DataType::Timestamp(unit, tz) => {
             let with_offset = tz.is_some();
-            let mut out: Vec<Option<i64>> = Vec::with_capacity(values.len());
-            for v in values {
-                out.push(match v {
-                    None => None,
-                    Some(v) => Some(
-                        parse_timestamp(v, with_offset, *unit)
-                            .map_err(|e| anyhow::anyhow!("col {col_name}: '{v}': {e}"))?,
-                    ),
-                });
-            }
+            let parse = |v: &str| parse_timestamp(v, with_offset, *unit);
             let tz = tz.clone();
+            macro_rules! timestamps {
+                ($builder:ty, $type:ty) => {
+                    Arc::new(parsed!($builder, parse).as_primitive::<$type>().clone().with_timezone_opt(tz))
+                        as ArrayRef
+                };
+            }
             match unit {
-                TimeUnit::Second => Arc::new(TimestampSecondArray::from(out).with_timezone_opt(tz)) as ArrayRef,
-                TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(out).with_timezone_opt(tz)),
-                TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(out).with_timezone_opt(tz)),
-                TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(out).with_timezone_opt(tz)),
+                TimeUnit::Second => timestamps!(TimestampSecondBuilder, TimestampSecondType),
+                TimeUnit::Millisecond => timestamps!(TimestampMillisecondBuilder, TimestampMillisecondType),
+                TimeUnit::Microsecond => timestamps!(TimestampMicrosecondBuilder, TimestampMicrosecondType),
+                TimeUnit::Nanosecond => timestamps!(TimestampNanosecondBuilder, TimestampNanosecondType),
             }
         }
         DataType::Binary => {
@@ -295,36 +294,74 @@ fn decimal_error(col_name: &str, v: &str, precision: u8, scale: i8, e: anyhow::E
     )
 }
 
-/// Parses Postgres' exact `numeric` text (`-12.5`, `0.001`, `42`; never an
-/// exponent) into an unscaled decimal value at `scale`. More significant
-/// fractional digits than `scale`, more digits than `precision`, or a
-/// `NaN`/`Infinity` is an error: nothing is rounded or truncated.
+/// Postgres' exact `numeric` text (`-12.5`, `0.001`, `42`; never an
+/// exponent), checked against a column's precision and scale: the parts of
+/// its unscaled value at `scale`, without allocating.
+struct DecimalText<'a> {
+    negative: bool,
+    /// The integer digits, leading zeros removed.
+    int: &'a str,
+    /// The fractional digits, trailing zeros removed (at most `scale`).
+    frac: &'a str,
+    /// The zeros that pad `frac` up to the scale.
+    pad: usize,
+}
+
+impl<'a> DecimalText<'a> {
+    /// More significant fractional digits than `scale`, more digits than
+    /// `precision`, or a `NaN`/`Infinity` is an error: nothing is rounded or
+    /// truncated.
+    fn parse(s: &'a str, precision: u8, scale: i8) -> Result<Self> {
+        let (negative, digits) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+        if int_part.is_empty() && frac_part.is_empty()
+            || !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit())
+        {
+            bail!("is not a finite decimal number");
+        }
+        let scale = scale.max(0) as usize;
+        let frac = frac_part.trim_end_matches('0');
+        if frac.len() > scale {
+            bail!("has {} decimal places, more than the column's scale {scale}", frac.len());
+        }
+        let int = int_part.trim_start_matches('0');
+        // The digits of the unscaled value, as written without leading zeros.
+        let needed = if !int.is_empty() {
+            int.len() + scale
+        } else {
+            match frac.trim_start_matches('0') {
+                "" => 0,
+                significant => scale - (frac.len() - significant.len()),
+            }
+        };
+        if needed > precision as usize {
+            bail!("needs {needed} digits, more than the column's precision {precision}");
+        }
+        Ok(Self { negative, int, frac, pad: scale - frac.len() })
+    }
+
+    fn digits(&self) -> impl Iterator<Item = u8> + '_ {
+        self.int.bytes().chain(self.frac.bytes()).map(|d| d - b'0').chain(std::iter::repeat_n(0, self.pad))
+    }
+}
+
+/// The unscaled value of a `numeric` for a `Decimal128` (precision ≤ 38, so
+/// it never overflows).
+fn parse_decimal128(s: &str, precision: u8, scale: i8) -> Result<i128> {
+    let text = DecimalText::parse(s, precision.min(38), scale)?;
+    let v = text.digits().fold(0i128, |v, d| v * 10 + d as i128);
+    Ok(if text.negative { -v } else { v })
+}
+
+/// The unscaled value of a `numeric` for a `Decimal256`.
 fn parse_decimal(s: &str, precision: u8, scale: i8) -> Result<i256> {
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s),
-    };
-    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
-    if int_part.is_empty() && frac_part.is_empty()
-        || !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit())
-    {
-        bail!("is not a finite decimal number");
-    }
-    let scale = scale.max(0) as usize;
-    let frac = frac_part.trim_end_matches('0');
-    if frac.len() > scale {
-        bail!("has {} decimal places, more than the column's scale {scale}", frac.len());
-    }
-    let unscaled = format!("{int_part}{frac:0<scale$}");
-    let unscaled = unscaled.trim_start_matches('0');
-    if unscaled.len() > precision as usize {
-        bail!("needs {} digits, more than the column's precision {precision}", unscaled.len());
-    }
-    let mut v = i256::ZERO;
-    for d in unscaled.bytes() {
-        v = v.wrapping_mul(i256::from_i128(10)).wrapping_add(i256::from_i128((d - b'0') as i128));
-    }
-    Ok(if negative { v.wrapping_neg() } else { v })
+    let text = DecimalText::parse(s, precision, scale)?;
+    let ten = i256::from_i128(10);
+    let v = text.digits().fold(i256::ZERO, |v, d| v.wrapping_mul(ten).wrapping_add(i256::from_i128(d as i128)));
+    Ok(if text.negative { v.wrapping_neg() } else { v })
 }
 
 fn parse_bool(v: &str) -> Result<bool> {
@@ -560,9 +597,44 @@ fn parse_timestamp(s: &str, with_offset: bool, unit: TimeUnit) -> Result<i64> {
     } else {
         (time, 0)
     };
-    let time = NaiveTime::parse_from_str(time, "%H:%M:%S%.f").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let time = match parse_iso_time(time) {
+        Some(t) => t,
+        // Anything off the fixed layout (a leap second, …) keeps chrono's
+        // reading and its error.
+        None => NaiveTime::parse_from_str(time, "%H:%M:%S%.f").map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
     let utc = NaiveDateTime::new(date, time) - chrono::Duration::seconds(offset_secs);
     crate::vocab::epoch_in(utc, unit).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// The `HH:MM:SS[.f]` layout Postgres prints (DateStyle ISO), up to nine
+/// fractional digits; `None` for anything else.
+fn parse_iso_time(s: &str) -> Option<NaiveTime> {
+    let b = s.as_bytes();
+    if b.len() < 8 || b[2] != b':' || b[5] != b':' {
+        return None;
+    }
+    let two = |i: usize| -> Option<u32> {
+        let (h, l) = (b[i].wrapping_sub(b'0'), b[i + 1].wrapping_sub(b'0'));
+        (h < 10 && l < 10).then(|| (h * 10 + l) as u32)
+    };
+    let (h, m, sec) = (two(0)?, two(3)?, two(6)?);
+    let nano = match &b[8..] {
+        [] => 0,
+        [b'.', frac @ ..] if (1..=9).contains(&frac.len()) => {
+            let mut n = 0u32;
+            for &d in frac {
+                let d = d.wrapping_sub(b'0');
+                if d >= 10 {
+                    return None;
+                }
+                n = n * 10 + d as u32;
+            }
+            n * 10u32.pow(9 - frac.len() as u32)
+        }
+        _ => return None,
+    };
+    NaiveTime::from_hms_nano_opt(h, m, sec, nano)
 }
 
 /// Parses a `+HH[:MM[:SS]]` / `-HH[:MM[:SS]]` UTC offset into seconds.
@@ -751,6 +823,35 @@ mod tests {
         let dt = pg_type_to_arrow(&Type::NUMERIC_ARRAY, typmod(9, 3), TimeUnit::Millisecond, 10);
         let DataType::List(inner) = dt else { panic!("{dt:?}") };
         assert_eq!(inner.data_type(), &DataType::Decimal128(9, 3));
+    }
+
+    #[test]
+    fn decimal128_matches_the_wide_path() {
+        let cases = [
+            "0", "-0", "0.0", "00012.3400", ".5", "5.", "-0.000001", "99999999.99", "-12345678.99",
+            "1", "10", "100.001", "0.1234567890", "12345678901234567890123456.123456789012",
+        ];
+        for s in cases {
+            for (p, sc) in [(38, 10), (38, 12), (10, 2), (20, 0), (12, 3)] {
+                let narrow = parse_decimal128(s, p, sc).map_err(|e| e.to_string());
+                let wide = parse_decimal(s, p, sc).map(|d| d.as_i128()).map_err(|e| e.to_string());
+                assert_eq!(narrow, wide, "{s} as ({p},{sc})");
+            }
+        }
+        let max = "9".repeat(38);
+        assert_eq!(parse_decimal128(&max, 38, 0).unwrap().to_string(), max);
+    }
+
+    #[test]
+    fn hand_parsed_times_match_chrono() {
+        for s in ["00:00:00", "23:59:59", "12:30:45.1", "12:30:45.123456", "01:02:03.000000001", "07:08:09.120"] {
+            assert_eq!(parse_iso_time(s), NaiveTime::parse_from_str(s, "%H:%M:%S%.f").ok(), "{s}");
+        }
+        for s in ["24:00:00", "12:60:00", "1:02:03", "12:30:45.", "12:30:45.1234567890", "12:30:45x", "12:3a:45"] {
+            assert_eq!(parse_iso_time(s), None, "{s}");
+        }
+        // Off the fast path, chrono still decides (a leap second).
+        assert!(parse_timestamp("2016-12-31 23:59:60", false, TimeUnit::Second).is_ok());
     }
 
     #[test]
