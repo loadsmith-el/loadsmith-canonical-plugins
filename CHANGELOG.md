@@ -4,6 +4,19 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-23 — native temporal reads
+
+### oracle 0.5.2
+
+- The source fetches `DATE` and `TIMESTAMP` in Oracle's binary form instead
+  of rendering them as text with `TO_CHAR`: 11 bytes a timestamp on the wire
+  instead of 29. The zoned timestamps are converted with `SYS_EXTRACT_UTC` and
+  fetched the same way. The delivered values are unchanged, and so is the
+  persisted incremental watermark: state saved by 0.5.1 resumes as before.
+- A `TIMESTAMP WITH TIME ZONE` stored with a region name
+  (`America/Sao_Paulo`) reads correctly; the driver can't decode a region
+  itself, so the conversion to UTC happens in the database.
+
 ## 2026-10-22 — sinks on slow links
 
 The sinks move to the SDK at engine commit `08291ff`.

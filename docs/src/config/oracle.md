@@ -26,9 +26,10 @@ driver supports; the lab validates against Oracle Free).
 | `connect_timeout` | duration | `10s` | Connection establishment timeout. Whole seconds only (sub-second values round down, minimum 1s). |
 | `tls` | object | — | The shared [`tls` block](./overview.md#the-tls-block), limited to what the thin driver supports (see [TLS](#tls-tcps) below). |
 
-Every session pins `NLS_NUMERIC_CHARACTERS = '.,'`, and temporal values cross
-the connector through explicit `TO_CHAR`/`TO_*` formats, so data is
-NLS-independent whatever the server or account defaults are. (`NLS_LANG` is
+Every session pins `NLS_NUMERIC_CHARACTERS = '.,'`, the source reads temporal
+values in Oracle's binary form, and the destination writes them through
+explicit `TO_*` formats, so data is NLS-independent whatever the server or
+account defaults are. (`NLS_LANG` is
 ignored, as with every thin driver.)
 
 ## Source
@@ -53,18 +54,20 @@ ignored, as with every thin driver.)
 | `BOOLEAN` (23ai+) | `Boolean` | |
 | `DATE` | `Timestamp(unit, None)` | Oracle `DATE` carries a time of day. |
 | `TIMESTAMP` | `Timestamp(unit, None)` | Digits finer than `unit` are truncated. |
-| `TIMESTAMP WITH TIME ZONE`, `… WITH LOCAL TIME ZONE` | `Timestamp(unit, "UTC")` | Normalized to the UTC instant. The original offset/region is not kept: select `TO_CHAR(col, 'YYYY-MM-DD HH24:MI:SS.FF9 TZR')` to carry it as text. |
+| `TIMESTAMP WITH TIME ZONE`, `… WITH LOCAL TIME ZONE` | `Timestamp(unit, "UTC")` | Normalized to the UTC instant (`SYS_EXTRACT_UTC`; `LOCAL TIME ZONE` through the session time zone). The original offset/region is not kept: select `TO_CHAR(col, 'YYYY-MM-DD HH24:MI:SS.FF9 TZR')` to carry it as text. |
 | `RAW`, `LONG RAW`, `BLOB` | `Binary` | |
 | everything else (`VARCHAR2`, `CHAR`, `CLOB`, `INTERVAL`, `ROWID`, …) | `Utf8` | |
 
-Temporal columns are rendered server-side with `TO_CHAR` and fixed formats, so
-values are NLS-independent. `INTERVAL` and `LONG` go through `TO_CHAR` too.
-CLOBs are read through `TO_CHAR`, so values over 4000 bytes aren't supported
-yet. `BFILE` is not supported (its contents are not fetched). Years BC are not
-supported.
+`DATE` and `TIMESTAMP` columns are fetched in Oracle's binary form (7 and 11
+bytes a value); the zoned timestamps are converted to UTC by the server and
+fetched the same way. `INTERVAL` and `LONG` are rendered server-side with
+`TO_CHAR`. CLOBs are read through `TO_CHAR`, so values over 4000 bytes aren't
+supported yet. `BFILE` is not supported (its contents are not fetched). Years
+BC are not supported.
 
-The source buffers the whole result set in memory before emitting batches;
-`batch_size` only sets the Arrow batch size.
+The source streams: the query's cursor stays open and `batch_size` rows are
+fetched per round trip, one batch ahead of the writer, so memory holds a few
+batches whatever the table's size.
 
 ```yaml
 source:

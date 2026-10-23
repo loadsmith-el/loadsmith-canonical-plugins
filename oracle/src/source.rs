@@ -68,7 +68,8 @@ pub struct OracleSourcePlugin {
 
     /// The user's base query (inner SELECT).
     query: String,
-    /// The projected SELECT list (temporal/CLOB columns wrapped in `TO_CHAR`).
+    /// The projected SELECT list (zoned timestamps in `SYS_EXTRACT_UTC`,
+    /// CLOB/INTERVAL columns in `TO_CHAR`).
     select_list: String,
 
     cursor_column: Option<String>,
@@ -335,8 +336,8 @@ impl SourcePlugin for OracleSourcePlugin {
         // row of this chunk carries the largest cursor value seen so far.
         if let Some(idx) = self.cursor_idx {
             if let Some(last) = slice.last() {
-                if let Some(v) = last.get(idx).and_then(Cell::text) {
-                    self.last_cursor_value = Some(v.to_string());
+                if let Some(v) = last.get(idx).and_then(|c| c.watermark(self.cursor_type)) {
+                    self.last_cursor_value = Some(v);
                 }
             }
         }

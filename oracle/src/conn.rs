@@ -21,11 +21,10 @@
 //! process-wide by [`connect`] via `loadsmith-tls`.
 //!
 //! **Text↔value conversions are kept NLS-independent at the SQL level** (the
-//! source renders temporal/CLOB columns with `TO_CHAR`, the destination wraps
-//! temporal binds in `TO_DATE`/`TO_TIMESTAMP`/`TO_TIMESTAMP_TZ`). Doing the
-//! conversion in SQL keeps the exact canonical text format regardless of session
-//! NLS — and matches the connector's text-preserving contract with the rest of
-//! Loadsmith.
+//! source reads temporals natively and renders CLOB/INTERVAL columns with
+//! `TO_CHAR`; the destination and the incremental watermark wrap temporal text
+//! in `TO_DATE`/`TO_TIMESTAMP`/`TO_TIMESTAMP_TZ`). Doing the conversion in SQL
+//! keeps the exact canonical text format regardless of session NLS.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,17 +34,12 @@ use crate::vocab::TlsMode;
 use oracledb::Connection;
 use serde::Deserialize;
 
-// ── Canonical text formats (shared by source TO_CHAR and destination TO_*) ─────
+// ── Canonical text formats (read by `TO_*`: destination binds, watermarks) ─────
 
 /// `DATE` ⇄ text. Oracle DATE always carries a time component.
 pub const FMT_DATE: &str = "YYYY-MM-DD HH24:MI:SS";
-/// `TIMESTAMP` → text (`TO_CHAR`), nanosecond precision: every digit Oracle
-/// keeps (`TIMESTAMP(9)`).
-pub const FMT_TIMESTAMP_OUT: &str = "YYYY-MM-DD HH24:MI:SS.FF9";
 /// Text → `TIMESTAMP` (`TO_TIMESTAMP`): `FF` reads 0 to 9 fraction digits.
 pub const FMT_TIMESTAMP_IN: &str = "YYYY-MM-DD HH24:MI:SS.FF";
-/// `TIMESTAMP WITH [LOCAL] TIME ZONE` → text, with explicit offset.
-pub const FMT_TIMESTAMP_TZ_OUT: &str = "YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM";
 /// Text → `TIMESTAMP WITH TIME ZONE`.
 pub const FMT_TIMESTAMP_TZ_IN: &str = "YYYY-MM-DD HH24:MI:SS.FF TZH:TZM";
 

@@ -9,10 +9,11 @@
 //! `TIMESTAMP WITH [LOCAL] TIME ZONE` as Arrow timestamps in the source's
 //! `timestamp_unit` (the zoned ones normalized to UTC).
 //!
-//! Temporal/CLOB columns are rendered server-side with `TO_CHAR` against pinned
-//! formats (see [`projected_select`]) so the wire text is exactly the canonical
-//! format regardless of session NLS; the destination wraps temporal binds in the
-//! matching `TO_DATE`/`TO_TIMESTAMP`/`TO_TIMESTAMP_TZ` ([`typed_expr`]).
+//! `DATE` and `TIMESTAMP` are fetched natively (Oracle's 7/11-byte binary form);
+//! the zoned timestamps are normalized server-side with `SYS_EXTRACT_UTC` and
+//! fetched the same way. CLOB/LONG/INTERVAL are rendered with `TO_CHAR` (see
+//! [`projected_select`]). The destination wraps temporal binds in the matching
+//! `TO_DATE`/`TO_TIMESTAMP`/`TO_TIMESTAMP_TZ` ([`typed_expr`]).
 
 use anyhow::{bail, Context, Result};
 use arrow::array::AsArray;
@@ -35,7 +36,7 @@ use chrono::NaiveDateTime;
 use oracledb::{DbType, Row, ToDbValue};
 use std::sync::Arc;
 
-use crate::conn::{FMT_DATE, FMT_TIMESTAMP_IN, FMT_TIMESTAMP_OUT, FMT_TIMESTAMP_TZ_IN, FMT_TIMESTAMP_TZ_OUT};
+use crate::conn::{FMT_DATE, FMT_TIMESTAMP_IN, FMT_TIMESTAMP_TZ_IN};
 use crate::vocab::{epoch_in, from_epoch, time_of_day};
 
 // ── Schema inference (source) ───────────────────────────────────────────────
@@ -116,18 +117,17 @@ fn is_zoned(t: &DbType) -> bool {
     is_one_of(t, &[oracledb::DB_TYPE_TIMESTAMP_TZ, oracledb::DB_TYPE_TIMESTAMP_LTZ])
 }
 
-/// Whether a column must be read through `TO_CHAR`. Returns the `TO_CHAR(...)`
+/// Whether a column must be read through an expression. Returns the
 /// expression to use, or `None` to read the column directly.
-fn to_char_expr(col: &str, t: &DbType) -> Option<String> {
+fn projected_expr(col: &str, t: &DbType) -> Option<String> {
     let quoted = quote_ident(col);
-    if t == oracledb::DB_TYPE_DATE {
-        Some(format!("TO_CHAR({quoted}, '{FMT_DATE}')"))
-    } else if t == oracledb::DB_TYPE_TIMESTAMP {
-        Some(format!("TO_CHAR({quoted}, '{FMT_TIMESTAMP_OUT}')"))
-    } else if is_zoned(t) {
-        // Normalized to UTC; the offset stays in the text so the incremental
-        // watermark compares as the same instant.
-        Some(format!("TO_CHAR({quoted} AT TIME ZONE '+00:00', '{FMT_TIMESTAMP_TZ_OUT}')"))
+    if t == oracledb::DB_TYPE_TIMESTAMP_TZ {
+        // The UTC instant as a plain TIMESTAMP, fetched natively. (The driver
+        // can't decode a zone region, and doesn't apply the offset.)
+        Some(format!("SYS_EXTRACT_UTC({quoted})"))
+    } else if t == oracledb::DB_TYPE_TIMESTAMP_LTZ {
+        // Through the session time zone to an instant; `(9)` keeps every digit.
+        Some(format!("SYS_EXTRACT_UTC(CAST({quoted} AS TIMESTAMP(9) WITH TIME ZONE))"))
     } else if is_one_of(
         t,
         &[
@@ -148,13 +148,14 @@ fn to_char_expr(col: &str, t: &DbType) -> Option<String> {
 }
 
 /// Builds the projected `SELECT` list and the matching Arrow `Schema` from the
-/// described columns. Temporal/CLOB columns are wrapped in `TO_CHAR(...) AS
-/// "name"`; every other column is selected verbatim. All fields are nullable.
+/// described columns. Zoned timestamps and CLOB/LONG/INTERVAL columns are
+/// wrapped (`SYS_EXTRACT_UTC(...)`, `TO_CHAR(...)`) `AS "name"`; every other
+/// column is selected verbatim. All fields are nullable.
 pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit, number_scale: i8) -> (String, Schema) {
     let mut select = Vec::with_capacity(cols.len());
     let mut fields = Vec::with_capacity(cols.len());
     for c in cols {
-        let expr = match to_char_expr(&c.name, c.oracle_type) {
+        let expr = match projected_expr(&c.name, c.oracle_type) {
             Some(e) => format!("{e} AS {}", quote_ident(&c.name)),
             None => quote_ident(&c.name),
         };
@@ -213,12 +214,14 @@ pub fn typed_expr(inner: &str, t: &DbType) -> String {
 // ── Row cells (source) ──────────────────────────────────────────────────────
 
 /// One fetched Oracle value, already reduced to the representation Arrow needs:
-/// text for everything except binary columns, which keep their raw bytes.
+/// text for everything except binary columns, which keep their raw bytes, and
+/// temporal ones, which keep their UTC wall clock.
 #[derive(Debug, Clone)]
 pub enum Cell {
     Null,
     Text(String),
     Bytes(Vec<u8>),
+    Temporal(NaiveDateTime),
 }
 
 impl Cell {
@@ -231,11 +234,25 @@ impl Cell {
             _ => None,
         }
     }
+
+    /// The incremental watermark of a cursor column of type `t`. A temporal
+    /// value is rendered as text in the format `typed_expr` reads back (the
+    /// same text earlier versions persisted, so saved state still resumes).
+    pub fn watermark(&self, t: Option<&DbType>) -> Option<String> {
+        match self {
+            Cell::Temporal(dt) => Some(match t {
+                Some(t) if t == oracledb::DB_TYPE_DATE => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                Some(t) if is_zoned(t) => dt.format("%Y-%m-%d %H:%M:%S%.9f +00:00").to_string(),
+                _ => dt.format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
+            }),
+            other => other.text().map(str::to_string),
+        }
+    }
 }
 
 /// Reads column `i` of a fetched row as a [`Cell`], dispatching on the column's
 /// *fetched* type (the projected query's, so `TO_CHAR`-wrapped columns arrive as
-/// VARCHAR). The thin driver doesn't convert NUMBER/float/bool to
+/// VARCHAR and `SYS_EXTRACT_UTC` ones as TIMESTAMP). The thin driver doesn't convert NUMBER/float/bool to
 /// `String` on request, so those are read natively and rendered here.
 /// `OracleNumber`'s `Display` is the exact decimal text (NLS-independent).
 pub fn read_cell(row: &Row, i: usize) -> Result<Cell> {
@@ -251,6 +268,11 @@ pub fn read_cell(row: &Row, i: usize) -> Result<Cell> {
         text(row.get::<Option<f64>>(i).map_err(err)?.map(|n| n.to_string()))
     } else if t == oracledb::DB_TYPE_BOOLEAN {
         text(row.get::<Option<bool>>(i).map_err(err)?.map(|b| if b { "1" } else { "0" }.to_string()))
+    } else if is_one_of(t, &[oracledb::DB_TYPE_DATE, oracledb::DB_TYPE_TIMESTAMP]) {
+        match row.get::<Option<oracledb::OracleTimestamp>>(i).map_err(err)? {
+            Some(ts) => Cell::Temporal(NaiveDateTime::try_from(ts).map_err(err)?),
+            None => Cell::Null,
+        }
     } else if is_one_of(t, &[oracledb::DB_TYPE_RAW, oracledb::DB_TYPE_LONG_RAW, oracledb::DB_TYPE_BLOB]) {
         // BLOBs are fetched inline as bytes (no `fetch_lobs()` on the statement).
         match row.get::<Option<Vec<u8>>>(i).map_err(err)? {
@@ -308,22 +330,6 @@ fn parse_decimal(s: &str, precision: u8, scale: i8) -> Result<i128> {
     }
     let v = if unscaled.is_empty() { 0 } else { unscaled.parse::<i128>()? };
     Ok(if negative { -v } else { v })
-}
-
-/// Parses a `TO_CHAR` temporal rendering — `YYYY-MM-DD HH24:MI:SS[.fffffffff][
-/// ±HH:MM]` — into an epoch value in `unit` (UTC), floored to the unit.
-fn parse_temporal(s: &str, unit: TimeUnit) -> Result<i64> {
-    let (wall, offset_secs) = match s.rsplit_once(' ') {
-        Some((wall, off)) if off.starts_with(['+', '-']) => {
-            let sign = if off.starts_with('-') { -1 } else { 1 };
-            let (h, m) = off[1..].split_once(':').ok_or_else(|| anyhow::anyhow!("bad UTC offset '{off}'"))?;
-            let secs = h.trim().parse::<i64>()? * 3600 + m.trim().parse::<i64>()? * 60;
-            (wall, sign * secs)
-        }
-        _ => (s, 0),
-    };
-    let dt = NaiveDateTime::parse_from_str(wall.trim(), "%Y-%m-%d %H:%M:%S%.f").map_err(|e| anyhow::anyhow!("{e}"))?;
-    epoch_in(dt - chrono::Duration::seconds(offset_secs), unit).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn build_column(rows: &[Vec<Cell>], idx: usize, field: &Field) -> Result<ArrayRef> {
@@ -409,11 +415,12 @@ fn build_column(rows: &[Vec<Cell>], idx: usize, field: &Field) -> Result<ArrayRe
         DataType::Timestamp(unit, tz) => {
             let mut out: Vec<Option<i64>> = Vec::with_capacity(rows.len());
             for row in rows {
-                out.push(match cell_at(row, idx).text() {
-                    None => None,
-                    Some(v) => Some(
-                        parse_temporal(v, *unit).map_err(|e| anyhow::anyhow!("col {name}: timestamp '{v}': {e}"))?,
-                    ),
+                out.push(match cell_at(row, idx) {
+                    Cell::Temporal(dt) => {
+                        Some(epoch_in(*dt, *unit).map_err(|e| anyhow::anyhow!("col {name}: timestamp {dt}: {e}"))?)
+                    }
+                    Cell::Null => None,
+                    other => bail!("col {name}: expected a timestamp, fetched {other:?}"),
                 });
             }
             let tz = tz.clone();
@@ -431,6 +438,7 @@ fn build_column(rows: &[Vec<Cell>], idx: usize, field: &Field) -> Result<ArrayRe
                     Cell::Null => b.append_null(),
                     Cell::Bytes(bytes) => b.append_value(bytes),
                     Cell::Text(s) => b.append_value(s.as_bytes()),
+                    Cell::Temporal(dt) => bail!("col {name}: unexpected timestamp {dt} in a binary column"),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -646,21 +654,24 @@ mod tests {
     }
 
     #[test]
-    fn projection_wraps_temporal_only() {
+    fn projection_reads_plain_temporals_natively() {
         let cols = vec![
             ColumnDesc { precision: 19, ..ColumnDesc::new("EVENT_ID", oracledb::DB_TYPE_NUMBER) },
             ColumnDesc::new("EVENT_TSTZ", oracledb::DB_TYPE_TIMESTAMP_TZ),
+            ColumnDesc::new("EVENT_LTZ", oracledb::DB_TYPE_TIMESTAMP_LTZ),
             ColumnDesc::new("TS", oracledb::DB_TYPE_TIMESTAMP),
+            ColumnDesc::new("D", oracledb::DB_TYPE_DATE),
         ];
         let (select, schema) = projected_select(&cols, TimeUnit::Nanosecond, DEFAULT_NUMBER_SCALE);
         assert_eq!(
             select,
-            "\"EVENT_ID\", TO_CHAR(\"EVENT_TSTZ\" AT TIME ZONE '+00:00', 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM') \
-             AS \"EVENT_TSTZ\", TO_CHAR(\"TS\", 'YYYY-MM-DD HH24:MI:SS.FF9') AS \"TS\""
+            "\"EVENT_ID\", SYS_EXTRACT_UTC(\"EVENT_TSTZ\") AS \"EVENT_TSTZ\", \
+             SYS_EXTRACT_UTC(CAST(\"EVENT_LTZ\" AS TIMESTAMP(9) WITH TIME ZONE)) AS \"EVENT_LTZ\", \"TS\", \"D\""
         );
-        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(19, 0));
-        assert_eq!(schema.field(2).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, None));
+        assert_eq!(schema.field(2).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())));
+        assert_eq!(schema.field(3).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, None));
     }
 
     #[test]
@@ -719,13 +730,28 @@ mod tests {
     }
 
     #[test]
-    fn temporal_text_parses_in_every_unit() {
-        assert_eq!(parse_temporal("2024-01-15 12:30:45", TimeUnit::Millisecond).unwrap(), 1_705_321_845_000);
-        let s = "2024-01-15 12:30:45.123456789";
-        assert_eq!(parse_temporal(s, TimeUnit::Nanosecond).unwrap(), 1_705_321_845_123_456_789);
-        assert_eq!(parse_temporal(s, TimeUnit::Millisecond).unwrap(), 1_705_321_845_123);
-        assert_eq!(parse_temporal("2024-01-15 18:00:45.000000000 +05:30", TimeUnit::Second).unwrap(), 1_705_321_845);
-        assert_eq!(parse_temporal("2024-01-15 12:30:45.000000000 +00:00", TimeUnit::Second).unwrap(), 1_705_321_845);
+    fn temporals_build_in_every_unit() {
+        let dt = NaiveDateTime::parse_from_str("2024-01-15 12:30:45.123456789", "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        let rows = vec![vec![Cell::Temporal(dt)], vec![Cell::Null]];
+        let col = |unit| {
+            let schema = Schema::new(vec![Field::new("TS", DataType::Timestamp(unit, None), true)]);
+            rows_to_batch(&rows, &schema).unwrap().column(0).clone()
+        };
+        assert_eq!(col(TimeUnit::Nanosecond).as_primitive::<TimestampNanosecondType>().value(0), 1_705_321_845_123_456_789);
+        assert_eq!(col(TimeUnit::Millisecond).as_primitive::<TimestampMillisecondType>().value(0), 1_705_321_845_123);
+        assert_eq!(col(TimeUnit::Second).as_primitive::<TimestampSecondType>().value(0), 1_705_321_845);
+        assert!(col(TimeUnit::Second).is_null(1));
+    }
+
+    #[test]
+    fn temporal_watermark_keeps_the_typed_expr_format() {
+        let dt = NaiveDateTime::parse_from_str("2024-01-15 12:30:45.5", "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        let wm = |t| Cell::Temporal(dt).watermark(Some(t)).unwrap();
+        assert_eq!(wm(oracledb::DB_TYPE_DATE), "2024-01-15 12:30:45");
+        assert_eq!(wm(oracledb::DB_TYPE_TIMESTAMP), "2024-01-15 12:30:45.500000000");
+        assert_eq!(wm(oracledb::DB_TYPE_TIMESTAMP_TZ), "2024-01-15 12:30:45.500000000 +00:00");
+        assert_eq!(Cell::Text("42".into()).watermark(Some(oracledb::DB_TYPE_NUMBER)).as_deref(), Some("42"));
+        assert_eq!(Cell::Null.watermark(None), None);
     }
 
     #[test]
