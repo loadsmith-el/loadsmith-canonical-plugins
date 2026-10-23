@@ -47,7 +47,10 @@ rejected with the valid values (`read_only` → "did you mean `read-only`?").
 
 The query runs through a server-side cursor (`DECLARE … CURSOR FOR`) in a
 transaction, streamed in `batch_size` chunks, so large results never buffer
-fully in memory.
+fully in memory. The next `FETCH` runs while the last chunk is converted to
+Arrow, as far ahead as the engine's flow control allows
+([`pipeline.flow`](https://loadsmith-el.github.io/loadsmith/reference/pipeline-yaml.html#pipelineflow);
+one chunk with an engine older than 1.1).
 
 ### `incremental`
 

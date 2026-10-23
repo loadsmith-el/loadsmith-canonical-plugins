@@ -4,6 +4,29 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-23 — faster sources under the engine's flow control
+
+The plugins move to the SDK at engine commit `1ca7af3`: every source
+advertises `flow_credit` and reads ahead only as far as the engine grants
+(engine 1.1, `pipeline.flow`), and writes its Arrow stream on its own thread.
+With an older engine the sources behave as before. The delivered data is
+byte-identical to the previous versions.
+
+### postgres 0.5.0
+
+- The source fetches the next chunk while it converts the last one, so the
+  database and the conversion overlap instead of taking turns.
+- `numeric` and `timestamp` text is parsed without allocating.
+- 5M rows to the `null` destination: 16.9 s → 7.4 s.
+
+### oracle 0.6.0
+
+- The fetch thread only decodes the wire; values are read in their native
+  form (numbers, floats, booleans, text and bytes without a copy) when the
+  batch is built, instead of becoming a `String` per cell and being parsed
+  back.
+- 5M rows to the `null` destination: 19.2 s → 12.2 s.
+
 ## 2026-10-23 — native temporal reads
 
 ### oracle 0.5.2

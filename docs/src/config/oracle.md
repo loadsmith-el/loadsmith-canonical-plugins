@@ -66,8 +66,11 @@ supported yet. `BFILE` is not supported (its contents are not fetched). Years
 BC are not supported.
 
 The source streams: the query's cursor stays open and `batch_size` rows are
-fetched per round trip, one batch ahead of the writer, so memory holds a few
-batches whatever the table's size.
+fetched per round trip, ahead of the batch being converted as far as the
+engine's flow control allows
+([`pipeline.flow`](https://loadsmith-el.github.io/loadsmith/reference/pipeline-yaml.html#pipelineflow);
+one batch with an engine older than 1.1), so memory holds a few batches
+whatever the table's size.
 
 ```yaml
 source:

@@ -2412,7 +2412,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "loadsmith-arrow"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ae1740c39e34daa81a540abcc3d8ee989dc1700#1ae1740c39e34daa81a540abcc3d8ee989dc1700"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ca7af3bbcb864e81948eba090acb6f195047110#1ca7af3bbcb864e81948eba090acb6f195047110"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-oracle"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2575,7 +2575,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ae1740c39e34daa81a540abcc3d8ee989dc1700#1ae1740c39e34daa81a540abcc3d8ee989dc1700"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ca7af3bbcb864e81948eba090acb6f195047110#1ca7af3bbcb864e81948eba090acb6f195047110"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2593,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-postgres"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2619,7 +2619,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-protocol"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ae1740c39e34daa81a540abcc3d8ee989dc1700#1ae1740c39e34daa81a540abcc3d8ee989dc1700"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ca7af3bbcb864e81948eba090acb6f195047110#1ca7af3bbcb864e81948eba090acb6f195047110"
 dependencies = [
  "serde",
  "serde_json",
@@ -2697,7 +2697,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-tls"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ae1740c39e34daa81a540abcc3d8ee989dc1700#1ae1740c39e34daa81a540abcc3d8ee989dc1700"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ca7af3bbcb864e81948eba090acb6f195047110#1ca7af3bbcb864e81948eba090acb6f195047110"
 dependencies = [
  "anyhow",
  "rustls",
@@ -2709,7 +2709,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-transport"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ae1740c39e34daa81a540abcc3d8ee989dc1700#1ae1740c39e34daa81a540abcc3d8ee989dc1700"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=1ca7af3bbcb864e81948eba090acb6f195047110#1ca7af3bbcb864e81948eba090acb6f195047110"
 dependencies = [
  "loadsmith-arrow",
  "loadsmith-protocol",
