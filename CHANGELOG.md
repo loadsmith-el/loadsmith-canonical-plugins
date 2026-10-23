@@ -4,7 +4,18 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## 2026-10-23 — partitioned Oracle reads
+## 2026-10-23 — partitioned reads
+
+### postgres 0.6.0
+
+- **`parallel: { workers: N }`: a partitioned full load** (PostgreSQL 14+).
+  N connections read disjoint page ranges of the query's table (`ctid`, TID
+  range scans) in one snapshot the source exports and every worker imports,
+  each fetching and converting under the engine's shared flow credit. The
+  ranges are half-open and the last is open, so every row is read exactly
+  once. The query must read one table (`SELECT … FROM t [alias] [WHERE …]`);
+  not with `incremental`. 5M rows to `null`: 7.1 s on one connection, 3.3 s
+  with 8 workers.
 
 ### oracle 0.7.0
 

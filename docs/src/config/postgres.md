@@ -44,6 +44,7 @@ rejected with the valid values (`read_only` → "did you mean `read-only`?").
 | `incremental` | object | — | Activates incremental reads (below). Requires a pipeline `state:` block. |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `timestamp`/`timestamptz` columns (and arrays of them). The default is the same in every canonical plugin and truncates below the millisecond; **`us` keeps Postgres' full precision**. `ns` is the µs value × 1000 and only covers the years 1677–2262 (a value outside fails the batch). |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMERIC` **without a declared precision** (a bare `numeric` column, `sum(x)`, …), emitted as `Decimal128(38, number_scale)`; see the type table. |
+| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint page ranges of the query's table in one snapshot. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
 
 The query runs through a server-side cursor (`DECLARE … CURSOR FOR`) in a
 transaction, streamed in `batch_size` chunks, so large results never buffer
@@ -51,6 +52,43 @@ fully in memory. The next `FETCH` runs while the last chunk is converted to
 Arrow, as far ahead as the engine's flow control allows
 ([`pipeline.flow`](https://loadsmith-el.github.io/loadsmith/reference/pipeline-yaml.html#pipelineflow);
 one chunk with an engine older than 1.1).
+
+### Partitioned reads (`parallel`)
+
+```yaml
+source:
+  type: postgres
+  config:
+    # …connection…
+    query: "SELECT * FROM sales.orders WHERE region = 'BR'"
+    batch_size: 10000
+    parallel:
+      workers: 8
+```
+
+A full load of one large table, read by `workers` connections at once
+(PostgreSQL 14 or later):
+
+- **The query** must read one table: `SELECT <columns> FROM <table> [[AS]
+  <alias>] [WHERE <filter>]`. No joins, no subquery in `FROM`, no CTE,
+  `GROUP BY`, `ORDER BY`, `LIMIT`, `DISTINCT`, set operators or `FOR UPDATE` —
+  anything else fails at startup with the reason.
+- **One snapshot.** The source's own transaction (`REPEATABLE READ READ ONLY`)
+  exports its snapshot (`pg_export_snapshot()`); every worker imports it (`SET
+  TRANSACTION SNAPSHOT`), so all of them see the same data even while the table
+  changes. `transaction_isolation` does not apply.
+- **The split.** The table's pages (`pg_relation_size`) are cut into
+  `8 × workers` ranges of about equal pages, read with `ctid` conditions (a TID
+  range scan: each worker reads only its pages). The ranges are half-open and
+  the last one is open, so every row is read exactly once.
+- **Each worker fetches and converts** its rows, so the conversion runs in
+  parallel too. Batches leave in the order workers finish them, not in table
+  order.
+- **Memory** stays bounded by the engine's flow control: the workers share one
+  credit, so `workers` adds connections, not buffered batches.
+
+Measured on 5M rows (34 columns, the `null` destination, one machine): one
+connection 7.1 s, 4 workers 4.3 s, 8 workers 3.3 s.
 
 ### `incremental`
 

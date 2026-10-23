@@ -4,6 +4,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::{FlowGate, SourcePlugin, TieSafeCursor};
 use crate::conn::ConnectionConfig;
+use crate::parallel::{ParallelConfig, TableQuery};
 use crate::telemetry::{op, DbOp};
 use crate::vocab::{config_enum, TimestampUnit};
 use serde::Deserialize;
@@ -64,7 +65,15 @@ struct PostgresConfig {
     /// places, more digits, or `NaN`/`Infinity` fails the run.
     #[serde(default = "default_number_scale")]
     number_scale: u8,
+
+    /// Partitioned full load: `workers` connections read disjoint page
+    /// ranges of the query's table in one snapshot (see [`crate::parallel`]).
+    #[serde(default)]
+    parallel: Option<ParallelConfig>,
 }
+
+/// The output formats the text decoder parses, pinned on every session.
+const SESSION_PINS: &str = "SET DateStyle = 'ISO'; SET bytea_output = 'hex'";
 
 fn default_number_scale() -> u8 {
     crate::types::DEFAULT_NUMBER_SCALE as u8
@@ -93,6 +102,11 @@ pub struct PostgresSourcePlugin {
     /// The fetch task's rows, one FETCH per message; started on the first batch.
     fetched: Option<mpsc::Receiver<Fetched>>,
     fetcher: Option<tokio::task::JoinHandle<()>>,
+    /// A partitioned load: the table query and the worker count, the
+    /// connection config the workers connect with, and their batches.
+    partitioned: Option<(TableQuery, usize)>,
+    conn_cfg: Option<Arc<ConnectionConfig>>,
+    partition_batches: Option<mpsc::Receiver<Result<RecordBatch>>>,
 
     // ── Incremental state ──────────────────────────────────────────────────
     /// The user query, declared into the cursor lazily (after `resume_from`).
@@ -130,6 +144,9 @@ impl PostgresSourcePlugin {
             gate: FlowGate::open(),
             fetched: None,
             fetcher: None,
+            partitioned: None,
+            conn_cfg: None,
+            partition_batches: None,
             query: String::new(),
             begin_sql: "BEGIN".to_string(),
             cursor_column: None,
@@ -209,6 +226,51 @@ impl PostgresSourcePlugin {
         let task = fetch_ahead(client, self.gate.clone(), self.batch_size, self.namespace.clone(), tx);
         self.fetcher = Some(tokio::spawn(tracing::Instrument::in_current_span(task)));
         self.fetched = Some(rx);
+        Ok(())
+    }
+
+    /// A partitioned load: starts the workers on the first call, then hands
+    /// on their batches as they come; `None` once every worker is done (and
+    /// the snapshot's transaction is closed).
+    async fn next_partitioned(&mut self) -> Result<Option<RecordBatch>> {
+        if self.partition_batches.is_none() {
+            self.start_partitions().await?;
+        }
+        let rx = self.partition_batches.as_mut().context("no partition workers")?;
+        match rx.recv().await {
+            Some(batch) => Ok(Some(batch?)),
+            None => {
+                self.exhausted = true;
+                self.partition_batches = None;
+                if let Some(client) = &self.client {
+                    let _ = client.batch_execute("COMMIT").await;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Exports the snapshot (and counts the table's pages) on the source's
+    /// connection, then starts the workers in it.
+    async fn start_partitions(&mut self) -> Result<()> {
+        let (query, workers) = self.partitioned.clone().context("not partitioned")?;
+        let client = self.client.as_ref().context("postgres source: not configured")?;
+        let (snapshot, pages) = crate::parallel::export_snapshot(client, &query, &self.namespace).await?;
+        // More ranges than workers, so one that finishes early takes another.
+        let ranges = crate::parallel::page_ranges(pages, workers * 8);
+        tracing::info!(workers, ranges = ranges.len(), pages, table = %query.table_ref, "partitioned read");
+        let shared = Arc::new(crate::parallel::Shared {
+            conn: self.conn_cfg.clone().context("not configured")?,
+            query,
+            snapshot,
+            ranges: std::sync::Mutex::new(ranges.into()),
+            batch_size: self.batch_size,
+            schema: self.schema.clone().context("not configured")?,
+            namespace: self.namespace.clone(),
+            session_pins: SESSION_PINS.to_string(),
+            started: Default::default(),
+        });
+        self.partition_batches = Some(crate::parallel::spawn_workers(shared, workers, self.gate.clone()));
         Ok(())
     }
 }
@@ -296,6 +358,18 @@ impl SourcePlugin for PostgresSourcePlugin {
         // operator's policy: an error by default, a warning with
         // `--ignore-unknown-keys`.
         let cfg: PostgresConfig = config.parse()?;
+        if let Some(p) = &cfg.parallel {
+            if !(1..=crate::parallel::MAX_WORKERS).contains(&p.workers) {
+                anyhow::bail!("parallel.workers must be 1–{} (got {})", crate::parallel::MAX_WORKERS, p.workers);
+            }
+            if cfg.incremental.is_some() {
+                anyhow::bail!(
+                    "`parallel` reads a full load; it cannot be combined with `incremental` (batches would leave \
+                     out of cursor order)"
+                );
+            }
+            self.partitioned = Some((TableQuery::parse(&cfg.query)?, p.workers));
+        }
         if cfg.number_scale > 38 {
             anyhow::bail!("number_scale must be at most 38 (got {})", cfg.number_scale);
         }
@@ -308,7 +382,7 @@ impl SourcePlugin for PostgresSourcePlugin {
         // DMY/MDY input order. TimeZone is deliberately left alone: timestamptz
         // offsets are parsed, and changing it would alter the query's semantics.
         let ns = cfg.conn.dbname.as_str();
-        let pin = "SET DateStyle = 'ISO'; SET bytea_output = 'hex'";
+        let pin = SESSION_PINS;
         op("SET", ns, None, Some(pin), async { client.batch_execute(pin).await.context("pinning DateStyle/bytea_output") })
             .await?;
 
@@ -342,6 +416,7 @@ impl SourcePlugin for PostgresSourcePlugin {
             self.initial_value = inc.initial_value.clone();
         }
         self.namespace = cfg.conn.dbname.clone();
+        self.conn_cfg = Some(Arc::new(cfg.conn));
         self.query = cfg.query;
         self.schema = Some(schema);
         self.batch_size = cfg.batch_size;
@@ -357,6 +432,9 @@ impl SourcePlugin for PostgresSourcePlugin {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         if self.exhausted {
             return Ok(None);
+        }
+        if self.partitioned.is_some() {
+            return self.next_partitioned().await;
         }
 
         // Declare the cursor on first use, now that the resume watermark is in.
@@ -401,6 +479,8 @@ impl SourcePlugin for PostgresSourcePlugin {
         if let Some(fetcher) = self.fetcher.take() {
             fetcher.abort();
         }
+        // Workers stop at their next send; their connections close with them.
+        self.partition_batches = None;
         if let Some(client) = self.client.take() {
             let rollback = client.batch_execute("ROLLBACK");
             let _ = tokio::time::timeout(CANCEL_ROLLBACK_TIMEOUT, rollback).await;
