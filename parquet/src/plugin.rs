@@ -425,6 +425,11 @@ impl DestinationPlugin for ParquetPlugin {
         std::mem::take(&mut self.ready)
     }
 
+    fn first_object_seq(&mut self, seq: u64) {
+        // `open_writer` bumps the sequence before naming a chunk.
+        self.seq = seq.saturating_sub(1);
+    }
+
     async fn finalize(&mut self) -> Result<u64> {
         // Close the last open chunk and mark it ready. Zero batches ⇒ no schema
         // ever arrived ⇒ no file created.
