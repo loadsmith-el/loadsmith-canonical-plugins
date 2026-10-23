@@ -40,6 +40,7 @@ ignored, as with every thin driver.)
 | `batch_size` | integer | `1000` | Rows per Arrow batch. |
 | `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. `cursor_column` must be one of the query's columns (a plain name folds to upper case, like unquoted SQL); any other name fails at startup. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `DATE`/`TIMESTAMP` columns. The default is the same in every canonical plugin and truncates below the millisecond; **`ns` keeps `TIMESTAMP(9)` whole** (years 1677–2262 only), `us` covers the default `TIMESTAMP(6)`. |
+| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint ROWID ranges of the query's table at one SCN. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMBER` **without a declared precision** (a bare `NUMBER` column, `SUM(x)`, `COUNT(*)`, …), emitted as `Decimal128(38, number_scale)`. A value with more decimal places (or more than 38 digits) fails the run, naming the column — nothing is rounded. Declare the type in the query instead (`CAST(x AS NUMBER(19))`) for an exact integer or decimal. |
 
 | Oracle type | Arrow type | Notes |
@@ -87,6 +88,45 @@ source:
       cursor_column: event_sequence
       initial_value: "0"        # optional first-run watermark
 ```
+
+### Partitioned reads (`parallel`)
+
+```yaml
+source:
+  type: oracle
+  config:
+    # …connection…
+    query: "SELECT * FROM sales.orders WHERE region = 'BR'"
+    batch_size: 10000
+    parallel:
+      workers: 8
+```
+
+A full load of one large table, read by `workers` connections at once:
+
+- **The query** must read one table: `SELECT <columns> FROM <table> [<alias>]
+  [WHERE <filter>]`. No joins, no subquery in `FROM`, no `GROUP BY`, `ORDER BY`,
+  `DISTINCT` or set operators — anything else fails at startup with the reason.
+  Wrap other shapes in a view only if you don't need `parallel`: a view can't
+  be split.
+- **One snapshot.** Every worker reads `AS OF SCN` the same SCN, taken when the
+  load starts (`TIMESTAMP_TO_SCN(SYSTIMESTAMP)`, exact to a few seconds back),
+  so the load is consistent even while the table changes. The database's undo
+  retention must cover the load's duration (`ORA-01555` otherwise).
+- **The split.** A block sample (`SAMPLE BLOCK`, 1% of the table's blocks) gives
+  the extent of the table's segments; the blocks are cut into `8 × workers`
+  ROWID ranges of about equal size, and each worker takes the next range from
+  a shared queue. The ranges are half-open and open at both ends, so every row
+  is read exactly once whatever the sample. Only `SELECT` on the table is
+  needed (no `DBA_*` view, no `DBMS_PARALLEL_EXECUTE`, nothing written).
+- **Each worker fetches and converts** its rows on its own thread, so the
+  conversion runs in parallel too. Batches leave in the order workers finish
+  them, not in table order.
+- **Memory** stays bounded by the engine's flow control: the workers share one
+  credit, so `workers` adds connections, not buffered batches.
+
+Measured on 5M rows (34 columns, the `null` destination, one machine): one
+connection 11.8 s, 4 workers 6.1 s, 8 workers 4.9 s.
 
 ## Destination
 

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::conn::ConnectionConfig;
+use crate::parallel::{ParallelConfig, TableQuery};
 use crate::telemetry::{op, DbOp};
 use crate::types::{self, quote_ident, typed_expr};
 
@@ -45,6 +46,11 @@ struct OracleConfig {
     /// (default 10). A value with more decimal places fails the run.
     #[serde(default = "default_number_scale")]
     number_scale: u8,
+
+    /// Partitioned full load: `workers` connections read disjoint ROWID
+    /// ranges of the query's table at one SCN (see [`crate::parallel`]).
+    #[serde(default)]
+    parallel: Option<ParallelConfig>,
 }
 
 fn default_number_scale() -> u8 {
@@ -88,6 +94,11 @@ pub struct OracleSourcePlugin {
     fetched: Option<std::sync::mpsc::Receiver<Result<Vec<Row>>>>,
     /// The core's grant: the fetch thread never reads a chunk past it.
     gate: FlowGate,
+    /// A partitioned load: the table query and the worker count, the
+    /// connection config the workers connect with, and their batches.
+    partitioned: Option<(TableQuery, usize)>,
+    conn_cfg: Option<Arc<ConnectionConfig>>,
+    partition_batches: Option<std::sync::mpsc::Receiver<Result<RecordBatch>>>,
     /// The `SELECT` span: open while the cursor is, so it covers the fetch.
     select_span: tracing::Span,
     returned_rows: u64,
@@ -118,6 +129,9 @@ impl OracleSourcePlugin {
             cursor: TieSafeCursor::new(),
             fetched: None,
             gate: FlowGate::open(),
+            partitioned: None,
+            conn_cfg: None,
+            partition_batches: None,
             select_span: tracing::Span::none(),
             returned_rows: 0,
             exhausted: false,
@@ -193,6 +207,55 @@ impl OracleSourcePlugin {
             .spawn(move || fetch_loop(cursor, batch_size, gate, runtime, tx))
             .context("spawn the fetch thread")?;
         self.fetched = Some(rx);
+        Ok(())
+    }
+
+    /// A partitioned load: starts the workers on the first call, then hands
+    /// on their batches as they come; `None` once every worker is done.
+    fn next_partitioned(&mut self) -> Result<Option<RecordBatch>> {
+        if self.partition_batches.is_none() {
+            self.start_partitions()?;
+        }
+        let rx = self.partition_batches.as_ref().context("no partition workers")?;
+        match tokio::task::block_in_place(|| rx.recv()) {
+            Ok(batch) => {
+                let batch = batch?;
+                self.returned_rows += batch.num_rows() as u64;
+                Ok(Some(batch))
+            }
+            Err(_) => {
+                self.exhausted = true;
+                self.partition_batches = None;
+                tracing::info!(rows = self.returned_rows, "partitioned read complete");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Takes the snapshot SCN and cuts the table into ROWID ranges on the
+    /// configure connection, then starts the workers.
+    fn start_partitions(&mut self) -> Result<()> {
+        let (query, workers) = self.partitioned.clone().context("not partitioned")?;
+        let conn = self.conn.as_ref().context("not configured")?;
+        // More ranges than workers, so one that finishes early takes another.
+        let (scn, bounds) = tokio::task::block_in_place(|| -> Result<_> {
+            Ok((crate::parallel::snapshot_scn(conn)?, crate::parallel::sample_bounds(conn, &query, workers * 8)?))
+        })?;
+        let ranges = crate::parallel::ranges_between(&bounds);
+        tracing::info!(workers, ranges = ranges.len(), scn, table = %query.table, "partitioned read");
+        let shared = Arc::new(crate::parallel::Shared {
+            conn: self.conn_cfg.clone().context("not configured")?,
+            query,
+            scn,
+            select_list: self.select_list.clone(),
+            ranges: std::sync::Mutex::new(ranges.into()),
+            batch_size: self.batch_size,
+            schema: self.schema.clone().context("not configured")?,
+            namespace: self.namespace.clone(),
+            started: Default::default(),
+        });
+        let rx = crate::parallel::spawn_workers(shared, workers, self.gate.clone(), tokio::runtime::Handle::current())?;
+        self.partition_batches = Some(rx);
         Ok(())
     }
 
@@ -274,6 +337,18 @@ impl SourcePlugin for OracleSourcePlugin {
         // operator's policy: an error by default, a warning with
         // `--ignore-unknown-keys`.
         let cfg: OracleConfig = config.parse()?;
+        if let Some(p) = &cfg.parallel {
+            if !(1..=crate::parallel::MAX_WORKERS).contains(&p.workers) {
+                anyhow::bail!("parallel.workers must be 1–{} (got {})", crate::parallel::MAX_WORKERS, p.workers);
+            }
+            if cfg.incremental.is_some() {
+                anyhow::bail!(
+                    "`parallel` reads a full load; it cannot be combined with `incremental` (batches would leave \
+                     out of cursor order)"
+                );
+            }
+            self.partitioned = Some((TableQuery::parse(&cfg.query)?, p.workers));
+        }
         if cfg.number_scale > 38 {
             anyhow::bail!("number_scale must be at most 38 (got {})", cfg.number_scale);
         }
@@ -315,6 +390,7 @@ impl SourcePlugin for OracleSourcePlugin {
         }
 
         self.namespace = crate::conn::namespace(&cfg.conn).to_string();
+        self.conn_cfg = Some(Arc::new(cfg.conn));
         self.query = cfg.query;
         self.select_list = select_list;
         self.schema = Some(Arc::new(schema));
@@ -330,6 +406,9 @@ impl SourcePlugin for OracleSourcePlugin {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         if self.exhausted {
             return Ok(None);
+        }
+        if self.partitioned.is_some() {
+            return self.next_partitioned();
         }
         if self.fetched.is_none() {
             self.open_cursor()?;
@@ -365,6 +444,7 @@ impl SourcePlugin for OracleSourcePlugin {
         // Dropping the receiver stops the fetch thread (which then drops the
         // cursor), and dropping the connection closes it.
         self.fetched = None;
+        self.partition_batches = None;
         self.conn = None;
     }
 }

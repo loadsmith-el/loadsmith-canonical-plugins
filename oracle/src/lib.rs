@@ -9,6 +9,7 @@
 
 pub mod conn;
 pub mod destination;
+pub mod parallel;
 pub mod source;
 pub mod telemetry;
 pub mod types;

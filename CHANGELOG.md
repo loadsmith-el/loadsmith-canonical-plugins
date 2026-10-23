@@ -4,6 +4,19 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-23 — partitioned Oracle reads
+
+### oracle 0.7.0
+
+- **`parallel: { workers: N }`: a partitioned full load.** N connections read
+  disjoint ROWID ranges of the query's table, all `AS OF` the same SCN, each
+  fetching and converting on its own thread under the engine's shared flow
+  credit. The ranges are cut from a 1% block sample and are half-open, so
+  every row is read exactly once; only `SELECT` on the table is needed. The
+  query must read one table (`SELECT … FROM t [alias] [WHERE …]`); not with
+  `incremental`. 5M rows to `null`: 11.8 s on one connection, 4.9 s with 8
+  workers.
+
 ## 2026-10-23 — resume at what reached the target
 
 The plugins move to the SDK at engine commit `261870f`.
