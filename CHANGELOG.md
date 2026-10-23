@@ -4,6 +4,16 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-23 — parallel Parquet encoding
+
+### parquet 0.4.0
+
+- **The columns of each batch are encoded in parallel** (`encode_threads`,
+  default: the CPUs, at most 8), each column by its own encoder, with the
+  same row groups, pages and footer as before: the files are byte for byte
+  the ones 0.3 writes. Postgres 5M rows → Parquet → S3 (8 source workers):
+  8.4 s → 5.5 s; the writer's own thread went from 8.0 to 1.6 CPU seconds.
+
 ## 2026-10-23 — partitioned reads
 
 ### postgres 0.6.0

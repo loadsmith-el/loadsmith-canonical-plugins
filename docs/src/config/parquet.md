@@ -19,6 +19,7 @@ in memory, so a multi-gigabyte export is safe.
 | `compression_level` | integer | no | *(the codec's default)* | `gzip`: 0–10, `zstd`: 1–22; an error with any other codec. |
 | `max_file_size` | size with a unit | no | *(single file)* | Size cap per file. Omit ⇒ a single file. |
 | `row_group_size` | integer | no | `131072` | Maximum rows per row group. A row group is buffered in memory until written, so this bounds the writer's memory (0.2: the `parquet` crate's 1,048,576). |
+| `encode_threads` | integer ≥ 1 | no | the CPUs, at most `8` | Threads encoding a batch's columns at once (each column by its own encoder). The files are byte for byte the same whatever the value; `1` encodes on one thread (0.3). |
 
 ```yaml
 destination:

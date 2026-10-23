@@ -2,13 +2,13 @@ use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::{telemetry, BatchRange, DestinationPlugin, ReadyObject};
-use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tracing::Span;
 
+use crate::encoder::ColumnParallelWriter;
 use crate::vocab::config_enum;
 
 /// Smallest `max_file_size` we accept. A Parquet file pays a fixed cost (the
@@ -73,7 +73,13 @@ struct ParquetConfig {
     max_file_size: Option<String>,
     /// Rows per row group (default [`DEFAULT_ROW_GROUP_SIZE`]).
     row_group_size: Option<usize>,
+    /// Threads encoding a batch's columns at once (default: the CPUs, at
+    /// most [`MAX_DEFAULT_ENCODE_THREADS`]). The file is the same either way.
+    encode_threads: Option<usize>,
 }
+
+/// The most encoding threads the default picks.
+const MAX_DEFAULT_ENCODE_THREADS: usize = 8;
 
 /// Rows per row group unless `row_group_size` says otherwise. A row group is
 /// buffered in memory until written, so this bounds the writer's memory; 128Ki
@@ -192,11 +198,12 @@ struct Settings {
     props: WriterProperties,
     /// Byte threshold parsed from `max_file_size`; `None` ⇒ single-file mode.
     threshold: Option<u64>,
+    encode_threads: usize,
 }
 
 /// The chunk being written: under its temp name until closed.
 struct OpenFile {
-    writer: ArrowWriter<std::fs::File>,
+    writer: ColumnParallelWriter<std::fs::File>,
     temp: PathBuf,
     path: PathBuf,
     /// The file's `write <file>` span, open until the file is closed.
@@ -275,7 +282,7 @@ impl ParquetPlugin {
         let file = std::fs::File::create(&temp)
             .with_context(|| format!("cannot create output file: {}", temp.display()))?;
         self.created.push(temp.clone());
-        let writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
+        let writer = ColumnParallelWriter::try_new(file, batch.schema(), props, self.settings()?.encode_threads)
             .with_context(|| format!("cannot open parquet writer for {}", temp.display()))?;
         let span = file_span(&name, &path);
         self.current = Some(OpenFile { writer, temp, path, span, rows: 0, first_batch: self.batches });
@@ -372,12 +379,18 @@ impl DestinationPlugin for ParquetPlugin {
             bail!("row_group_size must be at least 1");
         }
         props = props.set_max_row_group_size(rows);
+        let encode_threads = match cfg.encode_threads {
+            Some(0) => bail!("encode_threads must be at least 1"),
+            Some(n) => n,
+            None => std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_DEFAULT_ENCODE_THREADS),
+        };
         self.settings = Some(Settings {
             dir: cfg.path,
             prefix: cfg.prefix,
             compression: cfg.compression,
             props: props.build(),
             threshold,
+            encode_threads,
         });
         Ok(())
     }

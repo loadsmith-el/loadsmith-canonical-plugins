@@ -1,3 +1,4 @@
+mod encoder;
 mod plugin;
 mod vocab;
 
