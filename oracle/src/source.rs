@@ -2,14 +2,14 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::SourcePlugin;
-use oracledb::{Connection, DbType};
+use loadsmith_plugin_sdk::{FlowGate, SourcePlugin};
+use oracledb::{Connection, DbType, Row};
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::conn::ConnectionConfig;
 use crate::telemetry::{op, DbOp};
-use crate::types::{self, quote_ident, typed_expr, Cell};
+use crate::types::{self, quote_ident, typed_expr};
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
@@ -58,9 +58,11 @@ fn default_batch_size() -> usize {
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 /// Oracle source. The query's cursor stays open across batches, owned by a
-/// fetch thread that reads `batch_size` rows per driver round trip, one batch
-/// ahead of the pump (a bounded channel): memory holds a few batches whatever
-/// the result set's size, and the database fetch overlaps the write.
+/// fetch thread that reads `batch_size` rows per driver round trip, ahead of
+/// the batch being built as far as the core's credit allows (one chunk without
+/// credit): memory holds a few batches whatever the result set's size, and the
+/// database fetch overlaps the conversion. The fetch thread only decodes the
+/// wire; the values are read natively when the batch is built.
 pub struct OracleSourcePlugin {
     conn: Option<Connection>,
     schema: Option<Arc<Schema>>,
@@ -81,7 +83,9 @@ pub struct OracleSourcePlugin {
 
     /// Rows from the fetch thread (which owns the open cursor), from the first
     /// batch until end of data. Dropping it stops the thread.
-    fetched: Option<std::sync::mpsc::Receiver<Result<Vec<Vec<Cell>>>>>,
+    fetched: Option<std::sync::mpsc::Receiver<Result<Vec<Row>>>>,
+    /// The core's grant: the fetch thread never reads a chunk past it.
+    gate: FlowGate,
     /// The `SELECT` span: open while the cursor is, so it covers the fetch.
     select_span: tracing::Span,
     returned_rows: u64,
@@ -111,6 +115,7 @@ impl OracleSourcePlugin {
             resume_value: None,
             last_cursor_value: None,
             fetched: None,
+            gate: FlowGate::open(),
             select_span: tracing::Span::none(),
             returned_rows: 0,
             exhausted: false,
@@ -175,20 +180,22 @@ impl OracleSourcePlugin {
                     .map_err(|e| anyhow::anyhow!("query failed: {e}"))
             })
         })?;
-        let ncols = self.schema.as_ref().context("not configured")?.fields().len();
         let batch_size = self.batch_size;
-        // One batch queued while the pump writes the previous one.
+        // The core's credit bounds the chunks read ahead; the channel holds one
+        // (the only bound when an older core sends no credit).
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let gate = self.gate.clone();
+        let runtime = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name("oracle-fetch".into())
-            .spawn(move || fetch_loop(cursor, ncols, batch_size, tx))
+            .spawn(move || fetch_loop(cursor, batch_size, gate, runtime, tx))
             .context("spawn the fetch thread")?;
         self.fetched = Some(rx);
         Ok(())
     }
 
     /// The next up-to-`batch_size` rows (empty at the end of data).
-    fn next_rows(&mut self) -> Result<Vec<Vec<Cell>>> {
+    fn next_rows(&mut self) -> Result<Vec<Row>> {
         let rx = self.fetched.as_ref().context("no open cursor")?;
         match tokio::task::block_in_place(|| rx.recv()) {
             Ok(rows) => rows,
@@ -197,23 +204,24 @@ impl OracleSourcePlugin {
     }
 }
 
-/// Reads the cursor `batch_size` rows at a time until the end of data (sent as
-/// an empty batch) or an error; stops early when the receiver is gone.
+/// Reads the cursor `batch_size` rows at a time, each chunk only once the core
+/// granted it, until the end of data (sent as an empty chunk) or an error;
+/// stops early when the receiver is gone. The rows go out as fetched: their
+/// values are converted on the batch-building side.
 fn fetch_loop(
     mut cursor: oracledb::Cursor,
-    ncols: usize,
     batch_size: usize,
-    tx: std::sync::mpsc::SyncSender<Result<Vec<Vec<Cell>>>>,
+    mut gate: FlowGate,
+    runtime: tokio::runtime::Handle,
+    tx: std::sync::mpsc::SyncSender<Result<Vec<Row>>>,
 ) {
-    loop {
+    for seq in 1.. {
+        runtime.block_on(gate.wait_for(seq));
         let mut chunk = Vec::with_capacity(batch_size);
         let mut failed = None;
         for row in cursor.by_ref().take(batch_size) {
-            match row
-                .map_err(|e| anyhow::anyhow!("row fetch failed: {e}"))
-                .and_then(|row| (0..ncols).map(|i| types::read_cell(&row, i)).collect::<Result<Vec<_>>>())
-            {
-                Ok(cells) => chunk.push(cells),
+            match row.map_err(|e| anyhow::anyhow!("row fetch failed: {e}")) {
+                Ok(row) => chunk.push(row),
                 Err(e) => {
                     failed = Some(e);
                     break;
@@ -249,6 +257,10 @@ impl SourcePlugin for OracleSourcePlugin {
             serde_json::Value::String(s) => s,
             other => other.to_string(),
         });
+    }
+
+    fn attach_flow(&mut self, gate: FlowGate) {
+        self.gate = gate;
     }
 
     fn current_watermark(&self) -> Option<serde_json::Value> {
@@ -336,7 +348,7 @@ impl SourcePlugin for OracleSourcePlugin {
         // row of this chunk carries the largest cursor value seen so far.
         if let Some(idx) = self.cursor_idx {
             if let Some(last) = slice.last() {
-                if let Some(v) = last.get(idx).and_then(|c| c.watermark(self.cursor_type)) {
+                if let Some(v) = types::read_value(last, idx)?.watermark(self.cursor_type) {
                     self.last_cursor_value = Some(v);
                 }
             }

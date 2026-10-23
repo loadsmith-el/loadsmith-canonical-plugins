@@ -26,14 +26,15 @@ use arrow::datatypes::{
 use arrow_array::{
     builder::{
         BinaryBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder, Int32Builder,
-        Int64Builder, StringBuilder,
+        Int64Builder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        TimestampNanosecondBuilder, TimestampSecondBuilder,
     },
-    Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::NaiveDateTime;
 use oracledb::{DbType, Row, ToDbValue};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::conn::{FMT_DATE, FMT_TIMESTAMP_IN, FMT_TIMESTAMP_TZ_IN};
@@ -211,28 +212,41 @@ pub fn typed_expr(inner: &str, t: &DbType) -> String {
     }
 }
 
-// ── Row cells (source) ──────────────────────────────────────────────────────
+// ── Row values (source) ─────────────────────────────────────────────────────
 
-/// One fetched Oracle value, already reduced to the representation Arrow needs:
-/// text for everything except binary columns, which keep their raw bytes, and
-/// temporal ones, which keep their UTC wall clock.
+/// One fetched Oracle value in its native form, borrowed from the fetched row
+/// where it can be: a number keeps its `OracleNumber`, text and bytes are not
+/// copied, a temporal keeps its UTC wall clock.
 #[derive(Debug, Clone)]
-pub enum Cell {
+pub enum Value<'a> {
     Null,
-    Text(String),
-    Bytes(Vec<u8>),
+    Number(oracledb::OracleNumber),
+    F32(f32),
+    F64(f64),
+    Bool(bool),
     Temporal(NaiveDateTime),
+    Bytes(Cow<'a, [u8]>),
+    Text(Cow<'a, str>),
 }
 
-impl Cell {
-    /// The text of a cell, or `None` for NULL / raw bytes (used for the
-    /// incremental watermark, which only ever tracks a text/number/temporal
-    /// column).
-    pub fn text(&self) -> Option<&str> {
+impl Value<'_> {
+    /// The value as text, rendered into `buf` when it is not text already:
+    /// a number's exact decimal text (NLS-independent), a float's shortest
+    /// round-trip text, a boolean as `1`/`0`. `None` for NULL, raw bytes and
+    /// temporals.
+    pub fn text<'s>(&'s self, buf: &'s mut String) -> Option<&'s str> {
+        use std::fmt::Write;
+        buf.clear();
         match self {
-            Cell::Text(s) => Some(s),
-            _ => None,
+            Value::Text(s) => return Some(s),
+            Value::Bool(b) => return Some(if *b { "1" } else { "0" }),
+            Value::Number(n) => write!(buf, "{n}"),
+            Value::F32(f) => write!(buf, "{f}"),
+            Value::F64(f) => write!(buf, "{f}"),
+            Value::Null | Value::Bytes(_) | Value::Temporal(_) => return None,
         }
+        .ok()?;
+        Some(buf)
     }
 
     /// The incremental watermark of a cursor column of type `t`. A temporal
@@ -240,53 +254,73 @@ impl Cell {
     /// same text earlier versions persisted, so saved state still resumes).
     pub fn watermark(&self, t: Option<&DbType>) -> Option<String> {
         match self {
-            Cell::Temporal(dt) => Some(match t {
+            Value::Temporal(dt) => Some(match t {
                 Some(t) if t == oracledb::DB_TYPE_DATE => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
                 Some(t) if is_zoned(t) => dt.format("%Y-%m-%d %H:%M:%S%.9f +00:00").to_string(),
                 _ => dt.format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
             }),
-            other => other.text().map(str::to_string),
+            other => other.text(&mut String::new()).map(str::to_string),
         }
     }
 }
 
-/// Reads column `i` of a fetched row as a [`Cell`], dispatching on the column's
-/// *fetched* type (the projected query's, so `TO_CHAR`-wrapped columns arrive as
-/// VARCHAR and `SYS_EXTRACT_UTC` ones as TIMESTAMP). The thin driver doesn't convert NUMBER/float/bool to
-/// `String` on request, so those are read natively and rendered here.
-/// `OracleNumber`'s `Display` is the exact decimal text (NLS-independent).
-pub fn read_cell(row: &Row, i: usize) -> Result<Cell> {
+/// A fetched row, as the batch builder reads it.
+pub trait FetchedRow {
+    /// The value of column `idx`.
+    fn value(&self, idx: usize) -> Result<Value<'_>>;
+}
+
+impl FetchedRow for Row {
+    fn value(&self, idx: usize) -> Result<Value<'_>> {
+        read_value(self, idx)
+    }
+}
+
+/// Rows built by hand (tests): a short row reads as NULL.
+impl FetchedRow for Vec<Value<'static>> {
+    fn value(&self, idx: usize) -> Result<Value<'_>> {
+        Ok(self.get(idx).cloned().unwrap_or(Value::Null))
+    }
+}
+
+/// Reads column `i` of a fetched row, dispatching on the column's *fetched*
+/// type (the projected query's, so `TO_CHAR`-wrapped columns arrive as VARCHAR
+/// and `SYS_EXTRACT_UTC` ones as TIMESTAMP).
+pub fn read_value(row: &Row, i: usize) -> Result<Value<'_>> {
     let meta = row.columns().get(i).context("column index out of range")?;
     let t = meta.db_type();
     let err = |e: oracledb::Error| anyhow::anyhow!("col {}: {e}", meta.name());
-    let text = |v: Option<String>| v.map(Cell::Text).unwrap_or(Cell::Null);
     Ok(if is_one_of(t, &[oracledb::DB_TYPE_NUMBER, oracledb::DB_TYPE_BINARY_INTEGER]) {
-        text(row.get::<Option<oracledb::OracleNumber>>(i).map_err(err)?.map(|n| n.to_string()))
+        row.get::<Option<oracledb::OracleNumber>>(i).map_err(err)?.map_or(Value::Null, Value::Number)
     } else if t == oracledb::DB_TYPE_BINARY_FLOAT {
-        text(row.get::<Option<f32>>(i).map_err(err)?.map(|n| n.to_string()))
+        row.get::<Option<f32>>(i).map_err(err)?.map_or(Value::Null, Value::F32)
     } else if t == oracledb::DB_TYPE_BINARY_DOUBLE {
-        text(row.get::<Option<f64>>(i).map_err(err)?.map(|n| n.to_string()))
+        row.get::<Option<f64>>(i).map_err(err)?.map_or(Value::Null, Value::F64)
     } else if t == oracledb::DB_TYPE_BOOLEAN {
-        text(row.get::<Option<bool>>(i).map_err(err)?.map(|b| if b { "1" } else { "0" }.to_string()))
+        row.get::<Option<bool>>(i).map_err(err)?.map_or(Value::Null, Value::Bool)
     } else if is_one_of(t, &[oracledb::DB_TYPE_DATE, oracledb::DB_TYPE_TIMESTAMP]) {
         match row.get::<Option<oracledb::OracleTimestamp>>(i).map_err(err)? {
-            Some(ts) => Cell::Temporal(NaiveDateTime::try_from(ts).map_err(err)?),
-            None => Cell::Null,
+            Some(ts) => Value::Temporal(NaiveDateTime::try_from(ts).map_err(err)?),
+            None => Value::Null,
         }
     } else if is_one_of(t, &[oracledb::DB_TYPE_RAW, oracledb::DB_TYPE_LONG_RAW, oracledb::DB_TYPE_BLOB]) {
         // BLOBs are fetched inline as bytes (no `fetch_lobs()` on the statement).
-        match row.get::<Option<Vec<u8>>>(i).map_err(err)? {
-            Some(b) => Cell::Bytes(b),
-            None => Cell::Null,
+        match row.get::<Option<&[u8]>>(i) {
+            Ok(b) => b.map_or(Value::Null, |b| Value::Bytes(Cow::Borrowed(b))),
+            Err(_) => row.get::<Option<Vec<u8>>>(i).map_err(err)?.map_or(Value::Null, |b| Value::Bytes(Cow::Owned(b))),
         }
     } else {
-        // VARCHAR/CHAR/N*, inline CLOB, ROWID, and every TO_CHAR projection.
-        text(row.get::<Option<String>>(i).map_err(err)?)
+        // VARCHAR/CHAR/N*, inline CLOB, every TO_CHAR projection; a ROWID
+        // only renders to an owned string.
+        match row.get::<Option<&str>>(i) {
+            Ok(s) => s.map_or(Value::Null, |s| Value::Text(Cow::Borrowed(s))),
+            Err(_) => row.get::<Option<String>>(i).map_err(err)?.map_or(Value::Null, |s| Value::Text(Cow::Owned(s))),
+        }
     })
 }
 
 /// Converts a slice of fetched rows into an Arrow `RecordBatch`.
-pub fn rows_to_batch(rows: &[Vec<Cell>], schema: &Schema) -> Result<RecordBatch> {
+pub fn rows_to_batch<R: FetchedRow>(rows: &[R], schema: &Schema) -> Result<RecordBatch> {
     let arrays: Vec<ArrayRef> = schema
         .fields()
         .iter()
@@ -297,16 +331,10 @@ pub fn rows_to_batch(rows: &[Vec<Cell>], schema: &Schema) -> Result<RecordBatch>
         .map_err(|e| anyhow::anyhow!("RecordBatch::try_new: {e}"))
 }
 
-/// The cell at `idx` in a row, treating a short row as NULL.
-fn cell_at(row: &[Cell], idx: usize) -> &Cell {
-    static NULL_CELL: Cell = Cell::Null;
-    row.get(idx).unwrap_or(&NULL_CELL)
-}
-
 /// Parses an `OracleNumber`'s exact decimal text (`-12.5`, `0.001`, `42`; never
-/// an exponent) into a `Decimal128` value at `scale`. A value with more
-/// significant fractional digits than `scale`, or more digits than `precision`,
-/// is an error: nothing is rounded or truncated.
+/// an exponent) into a `Decimal128` value at `scale`, without allocating. A
+/// value with more significant fractional digits than `scale`, or more digits
+/// than `precision`, is an error: nothing is rounded or truncated.
 fn parse_decimal(s: &str, precision: u8, scale: i8) -> Result<i128> {
     let (negative, digits) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -323,122 +351,127 @@ fn parse_decimal(s: &str, precision: u8, scale: i8) -> Result<i128> {
     if frac.len() > scale {
         bail!("has {} decimal places, more than the column's scale {scale}", frac.len());
     }
-    let unscaled = format!("{int_part}{frac:0<scale$}");
-    let unscaled = unscaled.trim_start_matches('0');
-    if unscaled.len() > precision as usize {
-        bail!("needs {} digits, more than the column's precision {precision}", unscaled.len());
+    let int = int_part.trim_start_matches('0');
+    // The digits of the unscaled value, as written without leading zeros.
+    let needed = if !int.is_empty() {
+        int.len() + scale
+    } else {
+        match frac.trim_start_matches('0') {
+            "" => 0,
+            significant => scale - (frac.len() - significant.len()),
+        }
+    };
+    if needed > precision.min(MAX_DECIMAL_PRECISION) as usize {
+        bail!("needs {needed} digits, more than the column's precision {precision}");
     }
-    let v = if unscaled.is_empty() { 0 } else { unscaled.parse::<i128>()? };
+    let digits = int.bytes().chain(frac.bytes()).map(|d| d - b'0').chain(std::iter::repeat_n(0, scale - frac.len()));
+    let v = digits.fold(0i128, |v, d| v * 10 + d as i128);
     Ok(if negative { -v } else { v })
 }
 
-fn build_column(rows: &[Vec<Cell>], idx: usize, field: &Field) -> Result<ArrayRef> {
+fn build_column<R: FetchedRow>(rows: &[R], idx: usize, field: &Field) -> Result<ArrayRef> {
     let name = field.name();
+    let mut buf = String::new();
+    // Columns read through their text: numbers are rendered into one reused
+    // buffer and parsed from it (no allocation per cell).
+    macro_rules! from_text {
+        ($builder:expr, |$v:ident| $parse:expr) => {{
+            let mut b = $builder;
+            for row in rows {
+                match row.value(idx)?.text(&mut buf) {
+                    None => b.append_null(),
+                    Some($v) => b.append_value($parse),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }};
+        ($builder:expr, $native:pat => $direct:expr, |$v:ident| $parse:expr) => {{
+            let mut b = $builder;
+            for row in rows {
+                match row.value(idx)? {
+                    $native => b.append_value($direct),
+                    value => match value.text(&mut buf) {
+                        None => b.append_null(),
+                        Some($v) => b.append_value($parse),
+                    },
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }};
+    }
     match field.data_type() {
-        DataType::Float32 => {
-            let mut b = Float32Builder::with_capacity(rows.len());
-            for row in rows {
-                match cell_at(row, idx).text() {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<f32>().map_err(|e| anyhow::anyhow!("col {name}: f32 '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-        DataType::Int32 => {
-            let mut b = Int32Builder::with_capacity(rows.len());
-            for row in rows {
-                match cell_at(row, idx).text() {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<i32>().map_err(|e| anyhow::anyhow!("col {name}: int32 '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-        DataType::Int64 => {
-            let mut b = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                match cell_at(row, idx).text() {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<i64>().map_err(|e| anyhow::anyhow!("col {name}: int64 '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
+        DataType::Float32 => from_text!(Float32Builder::with_capacity(rows.len()), Value::F32(f) => f, |v| v
+            .parse::<f32>()
+            .map_err(|e| anyhow::anyhow!("col {name}: f32 '{v}': {e}"))?),
+        DataType::Int32 => from_text!(Int32Builder::with_capacity(rows.len()), |v| v
+            .parse::<i32>()
+            .map_err(|e| anyhow::anyhow!("col {name}: int32 '{v}': {e}"))?),
+        DataType::Int64 => from_text!(Int64Builder::with_capacity(rows.len()), |v| v
+            .parse::<i64>()
+            .map_err(|e| anyhow::anyhow!("col {name}: int64 '{v}': {e}"))?),
         DataType::Decimal128(precision, scale) => {
-            let mut b = Decimal128Builder::with_capacity(rows.len())
+            let builder = Decimal128Builder::with_capacity(rows.len())
                 .with_precision_and_scale(*precision, *scale)
                 .map_err(|e| anyhow::anyhow!("col {name}: {e}"))?;
-            for row in rows {
-                match cell_at(row, idx).text() {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(parse_decimal(v, *precision, *scale).map_err(|e| {
-                        anyhow::anyhow!(
-                            "col {name}: NUMBER '{v}' {e} (Decimal128({precision}, {scale})); \
-                             declare the column's precision with a CAST in the query, or raise `number_scale`"
-                        )
-                    })?),
-                }
-            }
-            Ok(Arc::new(b.finish()))
+            from_text!(builder, |v| parse_decimal(v, *precision, *scale).map_err(|e| {
+                anyhow::anyhow!(
+                    "col {name}: NUMBER '{v}' {e} (Decimal128({precision}, {scale})); \
+                     declare the column's precision with a CAST in the query, or raise `number_scale`"
+                )
+            })?)
         }
-        DataType::Float64 => {
-            let mut b = Float64Builder::with_capacity(rows.len());
-            for row in rows {
-                match cell_at(row, idx).text() {
-                    None => b.append_null(),
-                    Some(v) => b.append_value(
-                        v.parse::<f64>().map_err(|e| anyhow::anyhow!("col {name}: f64 '{v}': {e}"))?,
-                    ),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
+        DataType::Float64 => from_text!(Float64Builder::with_capacity(rows.len()), Value::F64(f) => f, |v| v
+            .parse::<f64>()
+            .map_err(|e| anyhow::anyhow!("col {name}: f64 '{v}': {e}"))?),
         DataType::Boolean => {
             let mut b = BooleanBuilder::with_capacity(rows.len());
             for row in rows {
-                match cell_at(row, idx).text() {
-                    None => b.append_null(),
-                    Some("1") | Some("true") | Some("TRUE") => b.append_value(true),
-                    Some("0") | Some("false") | Some("FALSE") => b.append_value(false),
-                    Some(v) => bail!("col {name}: unexpected bool value '{v}'"),
+                match row.value(idx)? {
+                    Value::Bool(v) => b.append_value(v),
+                    value => match value.text(&mut buf) {
+                        None => b.append_null(),
+                        Some("1") | Some("true") | Some("TRUE") => b.append_value(true),
+                        Some("0") | Some("false") | Some("FALSE") => b.append_value(false),
+                        Some(v) => bail!("col {name}: unexpected bool value '{v}'"),
+                    },
                 }
             }
             Ok(Arc::new(b.finish()))
         }
         DataType::Timestamp(unit, tz) => {
-            let mut out: Vec<Option<i64>> = Vec::with_capacity(rows.len());
-            for row in rows {
-                out.push(match cell_at(row, idx) {
-                    Cell::Temporal(dt) => {
-                        Some(epoch_in(*dt, *unit).map_err(|e| anyhow::anyhow!("col {name}: timestamp {dt}: {e}"))?)
+            macro_rules! timestamps {
+                ($builder:ty) => {{
+                    let mut b = <$builder>::with_capacity(rows.len()).with_timezone_opt(tz.clone());
+                    for row in rows {
+                        match row.value(idx)? {
+                            Value::Temporal(dt) => b.append_value(
+                                epoch_in(dt, *unit).map_err(|e| anyhow::anyhow!("col {name}: timestamp {dt}: {e}"))?,
+                            ),
+                            Value::Null => b.append_null(),
+                            other => bail!("col {name}: expected a timestamp, fetched {other:?}"),
+                        }
                     }
-                    Cell::Null => None,
-                    other => bail!("col {name}: expected a timestamp, fetched {other:?}"),
-                });
+                    Ok(Arc::new(b.finish()) as ArrayRef)
+                }};
             }
-            let tz = tz.clone();
-            Ok(match unit {
-                TimeUnit::Second => Arc::new(TimestampSecondArray::from(out).with_timezone_opt(tz)) as ArrayRef,
-                TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(out).with_timezone_opt(tz)),
-                TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(out).with_timezone_opt(tz)),
-                TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(out).with_timezone_opt(tz)),
-            })
+            match unit {
+                TimeUnit::Second => timestamps!(TimestampSecondBuilder),
+                TimeUnit::Millisecond => timestamps!(TimestampMillisecondBuilder),
+                TimeUnit::Microsecond => timestamps!(TimestampMicrosecondBuilder),
+                TimeUnit::Nanosecond => timestamps!(TimestampNanosecondBuilder),
+            }
         }
         DataType::Binary => {
             let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
             for row in rows {
-                match cell_at(row, idx) {
-                    Cell::Null => b.append_null(),
-                    Cell::Bytes(bytes) => b.append_value(bytes),
-                    Cell::Text(s) => b.append_value(s.as_bytes()),
-                    Cell::Temporal(dt) => bail!("col {name}: unexpected timestamp {dt} in a binary column"),
+                match row.value(idx)? {
+                    Value::Null => b.append_null(),
+                    Value::Bytes(bytes) => b.append_value(bytes),
+                    Value::Temporal(dt) => bail!("col {name}: unexpected timestamp {dt} in a binary column"),
+                    value => match value.text(&mut buf) {
+                        Some(s) => b.append_value(s.as_bytes()),
+                        None => b.append_null(),
+                    },
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -446,7 +479,7 @@ fn build_column(rows: &[Vec<Cell>], idx: usize, field: &Field) -> Result<ArrayRe
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
-                match cell_at(row, idx).text() {
+                match row.value(idx)?.text(&mut buf) {
                     None => b.append_null(),
                     Some(v) => b.append_value(v),
                 }
@@ -640,7 +673,7 @@ fn is_simple_ident(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray, UInt64Array};
+    use arrow_array::{Int64Array, StringArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array};
 
     #[test]
     fn type_mapping() {
@@ -716,8 +749,8 @@ mod tests {
             Field::new("D", DataType::Decimal128(18, 6), true),
         ]);
         let rows = vec![
-            vec![Cell::Text("7".into()), Cell::Text("9000000000".into()), Cell::Text("-12.5".into())],
-            vec![Cell::Null, Cell::Null, Cell::Null],
+            vec![Value::Text("7".into()), Value::Text("9000000000".into()), Value::Text("-12.5".into())],
+            vec![Value::Null, Value::Null, Value::Null],
         ];
         let batch = rows_to_batch(&rows, &schema).unwrap();
         assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 7);
@@ -725,14 +758,45 @@ mod tests {
         let d = batch.column(2).as_any().downcast_ref::<Decimal128Array>().unwrap();
         assert_eq!(d.value_as_string(0), "-12.500000");
         assert!(d.is_null(1));
-        let bad = vec![vec![Cell::Null, Cell::Null, Cell::Text("0.0000001".into())]];
+        let bad = vec![vec![Value::Null, Value::Null, Value::Text("0.0000001".into())]];
         assert!(rows_to_batch(&bad, &schema).unwrap_err().to_string().contains("number_scale"));
+    }
+
+    #[test]
+    fn native_values_build_like_their_text() {
+        use std::str::FromStr;
+        let n = |s: &str| Value::Number(oracledb::OracleNumber::from_str(s).unwrap());
+        let schema = Schema::new(vec![
+            Field::new("I", DataType::Int64, true),
+            Field::new("D", DataType::Decimal128(38, 10), true),
+            Field::new("F", DataType::Float64, true),
+            Field::new("G", DataType::Float32, true),
+            Field::new("B", DataType::Boolean, true),
+            Field::new("S", DataType::Utf8, true),
+            Field::new("R", DataType::Binary, true),
+        ]);
+        let rows = vec![
+            vec![n("-42"), n("0.0000000001"), Value::F64(0.1), Value::F32(0.1), Value::Bool(true), n("12.5"), n("7")],
+            vec![n("0"), n("-123456789.5"), Value::F32(0.1), Value::F64(1e300), Value::Null, Value::F64(2.5), Value::Null],
+        ];
+        let batch = rows_to_batch(&rows, &schema).unwrap();
+        assert_eq!(batch.column(0).as_primitive::<Int64Type>().values(), &[-42, 0]);
+        let d = batch.column(1).as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!((d.value(0), d.value_as_string(1)), (1, "-123456789.5000000000".to_string()));
+        // An f32 read into a Float64 goes through its text, as it always did
+        // (0.1, not 0.10000000149…); an f64 too large for f32 becomes inf.
+        assert_eq!(batch.column(2).as_primitive::<Float64Type>().values(), &[0.1, 0.1]);
+        assert_eq!(batch.column(3).as_primitive::<Float32Type>().value(1), f32::INFINITY);
+        assert!(batch.column(4).as_boolean().value(0) && batch.column(4).is_null(1));
+        assert_eq!(batch.column(5).as_string::<i32>().value(0), "12.5");
+        assert_eq!(batch.column(5).as_string::<i32>().value(1), "2.5");
+        assert_eq!(batch.column(6).as_binary::<i32>().value(0), b"7");
     }
 
     #[test]
     fn temporals_build_in_every_unit() {
         let dt = NaiveDateTime::parse_from_str("2024-01-15 12:30:45.123456789", "%Y-%m-%d %H:%M:%S%.f").unwrap();
-        let rows = vec![vec![Cell::Temporal(dt)], vec![Cell::Null]];
+        let rows = vec![vec![Value::Temporal(dt)], vec![Value::Null]];
         let col = |unit| {
             let schema = Schema::new(vec![Field::new("TS", DataType::Timestamp(unit, None), true)]);
             rows_to_batch(&rows, &schema).unwrap().column(0).clone()
@@ -746,12 +810,12 @@ mod tests {
     #[test]
     fn temporal_watermark_keeps_the_typed_expr_format() {
         let dt = NaiveDateTime::parse_from_str("2024-01-15 12:30:45.5", "%Y-%m-%d %H:%M:%S%.f").unwrap();
-        let wm = |t| Cell::Temporal(dt).watermark(Some(t)).unwrap();
+        let wm = |t| Value::Temporal(dt).watermark(Some(t)).unwrap();
         assert_eq!(wm(oracledb::DB_TYPE_DATE), "2024-01-15 12:30:45");
         assert_eq!(wm(oracledb::DB_TYPE_TIMESTAMP), "2024-01-15 12:30:45.500000000");
         assert_eq!(wm(oracledb::DB_TYPE_TIMESTAMP_TZ), "2024-01-15 12:30:45.500000000 +00:00");
-        assert_eq!(Cell::Text("42".into()).watermark(Some(oracledb::DB_TYPE_NUMBER)).as_deref(), Some("42"));
-        assert_eq!(Cell::Null.watermark(None), None);
+        assert_eq!(Value::Text("42".into()).watermark(Some(oracledb::DB_TYPE_NUMBER)).as_deref(), Some("42"));
+        assert_eq!(Value::Null.watermark(None), None);
     }
 
     #[test]
