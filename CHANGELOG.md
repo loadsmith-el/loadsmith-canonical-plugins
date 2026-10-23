@@ -4,6 +4,28 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-23 — resume at what reached the target
+
+The plugins move to the SDK at engine commit `261870f`.
+
+### parquet 0.3.0
+
+- Each file announces the batches it holds. With engine 1.2 and a sink, the
+  incremental watermark then advances as each file is delivered, and a run
+  whose sink fails for good leaves it at the last delivered file: the next run
+  reads only what never reached the target.
+- On a run the engine retries (`pipeline.recovery`), the files of the new
+  attempt are numbered after the ones already staged, so delivered files keep
+  their names.
+
+### postgres 0.5.1, oracle 0.6.1, mysql 0.2.1
+
+- **Fix:** an incremental watermark persisted mid-run could skip rows tied on
+  the cursor (a resume reads strictly after it). While streaming, the sources
+  now report only a cursor value no later row can repeat, and the last value
+  at the end. Rows of the boundary value are read again on resume
+  (at-least-once, as documented).
+
 ## 2026-10-23 — faster sources under the engine's flow control
 
 The plugins move to the SDK at engine commit `1ca7af3`: every source

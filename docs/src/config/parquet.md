@@ -88,6 +88,13 @@ starts with the prefix (`events2.snappy.parquet`, `events.v2.snappy.parquet`).
   (copies a sink already delivered elsewhere are not touched).
 - **`max_file_size` is a rollover threshold**, checked after each batch is
   written, so a file can exceed it by up to one batch.
+- **Each file announces the batches it holds** (0.3, engine 1.2+). With a sink
+  on an incremental pipeline, the engine advances the watermark as each file is
+  delivered; a sink that fails for good leaves it at the last delivered file,
+  and the next run reads only what never reached the target.
+- **A retried run keeps the delivered files' names.** When the engine retries
+  an incremental run (`pipeline.recovery`), the new attempt numbers its chunks
+  after the ones already staged.
 
 ## Migrating from 0.1
 
