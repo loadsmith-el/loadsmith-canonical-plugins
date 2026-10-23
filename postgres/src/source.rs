@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::SourcePlugin;
+use loadsmith_plugin_sdk::{FlowGate, SourcePlugin};
 use crate::conn::ConnectionConfig;
 use crate::telemetry::{op, DbOp};
 use crate::vocab::{config_enum, TimestampUnit};
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio_postgres::Client;
+use tokio::sync::mpsc;
+use tokio_postgres::{Client, SimpleQueryRow};
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
@@ -78,11 +79,20 @@ const CANCEL_ROLLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
+/// What the fetch task hands to `next_batch`: one FETCH's rows (empty at the
+/// end of the cursor), or the error that stopped it.
+type Fetched = Result<Vec<SimpleQueryRow>>;
+
 pub struct PostgresSourcePlugin {
-    client: Option<Client>,
+    client: Option<Arc<Client>>,
     schema: Option<Arc<Schema>>,
     batch_size: usize,
     exhausted: bool,
+    /// The core's grant: the fetch task never FETCHes past it.
+    gate: FlowGate,
+    /// The fetch task's rows, one FETCH per message; started on the first batch.
+    fetched: Option<mpsc::Receiver<Fetched>>,
+    fetcher: Option<tokio::task::JoinHandle<()>>,
 
     // ── Incremental state ──────────────────────────────────────────────────
     /// The user query, declared into the cursor lazily (after `resume_from`).
@@ -116,6 +126,9 @@ impl PostgresSourcePlugin {
             schema: None,
             batch_size: 1000,
             exhausted: false,
+            gate: FlowGate::open(),
+            fetched: None,
+            fetcher: None,
             query: String::new(),
             begin_sql: "BEGIN".to_string(),
             cursor_column: None,
@@ -184,6 +197,64 @@ impl PostgresSourcePlugin {
         self.cursor_declared = true;
         Ok(())
     }
+
+    /// Starts the fetch task, which FETCHes the next batches while
+    /// `next_batch` converts the last one: the database and the conversion
+    /// overlap instead of taking turns.
+    fn start_fetching(&mut self) -> Result<()> {
+        let client = self.client.clone().context("postgres source: not configured")?;
+        // One FETCH waits in the channel at most; the gate bounds the rest.
+        let (tx, rx) = mpsc::channel(1);
+        let task = fetch_ahead(client, self.gate.clone(), self.batch_size, self.namespace.clone(), tx);
+        self.fetcher = Some(tokio::spawn(tracing::Instrument::in_current_span(task)));
+        self.fetched = Some(rx);
+        Ok(())
+    }
+}
+
+/// FETCHes the cursor batch by batch, each only once the core granted it, and
+/// commits the read transaction when the cursor is exhausted.
+async fn fetch_ahead(
+    client: Arc<Client>,
+    mut gate: FlowGate,
+    batch_size: usize,
+    namespace: String,
+    tx: mpsc::Sender<Fetched>,
+) {
+    // Use simple_query (text protocol) so all types come back as strings.
+    // This avoids binary-format issues with NUMERIC, TIME, and other types
+    // that tokio_postgres's FromSql doesn't support out of the box.
+    let fetch_sql = format!("FETCH FORWARD {batch_size} FROM ls_cursor");
+    let mut seq = 0;
+    loop {
+        seq += 1;
+        gate.wait_for(seq).await;
+        let fetch = DbOp::new("FETCH", &namespace, None, Some(&fetch_sql));
+        let span = fetch.span().clone();
+        let fetched = fetch.run(async { client.simple_query(&fetch_sql).await.context("FETCH failed") }).await;
+        let rows = fetched.map(|messages| {
+            let rows: Vec<SimpleQueryRow> = messages
+                .into_iter()
+                .filter_map(|m| match m {
+                    tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                    _ => None,
+                })
+                .collect();
+            span.record("db.response.returned_rows", rows.len() as u64);
+            rows
+        });
+        let last = rows.as_ref().map_or(true, |r| r.is_empty());
+        if matches!(&rows, Ok(r) if r.is_empty()) {
+            let close = "CLOSE ls_cursor; COMMIT";
+            let _ = op("COMMIT", &namespace, None, Some(close), async {
+                client.batch_execute(close).await.context("CLOSE/COMMIT failed")
+            })
+            .await;
+        }
+        if tx.send(rows).await.is_err() || last {
+            return;
+        }
+    }
 }
 
 #[async_trait]
@@ -209,6 +280,10 @@ impl SourcePlugin for PostgresSourcePlugin {
             serde_json::Value::String(s) => s,
             other => other.to_string(),
         });
+    }
+
+    fn attach_flow(&mut self, gate: FlowGate) {
+        self.gate = gate;
     }
 
     fn current_watermark(&self) -> Option<serde_json::Value> {
@@ -269,7 +344,7 @@ impl SourcePlugin for PostgresSourcePlugin {
         self.query = cfg.query;
         self.schema = Some(schema);
         self.batch_size = cfg.batch_size;
-        self.client = Some(client);
+        self.client = Some(Arc::new(client));
 
         Ok(())
     }
@@ -284,37 +359,18 @@ impl SourcePlugin for PostgresSourcePlugin {
         }
 
         // Declare the cursor on first use, now that the resume watermark is in.
-        self.ensure_cursor().await?;
+        if self.fetched.is_none() {
+            self.ensure_cursor().await?;
+            self.start_fetching()?;
+        }
 
         let schema = self.schema.as_ref().context("postgres source: not configured")?.clone();
-        let client = self.client.as_ref().context("postgres source: not configured")?;
-
-        // Use simple_query (text protocol) so all types come back as strings.
-        // This avoids binary-format issues with NUMERIC, TIME, and other types
-        // that tokio_postgres's FromSql doesn't support out of the box.
-        let fetch_sql = format!("FETCH FORWARD {} FROM ls_cursor", self.batch_size);
-        let fetch = DbOp::new("FETCH", &self.namespace, None, Some(&fetch_sql));
-        let span = fetch.span().clone();
-        let messages =
-            fetch.run(async { client.simple_query(&fetch_sql).await.context("FETCH failed") }).await?;
-
-        let rows: Vec<tokio_postgres::SimpleQueryRow> = messages
-            .into_iter()
-            .filter_map(|m| match m {
-                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
-                _ => None,
-            })
-            .collect();
-
-        span.record("db.response.returned_rows", rows.len() as u64);
+        let fetched = self.fetched.as_mut().expect("started above");
+        let rows = fetched.recv().await.context("the fetch task stopped")??;
 
         if rows.is_empty() {
+            // The fetch task closed the cursor and committed.
             self.exhausted = true;
-            let close = "CLOSE ls_cursor; COMMIT";
-            let _ = op("COMMIT", &self.namespace, None, Some(close), async {
-                client.batch_execute(close).await.context("CLOSE/COMMIT failed")
-            })
-            .await;
             return Ok(None);
         }
 
@@ -344,6 +400,9 @@ impl SourcePlugin for PostgresSourcePlugin {
         // ROLLBACK also closes the cursor, and unlike `CLOSE …; ROLLBACK` it
         // still runs when the transaction is already aborted or the cursor was
         // never declared.
+        if let Some(fetcher) = self.fetcher.take() {
+            fetcher.abort();
+        }
         if let Some(client) = self.client.take() {
             let rollback = client.batch_execute("ROLLBACK");
             let _ = tokio::time::timeout(CANCEL_ROLLBACK_TIMEOUT, rollback).await;
