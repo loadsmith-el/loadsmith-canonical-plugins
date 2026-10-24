@@ -84,7 +84,7 @@
       }
     },
     "postgres": {
-      "latest": "0.6.0",
+      "latest": "0.7.0",
       "versions": {
         "0.1.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.1.0/loadsmith-plugin.yaml",
         "0.2.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.2.0/loadsmith-plugin.yaml",
@@ -93,7 +93,8 @@
         "0.4.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.4.0/loadsmith-plugin.yaml",
         "0.5.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.5.0/loadsmith-plugin.yaml",
         "0.5.1": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.5.1/loadsmith-plugin.yaml",
-        "0.6.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.6.0/loadsmith-plugin.yaml"
+        "0.6.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.6.0/loadsmith-plugin.yaml",
+        "0.7.0": "https://github.com/loadsmith-el/loadsmith-canonical-plugins/releases/download/postgres-v0.7.0/loadsmith-plugin.yaml"
       }
     },
     "s3": {
