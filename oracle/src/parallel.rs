@@ -10,31 +10,119 @@
 //! The ranges sit in one queue, so a worker that finishes early takes the next
 //! one.
 //!
+//! With `split_by: <column>` (an integer column, ideally indexed) the ranges
+//! are of its values instead, between its minimum and maximum at the SCN,
+//! open at both ends, plus one partition for its NULLs.
+//!
 //! The core's credit bounds the batches fetched across all workers: a worker
 //! takes a credit before each fetch and gives it back when the fetch comes
 //! back empty (the end of its range), so no credit is spent on a batch that
 //! never comes.
+//!
+//! **Resume.** The source reports its SCN, its partitions and the ones it has
+//! fully returned as its resume token; the core persists the token at the
+//! delivered prefix. A resumed run reads the partitions not yet done at the
+//! same SCN — one consistent snapshot, as if the run had never failed — while
+//! the undo still reaches back to it. When it no longer does, the load starts
+//! over; with `resume_snapshot: new` (key partitions only) it reads the
+//! remaining partitions at a new SCN instead, and the output mixes two points
+//! in time (which is why ROWID partitions cannot: a row moved by a reorganized
+//! table could be read twice or not at all).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use loadsmith_plugin_sdk::FlowGate;
 use oracledb::{Connection, Row};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::conn::ConnectionConfig;
 use crate::telemetry::DbOp;
 use crate::types::{self, fold_ident};
+use crate::vocab::config_enum;
 
 /// `parallel:` of the source config.
 #[derive(Debug, Deserialize)]
 pub struct ParallelConfig {
     /// Connections reading at once.
     pub workers: usize,
+    /// `rowid` (the default): ROWID ranges. A column of the table: ranges of
+    /// its values (an integer column).
+    #[serde(default)]
+    pub split_by: Option<String>,
+    /// What a resumed run reads at when the failed run's SCN is gone (see the
+    /// module docs).
+    #[serde(default)]
+    pub resume_snapshot: ResumeSnapshot,
+}
+
+config_enum! {
+    /// The snapshot a resumed partitioned load reads its remaining
+    /// partitions at.
+    #[derive(Default)]
+    pub enum ResumeSnapshot for "resume_snapshot" {
+        /// The failed run's SCN while the undo reaches it; otherwise the
+        /// load starts over.
+        #[default]
+        Same = "same",
+        /// The failed run's SCN while the undo reaches it; otherwise a new
+        /// one (key partitions only).
+        New = "new",
+    }
+    retired {}
+}
+
+/// How the table is cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Split {
+    Rowid,
+    /// A column, as written in the config (used verbatim in SQL).
+    Key(String),
+}
+
+impl Split {
+    /// The token's name for it.
+    fn name(&self) -> &str {
+        match self {
+            Split::Rowid => "rowid",
+            Split::Key(c) => c,
+        }
+    }
+}
+
+impl ParallelConfig {
+    /// The split, checked: a column must be one identifier (quoted or not),
+    /// and `resume_snapshot: new` needs one.
+    pub fn split(&self) -> Result<Split> {
+        let split = match self.split_by.as_deref().map(str::trim) {
+            None => Split::Rowid,
+            Some(c) if c.eq_ignore_ascii_case("rowid") => Split::Rowid,
+            Some(c) if is_identifier(c) => Split::Key(c.to_string()),
+            Some(c) => bail!("parallel.split_by `{c}` must be `rowid` or one column name"),
+        };
+        if self.resume_snapshot == ResumeSnapshot::New && split == Split::Rowid {
+            bail!(
+                "parallel.resume_snapshot: new needs a key column in `split_by`: with ROWID ranges a row \
+                 moved between the two snapshots (a reorganized table) could be read twice or not at all"
+            );
+        }
+        Ok(split)
+    }
+}
+
+/// One column name: a plain identifier or a double-quoted one.
+fn is_identifier(s: &str) -> bool {
+    match s.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
+        Some(quoted) => !quoted.is_empty() && !quoted.contains('"'),
+        None => {
+            s.chars().next().is_some_and(|c| c.is_alphabetic())
+                && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '#')
+        }
+    }
 }
 
 /// The most workers a load may open.
@@ -109,18 +197,32 @@ impl TableQuery {
         Ok(Self { columns, owner, table, table_ref: table_ref.to_string(), alias, filter })
     }
 
-    /// The query a worker runs for `range` at `scn`. The bounds are ROWID
-    /// literals: each range's statement text is its own (the driver's
-    /// statement cache, re-executing one cached text with new binds on a
-    /// connection, breaks the protocol).
-    pub fn range_query(&self, scn: u64, range: &Range) -> String {
+    /// The query a worker runs for `partition` (of a `Key` split on `key`) at
+    /// `scn`. The bounds are literals: each range's statement text is its own
+    /// (the driver's statement cache, re-executing one cached text with new
+    /// binds on a connection, breaks the protocol).
+    pub fn range_query(&self, scn: u64, partition: &Partition, key: Option<&str>) -> String {
         let alias = self.alias.as_deref().map(|a| format!(" {a}")).unwrap_or_default();
         let mut conds = Vec::new();
-        if let Some(lo) = &range.lo {
-            conds.push(format!("ROWID >= CHARTOROWID('{lo}')"));
-        }
-        if let Some(hi) = &range.hi {
-            conds.push(format!("ROWID < CHARTOROWID('{hi}')"));
+        match partition {
+            Partition::Rowid { lo, hi } => {
+                if let Some(lo) = lo {
+                    conds.push(format!("ROWID >= CHARTOROWID('{lo}')"));
+                }
+                if let Some(hi) = hi {
+                    conds.push(format!("ROWID < CHARTOROWID('{hi}')"));
+                }
+            }
+            Partition::Key { lo, hi } => {
+                let key = key.unwrap_or("ROWID");
+                if let Some(lo) = lo {
+                    conds.push(format!("{key} >= {lo}"));
+                }
+                if let Some(hi) = hi {
+                    conds.push(format!("{key} < {hi}"));
+                }
+            }
+            Partition::Null => conds.push(format!("{} IS NULL", key.unwrap_or("ROWID"))),
         }
         if let Some(f) = &self.filter {
             conds.push(format!("({f})"));
@@ -205,22 +307,131 @@ fn split_qualified(r: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// One ROWID range, `[lo, hi)`; `None` is open on that side.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Range {
-    pub lo: Option<String>,
-    pub hi: Option<String>,
+/// One partition of the table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Partition {
+    /// ROWIDs `[lo, hi)`; `None` is open on that side.
+    Rowid { lo: Option<String>, hi: Option<String> },
+    /// Key values `lo <= key < hi` (integer text; `None`: unbounded).
+    Key { lo: Option<String>, hi: Option<String> },
+    /// The rows whose key is NULL.
+    Null,
+}
+
+/// The key range `[min, max]` cut into `pieces` ranges of about equal width,
+/// open at both ends, then the NULLs. No minimum (no value): one unbounded
+/// partition.
+pub fn key_ranges(min_max: Option<(i128, i128)>, pieces: usize) -> Vec<Partition> {
+    let Some((min, max)) = min_max else {
+        return vec![Partition::Key { lo: None, hi: None }];
+    };
+    let span = max - min + 1;
+    let mut cuts: Vec<i128> = Vec::new();
+    for k in 1..pieces as i128 {
+        let cut = min + span * k / pieces as i128;
+        if cut > min && cuts.last().is_none_or(|&last| cut > last) {
+            cuts.push(cut);
+        }
+    }
+    let mut edges: Vec<Option<String>> = vec![None];
+    edges.extend(cuts.iter().map(|c| Some(c.to_string())));
+    edges.push(None);
+    let mut parts: Vec<Partition> =
+        edges.windows(2).map(|w| Partition::Key { lo: w[0].clone(), hi: w[1].clone() }).collect();
+    parts.push(Partition::Null);
+    parts
+}
+
+/// The minimum and maximum of `key` over the query's rows at `scn`; `None`
+/// when there is no value. The key must be an integer column.
+pub fn key_min_max(conn: &Connection, q: &TableQuery, key: &str, scn: u64) -> Result<Option<(i128, i128)>> {
+    let alias = q.alias.as_deref().map(|a| format!(" {a}")).unwrap_or_default();
+    let filter = q.filter.as_deref().map(|f| format!(" WHERE {f}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT TO_CHAR(MIN({key})), TO_CHAR(MAX({key})) FROM {} AS OF SCN {scn}{alias}{filter}",
+        q.table_ref
+    );
+    let row = conn.query_row(&sql, &[]).map_err(|e| anyhow::anyhow!("reading the range of `{key}`: {e}"))?;
+    let lo: Option<String> = row.get(0).map_err(|e| anyhow::anyhow!("reading the range of `{key}`: {e}"))?;
+    let hi: Option<String> = row.get(1).map_err(|e| anyhow::anyhow!("reading the range of `{key}`: {e}"))?;
+    match (lo, hi) {
+        (Some(lo), Some(hi)) => {
+            let int = |v: &str| {
+                v.trim().parse::<i128>().map_err(|_| {
+                    anyhow::anyhow!("parallel.split_by `{key}` must be an integer column (its minimum is {v:?})")
+                })
+            };
+            Ok(Some((int(&lo)?, int(&hi)?)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// What a partitioned load reports as its resume token: the SCN it reads
+/// at, how it cut the table, and the partitions it has fully returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeToken {
+    pub scn: u64,
+    /// `rowid` or the key column.
+    pub split_by: String,
+    pub partitions: Vec<Partition>,
+    pub done: Vec<usize>,
+}
+
+impl ResumeToken {
+    pub fn new(scn: u64, split: &Split, partitions: &[Partition], done: &BTreeSet<usize>) -> Self {
+        Self {
+            scn,
+            split_by: split.name().to_string(),
+            partitions: partitions.to_vec(),
+            done: done.iter().copied().collect(),
+        }
+    }
+
+    /// The token for `split`, if `value` is one (the same split, sane ids,
+    /// bounds that are safe as SQL literals).
+    pub fn parse(value: serde_json::Value, split: &Split) -> Result<Self> {
+        let token: Self = serde_json::from_value(value).context("not a partitioned load's resume token")?;
+        if token.split_by != split.name() {
+            bail!("the token splits by `{}`, the config by `{}`", token.split_by, split.name());
+        }
+        if let Some(id) = token.done.iter().find(|&&id| id >= token.partitions.len()) {
+            bail!("the token names partition {id} of {}", token.partitions.len());
+        }
+        for p in &token.partitions {
+            let ok = match p {
+                Partition::Rowid { lo, hi } => {
+                    [lo, hi].into_iter().flatten().all(|r| r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/'))
+                }
+                Partition::Key { lo, hi } => [lo, hi].into_iter().flatten().all(|b| b.parse::<i128>().is_ok()),
+                Partition::Null => true,
+            };
+            if !ok {
+                bail!("the token's partition bounds are not ROWIDs or integers");
+            }
+        }
+        Ok(token)
+    }
+}
+
+/// Whether the database can still read the table at `scn` (its undo reaches
+/// back that far); `Err` says why not.
+pub fn scn_readable(conn: &Connection, q: &TableQuery, scn: u64) -> Result<(), String> {
+    let sql = format!("SELECT COUNT(*) FROM {} AS OF SCN {scn} WHERE ROWNUM = 1", q.table_ref);
+    conn.query_row(&sql, &[]).map(|_| ()).map_err(|e| format!("{scn} can no longer be read: {e}"))
 }
 
 /// The ranges between consecutive `bounds` (sorted ROWIDs), open at both
 /// ends, in the order workers should take them: the two open ones first —
 /// they also hold the blocks the sample did not reach, so they are the
 /// largest, and taken last they would leave one worker reading alone.
-pub fn ranges_between(bounds: &[String]) -> Vec<Range> {
+pub fn ranges_between(bounds: &[String]) -> Vec<Partition> {
     let mut edges: Vec<Option<String>> = vec![None];
     edges.extend(bounds.iter().cloned().map(Some));
     edges.push(None);
-    let mut ranges: Vec<Range> = edges.windows(2).map(|w| Range { lo: w[0].clone(), hi: w[1].clone() }).collect();
+    let mut ranges: Vec<Partition> =
+        edges.windows(2).map(|w| Partition::Rowid { lo: w[0].clone(), hi: w[1].clone() }).collect();
     if ranges.len() > 2 {
         let last = ranges.pop().expect("more than two");
         ranges.insert(1, last);
@@ -229,10 +440,16 @@ pub fn ranges_between(bounds: &[String]) -> Vec<Range> {
 }
 
 /// `pieces - 1` ROWIDs that cut the table into about equal parts. A block
-/// sample (1% of the blocks; every block of a table too small to sample)
-/// gives each segment's span of blocks (data object, file, first and last
-/// block); the spans are cut evenly by block, rows per block being about even
-/// in a heap table, and Oracle builds and sorts the boundary ROWIDs.
+/// sample gives each segment's span of blocks (data object, file, first and
+/// last block); the spans are cut evenly by block, rows per block being about
+/// even in a heap table, and Oracle builds and sorts the boundary ROWIDs.
+///
+/// `SAMPLE BLOCK` samples whole multiblock reads, so a small percentage of a
+/// mid-sized table often comes back empty (1% of a 50,000-block table: some
+/// thousands of rows one time, none the next). The percentage grows until the
+/// sample spans enough blocks; only a table still too small for that is read
+/// whole — which for a mid-sized table cost seconds, and made the same
+/// partitioned load take 2 or 5.6 s by the luck of the sample.
 pub fn sample_bounds(conn: &Connection, q: &TableQuery, pieces: usize) -> Result<Vec<String>> {
     let spans = |sample: &str| -> Result<Vec<(i64, i64, i64, i64)>> {
         let sql = format!(
@@ -254,9 +471,15 @@ pub fn sample_bounds(conn: &Connection, q: &TableQuery, pieces: usize) -> Result
             })
             .collect()
     };
-    let mut segments = spans(" SAMPLE BLOCK (1)")?;
-    if segments.iter().map(|&(_, _, lo, hi)| hi - lo + 1).sum::<i64>() < pieces as i64 * 8 {
-        segments = spans("")?;
+    let enough = |segments: &[(i64, i64, i64, i64)]| {
+        segments.iter().map(|&(_, _, lo, hi)| hi - lo + 1).sum::<i64>() >= pieces as i64 * 8
+    };
+    let mut segments = Vec::new();
+    for sample in [" SAMPLE BLOCK (1)", " SAMPLE BLOCK (5)", " SAMPLE BLOCK (25)", ""] {
+        segments = spans(sample)?;
+        if enough(&segments) {
+            break;
+        }
     }
     let points = block_bounds(&segments, pieces);
     if points.is_empty() {
@@ -325,14 +548,49 @@ fn block_bounds(segments: &[(i64, i64, i64, i64)], pieces: usize) -> Vec<(i64, i
     points
 }
 
-/// The SCN every worker reads at: now, as precisely as an unprivileged user
-/// can ask (`TIMESTAMP_TO_SCN` is exact to a few seconds back).
-pub fn snapshot_scn(conn: &Connection) -> Result<u64> {
-    let row = conn
-        .query_row("SELECT TO_CHAR(TIMESTAMP_TO_SCN(SYSTIMESTAMP)) FROM DUAL", &[])
-        .map_err(|e| anyhow::anyhow!("reading the snapshot SCN: {e}"))?;
-    let scn: String = row.get(0).map_err(|e| anyhow::anyhow!("reading the snapshot SCN: {e}"))?;
-    scn.trim().parse().with_context(|| format!("snapshot SCN {scn:?}"))
+/// The SCN every worker reads at: the database's current one, found without
+/// privileges.
+///
+/// `TIMESTAMP_TO_SCN(SYSTIMESTAMP)` alone is not enough: the database maps
+/// time to SCNs in steps of about 3 seconds (and right after a restart, from
+/// an older entry), so the SCN it gives can precede commits made just before
+/// the run, and a table loaded moments earlier would read as empty. It is the
+/// starting point: an `AS OF SCN` read of the table fails with ORA-08181 past
+/// the current SCN, so the SCN is searched upwards from it (doubling, then
+/// halving), a few milliseconds per probe. An SCN before the table's last DDL
+/// (ORA-01466) is also below the current one.
+pub fn snapshot_scn(conn: &Connection, q: &TableQuery) -> Result<u64> {
+    let row = conn.query_row("SELECT TO_CHAR(TIMESTAMP_TO_SCN(SYSTIMESTAMP)) FROM DUAL", &[]);
+    let base: String = row.and_then(|r| r.get(0)).map_err(|e| anyhow::anyhow!("reading the snapshot SCN: {e}"))?;
+    let base: u64 = base.trim().parse().with_context(|| format!("snapshot SCN {base:?}"))?;
+    let below_current = |scn: u64| -> Result<bool> {
+        let sql = format!("SELECT COUNT(*) FROM {} AS OF SCN {scn} WHERE ROWNUM = 1", q.table_ref);
+        match conn.query_row(&sql, &[]) {
+            Ok(_) => Ok(true),
+            Err(e) if e.to_string().contains("ORA-08181") => Ok(false),
+            Err(e) if e.to_string().contains("ORA-01466") => Ok(true),
+            Err(e) => Err(anyhow::anyhow!("probing the snapshot SCN {scn}: {e}")),
+        }
+    };
+    // `lo` is at most the current SCN, `hi` past it.
+    let (mut lo, mut step) = (base, 1u64);
+    let mut hi = loop {
+        let scn = base.checked_add(step).context("snapshot SCN overflow")?;
+        if !below_current(scn)? {
+            break scn;
+        }
+        lo = scn;
+        step = step.checked_mul(2).context("snapshot SCN overflow")?;
+    };
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if below_current(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
 }
 
 /// What every worker shares.
@@ -342,12 +600,22 @@ pub struct Shared {
     pub scn: u64,
     /// The projected column list, as the unpartitioned query applies it.
     pub select_list: String,
-    pub ranges: Mutex<VecDeque<Range>>,
+    /// The key column of a `Key` split.
+    pub key: Option<String>,
+    /// The partitions left to read, with their ids.
+    pub partitions: Mutex<VecDeque<(usize, Partition)>>,
     pub batch_size: usize,
     pub schema: Arc<Schema>,
     pub namespace: String,
     /// Fetches started and not given back, across workers (the credit taken).
     pub started: AtomicU64,
+}
+
+/// What a worker hands the source: a batch, or the end of a partition (sent
+/// after its last batch, so every batch of a partition is ahead of it).
+pub enum Item {
+    Batch(RecordBatch),
+    Done(usize),
 }
 
 /// Starts `workers` threads; their batches arrive on the returned channel,
@@ -358,7 +626,7 @@ pub fn spawn_workers(
     workers: usize,
     gate: FlowGate,
     runtime: tokio::runtime::Handle,
-) -> Result<mpsc::Receiver<Result<RecordBatch>>> {
+) -> Result<mpsc::Receiver<Result<Item>>> {
     let (tx, rx) = mpsc::sync_channel(workers);
     for n in 0..workers {
         let (shared, gate, runtime, tx) = (shared.clone(), gate.clone(), runtime.clone(), tx.clone());
@@ -379,18 +647,19 @@ fn work(
     shared: &Shared,
     mut gate: FlowGate,
     runtime: &tokio::runtime::Handle,
-    tx: &mpsc::SyncSender<Result<RecordBatch>>,
+    tx: &mpsc::SyncSender<Result<Item>>,
 ) -> Result<()> {
     let conn = crate::conn::connect(&shared.conn)?;
     let fetch = u32::try_from(shared.batch_size).unwrap_or(u32::MAX);
     let (mut rows_read, mut ranges_read) = (0u64, 0u64);
     loop {
-        let Some(range) = shared.ranges.lock().map_err(|_| anyhow::anyhow!("range queue poisoned"))?.pop_front() else {
+        let next = shared.partitions.lock().map_err(|_| anyhow::anyhow!("partition queue poisoned"))?.pop_front();
+        let Some((id, partition)) = next else {
             tracing::debug!(rows = rows_read, ranges = ranges_read, "partition worker done");
             return Ok(());
         };
         ranges_read += 1;
-        let inner = shared.query.range_query(shared.scn, &range);
+        let inner = shared.query.range_query(shared.scn, &partition, shared.key.as_deref());
         let sql = format!("SELECT {} FROM ({inner}) \"_LS\"", shared.select_list);
         let select = DbOp::new("SELECT", &shared.namespace, None, None);
         let mut cursor = select.run(|| {
@@ -421,12 +690,15 @@ fn work(
             let last = rows.len() < shared.batch_size;
             rows_read += rows.len() as u64;
             let batch = types::rows_to_batch(&rows, &shared.schema).context("RecordBatch build failed")?;
-            if tx.send(Ok(batch)).is_err() {
+            if tx.send(Ok(Item::Batch(batch))).is_err() {
                 return Ok(()); // the source is gone
             }
             if last {
                 break;
             }
+        }
+        if tx.send(Ok(Item::Done(id))).is_err() {
+            return Ok(());
         }
     }
 }
@@ -483,16 +755,63 @@ mod tests {
     #[test]
     fn the_range_query_reads_at_the_scn() {
         let q = TableQuery::parse("SELECT * FROM hr.events e WHERE e.kind = 'x'").unwrap();
-        let mid = Range { lo: Some("AAA".into()), hi: Some("BBB".into()) };
+        let mid = Partition::Rowid { lo: Some("AAA".into()), hi: Some("BBB".into()) };
         assert_eq!(
-            q.range_query(42, &mid),
+            q.range_query(42, &mid, None),
             "SELECT * FROM hr.events AS OF SCN 42 e WHERE ROWID >= CHARTOROWID('AAA') AND ROWID < CHARTOROWID('BBB') \
              AND (e.kind = 'x')"
         );
         let q = TableQuery::parse("SELECT * FROM t").unwrap();
-        let last = Range { lo: Some("ZZZ".into()), hi: None };
-        assert_eq!(q.range_query(7, &last), "SELECT * FROM t AS OF SCN 7 WHERE ROWID >= CHARTOROWID('ZZZ')");
-        assert_eq!(q.range_query(7, &Range { lo: None, hi: None }), "SELECT * FROM t AS OF SCN 7");
+        let last = Partition::Rowid { lo: Some("ZZZ".into()), hi: None };
+        assert_eq!(q.range_query(7, &last, None), "SELECT * FROM t AS OF SCN 7 WHERE ROWID >= CHARTOROWID('ZZZ')");
+        assert_eq!(q.range_query(7, &Partition::Rowid { lo: None, hi: None }, None), "SELECT * FROM t AS OF SCN 7");
+        let key = Some("id");
+        assert_eq!(
+            q.range_query(7, &Partition::Key { lo: Some("10".into()), hi: Some("20".into()) }, key),
+            "SELECT * FROM t AS OF SCN 7 WHERE id >= 10 AND id < 20"
+        );
+        assert_eq!(q.range_query(7, &Partition::Null, key), "SELECT * FROM t AS OF SCN 7 WHERE id IS NULL");
+    }
+
+    #[test]
+    fn keys_are_cut_evenly_open_at_both_ends_with_the_nulls_last() {
+        let key = |lo: Option<i32>, hi: Option<i32>| Partition::Key { lo: lo.map(|v| v.to_string()), hi: hi.map(|v| v.to_string()) };
+        assert_eq!(
+            key_ranges(Some((1, 100)), 4),
+            [key(None, Some(26)), key(Some(26), Some(51)), key(Some(51), Some(76)), key(Some(76), None), Partition::Null]
+        );
+        assert_eq!(key_ranges(Some((3, 3)), 4), [key(None, None), Partition::Null]);
+        assert_eq!(key_ranges(None, 4), [key(None, None)]);
+    }
+
+    #[test]
+    fn split_by_is_checked() {
+        let cfg = |split: Option<&str>, snap: &str| -> Result<Split> {
+            let mut v = serde_json::json!({ "workers": 4, "resume_snapshot": snap });
+            if let Some(s) = split {
+                v["split_by"] = s.into();
+            }
+            serde_json::from_value::<ParallelConfig>(v).unwrap().split()
+        };
+        assert_eq!(cfg(None, "same").unwrap(), Split::Rowid);
+        assert_eq!(cfg(Some("ROWID"), "same").unwrap(), Split::Rowid);
+        assert_eq!(cfg(Some("event_id"), "new").unwrap(), Split::Key("event_id".into()));
+        assert!(cfg(Some("id; DROP TABLE t"), "same").is_err());
+        assert!(cfg(None, "new").unwrap_err().to_string().contains("needs a key column"));
+    }
+
+    #[test]
+    fn tokens_roundtrip_and_are_checked() {
+        let split = Split::Rowid;
+        let parts = ranges_between(&["AAAB".to_string(), "AAAC".to_string()]);
+        let done = [1usize].into_iter().collect();
+        let token = serde_json::to_value(ResumeToken::new(99, &split, &parts, &done)).unwrap();
+        let back = ResumeToken::parse(token.clone(), &split).unwrap();
+        assert_eq!((back.scn, back.partitions, back.done), (99, parts, vec![1]));
+        assert!(ResumeToken::parse(token.clone(), &Split::Key("id".into())).is_err());
+        let mut bad = token;
+        bad["partitions"][2]["lo"] = "x') OR 1=1 --".into();
+        assert!(ResumeToken::parse(bad, &split).is_err(), "bounds become SQL literals");
     }
 
     #[test]
@@ -501,11 +820,15 @@ mod tests {
         let ranges = ranges_between(&bounds);
         assert_eq!(ranges.len(), 4);
         // The open ranges first, then the inner ones in order.
-        assert_eq!((ranges[0].lo.as_deref(), ranges[1].hi.as_deref()), (None, None));
-        let mut sorted = ranges.clone();
-        sorted.sort_by_key(|r| r.lo.clone());
-        assert!(sorted.windows(2).all(|w| w[0].hi == w[1].lo), "contiguous: {sorted:?}");
-        assert_eq!(ranges_between(&[]), [Range { lo: None, hi: None }]);
+        let bounds = |p: &Partition| match p {
+            Partition::Rowid { lo, hi } => (lo.clone(), hi.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!((bounds(&ranges[0]).0, bounds(&ranges[1]).1), (None, None));
+        let mut sorted: Vec<_> = ranges.iter().map(bounds).collect();
+        sorted.sort();
+        assert!(sorted.windows(2).all(|w| w[0].1 == w[1].0), "contiguous: {sorted:?}");
+        assert_eq!(ranges_between(&[]), [Partition::Rowid { lo: None, hi: None }]);
     }
 
     #[test]

@@ -9,7 +9,8 @@ Delivery](https://loadsmith-el.github.io/loadsmith/architecture/sink-delivery.ht
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `dest` | string | yes | Destination **directory** each finalized file is copied into. Created if missing. |
+| `dest` | string | yes | Destination **directory** the files are delivered under. Created if missing. |
+| `key` | string | no (default `{run_date}/{run_id}/{file}`) | Where under `dest` each file lands, the same template as the [`s3`](./s3.md) sink's: `{file}` (required), `{run_id}`, `{run_date}` (`YYYY-MM-DD`, UTC), `{run_time}` (`YYYYMMDDTHHMMSSZ`), `{pipeline}`. `key: "{file}"` keeps the files flat in `dest`. |
 
 Unknown keys are rejected (or only warned about with `--ignore-unknown-keys`).
 
@@ -34,10 +35,12 @@ sink:
   `dest` sees either the previous file or the complete new one — never a
   partial copy, even if the sink is killed mid-copy (a killed copy can leave a
   temp file behind; it never takes a real name).
-- **Names.** A file keeps its staged name. Two objects with the same file name
-  (from different staging directories) land on the same target: **the last one
-  delivered wins**. Re-delivering an object (after a crash) replaces the target,
-  which is what makes resume idempotent.
+- **Names.** A file lands at `dest/<key>`: by default under a
+  `<date>/<run id>/` directory per run, so a later run never replaces an
+  earlier run's files (a run continuing a failed one keeps its id, and so its
+  directory). Within a run the name is stable: re-delivering an object (after a
+  crash) replaces the target, which is what makes resume idempotent. A `key`
+  must stay inside `dest` (no `..`).
 - The core's sink supervisor tracks delivery in a ledger and resumes from it if
   the sink crashes mid-run, so each object is delivered at least once.
 
@@ -47,9 +50,18 @@ The released binary has no crash switch. The lab's resume case uses
 `local-copy-chaos` instead — a never-released build of the same delivery code
 (workspace member `local-copy-chaos`, binary
 `loadsmith-sink-local-copy-chaos`) that exits abruptly once after
-`LOADSMITH_SINK_CRASH_AFTER=<n>` deliveries. It is only available when the lab
+`LOADSMITH_SINK_CRASH_AFTER=<n>` deliveries, fails every delivery after
+`LOADSMITH_SINK_FAIL_AFTER=<n>` (for `LOADSMITH_SINK_FAIL_COUNT=<k>` of them),
+and with `LOADSMITH_SINK_FAIL_COPIES=1` copies a file before failing it (at
+the target, unacknowledged: what a killed run leaves). It is only available when the lab
 builds this workspace with `--plugin`; `sink: { type: local-copy-chaos }` takes
 the same config as `local-copy`.
+
+## Migrating from 0.2
+
+| 0.2 | 0.3 |
+|---|---|
+| every file flat in `dest` (a later run's `events.00000001…` replaced an earlier run's) | `key`, default `{run_date}/{run_id}/{file}`; `key: "{file}"` for the flat layout |
 
 ## Migrating from 0.1
 

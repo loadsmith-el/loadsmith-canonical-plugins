@@ -2412,7 +2412,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "loadsmith-arrow"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=261870fa795f7c1f222869d75c91c4cc6b26e74b#261870fa795f7c1f222869d75c91c4cc6b26e74b"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=3a1000456e4e417fb3345139094ab2424b2e050f#3a1000456e4e417fb3345139094ab2424b2e050f"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-oracle"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2575,7 +2575,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=261870fa795f7c1f222869d75c91c4cc6b26e74b#261870fa795f7c1f222869d75c91c4cc6b26e74b"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=3a1000456e4e417fb3345139094ab2424b2e050f#3a1000456e4e417fb3345139094ab2424b2e050f"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2593,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-postgres"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2619,7 +2619,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-protocol"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=261870fa795f7c1f222869d75c91c4cc6b26e74b#261870fa795f7c1f222869d75c91c4cc6b26e74b"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=3a1000456e4e417fb3345139094ab2424b2e050f#3a1000456e4e417fb3345139094ab2424b2e050f"
 dependencies = [
  "serde",
  "serde_json",
@@ -2652,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-sink-local-copy"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2677,12 +2677,11 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-sink-s3"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
  "httpmock",
- "jiff",
  "loadsmith-plugin-sdk",
  "loadsmith-tls",
  "mimalloc",
@@ -2697,7 +2696,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-tls"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=261870fa795f7c1f222869d75c91c4cc6b26e74b#261870fa795f7c1f222869d75c91c4cc6b26e74b"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=3a1000456e4e417fb3345139094ab2424b2e050f#3a1000456e4e417fb3345139094ab2424b2e050f"
 dependencies = [
  "anyhow",
  "rustls",
@@ -2709,7 +2708,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-transport"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=261870fa795f7c1f222869d75c91c4cc6b26e74b#261870fa795f7c1f222869d75c91c4cc6b26e74b"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=3a1000456e4e417fb3345139094ab2424b2e050f#3a1000456e4e417fb3345139094ab2424b2e050f"
 dependencies = [
  "loadsmith-arrow",
  "loadsmith-protocol",

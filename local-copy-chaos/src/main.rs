@@ -15,6 +15,9 @@
 //! `LOADSMITH_SINK_FAIL_COUNT=<k>` as well, the target comes back after `k`
 //! failed deliveries (the core's sink supervisor gives up after 6 in a row:
 //! `k = 6` fails one attempt of the run and lets a retried one deliver).
+//! With `LOADSMITH_SINK_FAIL_COPIES=1`, a failing delivery copies the file
+//! first: it is at the target, but never acknowledged — what a run killed
+//! (SIGKILL) during an upload leaves behind.
 
 use std::path::PathBuf;
 
@@ -26,6 +29,7 @@ use loadsmith_plugin_sdk::{PluginConfig, SinkPlugin};
 const CRASH_AFTER_ENV: &str = "LOADSMITH_SINK_CRASH_AFTER";
 const FAIL_AFTER_ENV: &str = "LOADSMITH_SINK_FAIL_AFTER";
 const FAIL_COUNT_ENV: &str = "LOADSMITH_SINK_FAIL_COUNT";
+const FAIL_COPIES_ENV: &str = "LOADSMITH_SINK_FAIL_COPIES";
 
 fn crash_marker() -> PathBuf {
     std::env::temp_dir().join("loadsmith-sink-crash.marker")
@@ -51,6 +55,8 @@ struct ChaosSink {
     fail_after: Option<u64>,
     /// How many deliveries the outage fails before the target is back.
     fail_count: Option<u64>,
+    /// A failing delivery copies the file before it fails.
+    fail_copies: bool,
 }
 
 #[async_trait]
@@ -74,6 +80,9 @@ impl SinkPlugin for ChaosSink {
             let failed = read_count(&failed_counter());
             if done >= n && self.fail_count.is_none_or(|k| failed < k) {
                 std::fs::write(failed_counter(), (failed + 1).to_string())?;
+                if self.fail_copies {
+                    self.inner.deliver(path).await?;
+                }
                 anyhow::bail!("[local-copy-chaos] simulated target outage: {} deliveries done, failing the rest", done);
             }
             self.inner.deliver(path).await?;
@@ -104,5 +113,7 @@ async fn main() {
     let crash_after = std::env::var(CRASH_AFTER_ENV).ok().and_then(|v| v.parse().ok());
     let fail_after = std::env::var(FAIL_AFTER_ENV).ok().and_then(|v| v.parse().ok());
     let fail_count = std::env::var(FAIL_COUNT_ENV).ok().and_then(|v| v.parse().ok());
-    loadsmith_plugin_sdk::run_sink(ChaosSink { inner: LocalCopyPlugin::new(), crash_after, fail_after, fail_count }).await
+    let fail_copies = std::env::var(FAIL_COPIES_ENV).is_ok_and(|v| v == "1");
+    let sink = ChaosSink { inner: LocalCopyPlugin::new(), crash_after, fail_after, fail_count, fail_copies };
+    loadsmith_plugin_sdk::run_sink(sink).await
 }

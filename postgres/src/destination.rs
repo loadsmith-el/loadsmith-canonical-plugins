@@ -89,7 +89,10 @@ impl PostgresDestConfig {
 pub struct PostgresDestPlugin {
     config: Option<PostgresDestConfig>,
     client: Option<Client>,
-    /// Column names from the first batch — the `COPY`/`MERGE` column list.
+    /// The target table's columns, as the catalog spells them.
+    target_columns: Vec<String>,
+    /// The incoming columns resolved to the target's spelling (first batch) —
+    /// the `COPY`/`MERGE` column list.
     columns: Vec<String>,
     rows_written: u64,
 }
@@ -102,7 +105,7 @@ impl Default for PostgresDestPlugin {
 
 impl PostgresDestPlugin {
     pub fn new() -> Self {
-        Self { config: None, client: None, columns: Vec::new(), rows_written: 0 }
+        Self { config: None, client: None, target_columns: Vec::new(), columns: Vec::new(), rows_written: 0 }
     }
 
     fn cfg(&self) -> Result<&PostgresDestConfig> {
@@ -158,6 +161,14 @@ impl DestinationPlugin for PostgresDestPlugin {
             .await?;
 
         let target = &cfg.target_table;
+        // Incoming names are matched against these (see `resolve_column`).
+        let sql = "SELECT attname::text FROM pg_attribute \
+                   WHERE attrelid = $1::text::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum";
+        let rows = op("SELECT", ns, Some(target), Some(sql), async {
+            client.query(sql, &[target]).await.with_context(|| format!("cannot read the columns of {target}"))
+        })
+        .await?;
+        let target_columns = rows.iter().map(|r| r.get::<_, String>(0)).collect();
         match cfg.mode {
             WriteMode::Append => {}
             // TRUNCATE is transactional in Postgres: readers keep seeing the old
@@ -183,13 +194,20 @@ impl DestinationPlugin for PostgresDestPlugin {
             }
         }
 
+        self.target_columns = target_columns;
         self.client = Some(client);
         Ok(())
     }
 
     async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
         if self.columns.is_empty() {
-            self.columns = batch.schema().fields().iter().map(|f| f.name().clone()).collect();
+            let target = &self.cfg()?.target_table;
+            self.columns = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| resolve_column(f.name(), &self.target_columns, target).map(str::to_string))
+                .collect::<Result<_>>()?;
         }
         if batch.num_rows() == 0 {
             return Ok(());
@@ -222,12 +240,13 @@ impl DestinationPlugin for PostgresDestPlugin {
         let client = self.client()?;
         let ns = cfg.conn.dbname.as_str();
         if cfg.mode == WriteMode::Merge && !self.columns.is_empty() {
-            let merge = build_merge_sql(
-                &cfg.target_table,
-                &self.columns,
-                &cfg.merge_key,
-                cfg.update_columns.as_deref(),
-            )?;
+            // The key and update lists are resolved like the incoming names.
+            let resolve = |names: &[String]| -> Result<Vec<String>> {
+                names.iter().map(|n| resolve_column(n, &self.target_columns, &cfg.target_table).map(str::to_string)).collect()
+            };
+            let merge_key = resolve(&cfg.merge_key)?;
+            let update_columns = cfg.update_columns.as_deref().map(resolve).transpose()?;
+            let merge = build_merge_sql(&cfg.target_table, &self.columns, &merge_key, update_columns.as_deref())?;
             let phase = DbOp::new("MERGE", ns, Some(&cfg.target_table), Some(&merge));
             let span = phase.span().clone();
             let rows = phase.run(async { client.execute(&merge, &[]).await.context("MERGE failed") }).await?;
@@ -243,6 +262,29 @@ impl DestinationPlugin for PostgresDestPlugin {
     async fn cancel(&mut self) {
         if let Some(client) = &self.client {
             let _ = client.batch_execute("ROLLBACK").await;
+        }
+    }
+}
+
+/// The target column a name stands for: the column spelled exactly so, else
+/// the one column equal to it ignoring case — an Oracle source sends
+/// `EVENT_SEQUENCE` for a Postgres `event_sequence`, a Postgres source sends
+/// `id` for a quoted `"ID"`. Two columns equal ignoring case (`"Id"` and
+/// `id`) with neither exact is ambiguous, and fails.
+fn resolve_column<'a>(name: &str, target_columns: &'a [String], target: &str) -> Result<&'a str> {
+    if let Some(c) = target_columns.iter().find(|c| *c == name) {
+        return Ok(c);
+    }
+    let folded = name.to_lowercase();
+    let mut matches = target_columns.iter().filter(|c| c.to_lowercase() == folded);
+    match (matches.next(), matches.next()) {
+        (Some(c), None) => Ok(c),
+        (Some(a), Some(b)) => {
+            bail!("column `{name}` matches both `{a}` and `{b}` of {target} ignoring case; rename it in the source query")
+        }
+        (None, _) => {
+            let names = target_columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+            bail!("column `{name}` is not a column of {target} (its columns are {names})")
         }
     }
 }
@@ -402,6 +444,21 @@ mod tests {
         let cols = strings(&["a", "b"]);
         let sql = build_merge_sql("t", &cols, &cols, None).unwrap();
         assert!(sql.contains("WHEN MATCHED THEN DO NOTHING"));
+    }
+
+    #[test]
+    fn incoming_names_resolve_exactly_then_ignoring_case() {
+        let target = strings(&["event_sequence", "ID", "Mixed", "dup", "DUP"]);
+        let r = |n: &str| resolve_column(n, &target, "t").map(str::to_string);
+        assert_eq!(r("event_sequence").unwrap(), "event_sequence");
+        assert_eq!(r("EVENT_SEQUENCE").unwrap(), "event_sequence");
+        assert_eq!(r("id").unwrap(), "ID");
+        assert_eq!(r("mixed").unwrap(), "Mixed");
+        assert_eq!(r("DUP").unwrap(), "DUP", "an exact spelling wins");
+        let e = r("Dup").unwrap_err().to_string();
+        assert!(e.contains("matches both `dup` and `DUP`"), "{e}");
+        let e = r("nope").unwrap_err().to_string();
+        assert!(e.contains("not a column of t") && e.contains("`event_sequence`"), "{e}");
     }
 
     #[test]

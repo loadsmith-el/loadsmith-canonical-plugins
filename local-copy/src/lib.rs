@@ -1,5 +1,11 @@
 //! The local-copy sink: delivers each finalized object into a local directory.
 //!
+//! **Object names.** Each file lands at `dest` + the `key` template (the same
+//! as the s3 sink's, see [`ObjectKey`]): `{run_date}/{run_id}/{file}` by
+//! default, so every run adds its own files and never replaces an earlier
+//! run's; `key: "{file}"` keeps them flat in `dest`. Within a run the name is
+//! stable, so a re-delivery replaces the same file.
+//!
 //! A library as well as the `loadsmith-sink-local-copy` binary, so the lab's
 //! fault-injection build (`local-copy-chaos`, never released) wraps this exact
 //! delivery code instead of shipping a crash switch in the release binary.
@@ -8,25 +14,39 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{telemetry, SinkPlugin};
+use loadsmith_plugin_sdk::{telemetry, ObjectKey, RunInfo, SinkPlugin};
 use tracing::Span;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct LocalCopyConfig {
-    /// Destination directory, created when missing. Each delivered file is
-    /// copied here under its original file name.
+    /// Destination directory, created when missing.
     dest: PathBuf,
+    /// Where under `dest` each file lands ([`ObjectKey`]): `{file}`
+    /// (required), `{run_id}`, `{run_date}`, `{run_time}`, `{pipeline}`.
+    #[serde(default = "default_key")]
+    key: String,
+}
+
+fn default_key() -> String {
+    ObjectKey::DEFAULT.to_string()
+}
+
+/// A configured sink: the directory, the names, the run they name.
+struct Target {
+    dest: PathBuf,
+    keys: ObjectKey,
+    run: Option<RunInfo>,
 }
 
 pub struct LocalCopyPlugin {
-    dest: Option<PathBuf>,
+    target: Option<Target>,
     delivered: u64,
 }
 
 impl LocalCopyPlugin {
     pub fn new() -> Self {
-        Self { dest: None, delivered: 0 }
+        Self { target: None, delivered: 0 }
     }
 
     /// Objects delivered so far.
@@ -117,14 +137,16 @@ impl SinkPlugin for LocalCopyPlugin {
     }
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
+        let run = config.run().cloned();
         let cfg: LocalCopyConfig = config.parse()?;
         if cfg.dest.as_os_str().is_empty() {
             anyhow::bail!("`dest` is empty");
         }
+        let keys = ObjectKey::parse(None, &cfg.key, run.as_ref())?;
         // Create the destination directory up front so delivery is just a copy.
         std::fs::create_dir_all(&cfg.dest)
             .with_context(|| format!("cannot create dest directory: {}", cfg.dest.display()))?;
-        self.dest = Some(cfg.dest);
+        self.target = Some(Target { dest: cfg.dest, keys, run });
         Ok(())
     }
 
@@ -133,11 +155,21 @@ impl SinkPlugin for LocalCopyPlugin {
     }
 
     async fn deliver(&mut self, path: PathBuf) -> Result<()> {
-        let dest = self.dest.as_ref().context("deliver() before configure()")?;
+        let t = self.target.as_ref().context("deliver() before configure()")?;
         let file_name = path
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("staged path has no file name: {}", path.display()))?;
-        let target = dest.join(file_name);
+        let key = t.keys.render(&file_name.to_string_lossy(), t.run.as_ref())?;
+        let relative = Path::new(&key);
+        if relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            anyhow::bail!("object name {key:?} must stay inside `dest` (no `..`, no absolute path)");
+        }
+        let target = t.dest.join(relative);
+        if let Some(dir) = target.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        let file_name = target.file_name().unwrap_or(file_name).to_os_string();
+        let file_name = file_name.as_os_str();
 
         // Replaces any existing target, so re-delivery after a crash is
         // idempotent — the contract the supervisor relies on for resume.
@@ -170,10 +202,20 @@ mod tests {
         d
     }
 
+    fn run() -> RunInfo {
+        // 2026-10-22T12:00:00Z
+        RunInfo { id: "4242-1792670400000".into(), pipeline: "orders".into(), started_at_unix_ms: 1_792_670_400_000 }
+    }
+
+    /// Flat names (`key: {file}`), as the delivery tests below expect.
     async fn configured(dest: &Path) -> LocalCopyPlugin {
+        with_config(json!({ "dest": dest, "key": "{file}" }), Some(run())).await.unwrap()
+    }
+
+    async fn with_config(cfg: serde_json::Value, run: Option<RunInfo>) -> Result<LocalCopyPlugin> {
         let mut p = LocalCopyPlugin::new();
-        p.configure(PluginConfig::new(json!({ "dest": dest }), UnknownKeys::Error)).await.unwrap();
-        p
+        p.configure(PluginConfig::new(cfg, UnknownKeys::Error).with_run(run)).await?;
+        Ok(p)
     }
 
     fn listing(dir: &Path) -> Vec<String> {
@@ -199,6 +241,46 @@ mod tests {
         assert_eq!(listing(&dst_dir), ["part.0001.parquet"], "no temp file left behind");
         assert_eq!(p.finalize().await.unwrap(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Regression: with flat names, a second incremental run into the same
+    /// `dest` replaced the first run's files (both name theirs `part.0001…`).
+    #[tokio::test]
+    async fn the_default_key_gives_each_run_its_own_prefix() {
+        let tmp = scratch("runs");
+        let src_dir = tmp.join("src");
+        let dst_dir = tmp.join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src_file = src_dir.join("part.0001.parquet");
+        std::fs::write(&src_file, b"run 1").unwrap();
+        let mut p = with_config(json!({ "dest": dst_dir }), Some(run())).await.unwrap();
+        p.deliver(src_file.clone()).await.unwrap();
+
+        std::fs::write(&src_file, b"run 2").unwrap();
+        let second = RunInfo { id: "4343-1792674000000".into(), started_at_unix_ms: 1_792_674_000_000, ..run() };
+        let mut p = with_config(json!({ "dest": dst_dir }), Some(second)).await.unwrap();
+        p.deliver(src_file).await.unwrap();
+
+        let day = dst_dir.join("2026-10-22");
+        assert_eq!(listing(&day), ["4242-1792670400000", "4343-1792674000000"]);
+        assert_eq!(std::fs::read(day.join("4242-1792670400000/part.0001.parquet")).unwrap(), b"run 1");
+        assert_eq!(std::fs::read(day.join("4343-1792674000000/part.0001.parquet")).unwrap(), b"run 2");
+        assert_eq!(listing(&day.join("4242-1792670400000")), ["part.0001.parquet"], "no temp file left behind");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn keys_are_checked_at_configure() {
+        let dest = scratch("keys");
+        let err = |cfg, run| async move { format!("{:#}", with_config(cfg, run).await.err().unwrap()) };
+        assert!(err(json!({ "dest": dest, "key": "{run_id}" }), Some(run())).await.contains("{file}"));
+        assert!(err(json!({ "dest": dest }), None).await.contains("upgrade the engine"));
+        assert!(with_config(json!({ "dest": dest, "key": "{file}" }), None).await.is_ok(), "a flat key needs no run");
+        let mut p = with_config(json!({ "dest": dest, "key": "../{file}" }), None).await.unwrap();
+        let src = dest.join("f");
+        std::fs::write(&src, b"x").unwrap();
+        assert!(p.deliver(src).await.unwrap_err().to_string().contains("inside `dest`"));
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     #[tokio::test]
@@ -238,5 +320,6 @@ mod tests {
         assert!(err(json!({ "dest": "/tmp/x", "dset": 1 })).await.contains("`dset`"));
         let mut p = LocalCopyPlugin::new();
         assert!(p.deliver(PathBuf::from("/x")).await.unwrap_err().to_string().contains("before configure"));
+        assert!(err(json!({ "dest": "/tmp/x", "key": "{nope}" })).await.contains("unknown placeholder"));
     }
 }

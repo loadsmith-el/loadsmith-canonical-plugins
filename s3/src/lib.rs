@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{telemetry, RunInfo, SinkPlugin};
+use loadsmith_plugin_sdk::{telemetry, ObjectKey, RunInfo, SinkPlugin};
 use reqwest::{Client, StatusCode};
 use rusty_s3::actions::S3Action;
 use rusty_s3::{Bucket, Credentials, UrlStyle};
@@ -37,8 +37,6 @@ const MIN_PART_SIZE_MIB: u64 = 5;
 const MAX_PARTS: u64 = 10_000;
 /// How long a presigned request URL stays valid (each request signs anew).
 const SIGNATURE_TTL: Duration = Duration::from_secs(3600);
-/// Default object key template, under `prefix`.
-const DEFAULT_KEY: &str = "{run_date}/{run_id}/{file}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -65,8 +63,9 @@ struct S3Config {
     /// Prepended to every key (`raw/orders` → `raw/orders/<key>`).
     #[serde(default)]
     prefix: Option<String>,
-    /// Object key template: `{file}` (required), `{run_id}`, `{run_date}`
-    /// (`YYYY-MM-DD`, UTC), `{run_time}` (`YYYYMMDDTHHMMSSZ`), `{pipeline}`.
+    /// Object key template ([`ObjectKey`]): `{file}` (required), `{run_id}`,
+    /// `{run_date}` (`YYYY-MM-DD`, UTC), `{run_time}` (`YYYYMMDDTHHMMSSZ`),
+    /// `{pipeline}`.
     #[serde(default = "default_key")]
     key: String,
     /// Default `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
@@ -91,7 +90,7 @@ struct S3Config {
 }
 
 fn default_key() -> String {
-    DEFAULT_KEY.to_string()
+    ObjectKey::DEFAULT.to_string()
 }
 fn default_part_size_mib() -> u64 {
     16
@@ -103,88 +102,11 @@ fn default_max_attempts() -> u32 {
     4
 }
 
-/// One segment of a parsed key template.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Segment {
-    Text(String),
-    File,
-    RunId,
-    RunDate,
-    RunTime,
-    Pipeline,
-}
-
-/// A validated object key template: `prefix/` + `key` with its placeholders.
-#[derive(Debug, Clone)]
-struct KeyTemplate {
-    segments: Vec<Segment>,
-}
-
-impl KeyTemplate {
-    fn parse(prefix: Option<&str>, key: &str) -> Result<Self> {
-        let mut segments = Vec::new();
-        if let Some(p) = prefix.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()) {
-            segments.push(Segment::Text(format!("{p}/")));
-        }
-        let mut rest = key.trim_start_matches('/');
-        while let Some(open) = rest.find('{') {
-            if open > 0 {
-                segments.push(Segment::Text(rest[..open].to_string()));
-            }
-            let close = rest[open..].find('}').map(|c| open + c).with_context(|| format!("`key` {key:?}: unclosed `{{`"))?;
-            segments.push(match &rest[open + 1..close] {
-                "file" => Segment::File,
-                "run_id" => Segment::RunId,
-                "run_date" => Segment::RunDate,
-                "run_time" => Segment::RunTime,
-                "pipeline" => Segment::Pipeline,
-                other => bail!(
-                    "`key` {key:?}: unknown placeholder `{{{other}}}` (known: {{file}}, {{run_id}}, {{run_date}}, {{run_time}}, {{pipeline}})"
-                ),
-            });
-            rest = &rest[close + 1..];
-        }
-        if !rest.is_empty() {
-            segments.push(Segment::Text(rest.to_string()));
-        }
-        if !segments.contains(&Segment::File) {
-            bail!("`key` {key:?} must contain `{{file}}`, or every file of a run lands on the same object");
-        }
-        Ok(Self { segments })
-    }
-
-    /// Whether the template names the run (and so needs `configure.run`).
-    fn needs_run(&self) -> bool {
-        self.segments.iter().any(|s| matches!(s, Segment::RunId | Segment::RunDate | Segment::RunTime | Segment::Pipeline))
-    }
-
-    fn render(&self, file: &str, run: Option<&RunInfo>) -> Result<String> {
-        let run = || run.context("the key names the run, but the core sent no `configure.run`");
-        let started = |fmt: &str| -> Result<String> {
-            let ms = run()?.started_at_unix_ms;
-            let ts = jiff::Timestamp::from_millisecond(ms as i64).with_context(|| format!("run start {ms} out of range"))?;
-            Ok(ts.strftime(fmt).to_string())
-        };
-        let mut key = String::new();
-        for s in &self.segments {
-            match s {
-                Segment::Text(t) => key.push_str(t),
-                Segment::File => key.push_str(file),
-                Segment::RunId => key.push_str(&run()?.id),
-                Segment::Pipeline => key.push_str(&run()?.pipeline),
-                Segment::RunDate => key.push_str(&started("%Y-%m-%d")?),
-                Segment::RunTime => key.push_str(&started("%Y%m%dT%H%M%SZ")?),
-            }
-        }
-        Ok(key)
-    }
-}
-
 /// Everything a configured sink needs to upload.
 struct Target {
     bucket: Bucket,
     credentials: Credentials,
-    keys: KeyTemplate,
+    keys: ObjectKey,
     run: Option<RunInfo>,
     part_size: u64,
     max_attempts: u32,
@@ -250,14 +172,7 @@ impl Target {
         if cfg.max_attempts == 0 {
             bail!("`max_attempts` must be at least 1");
         }
-        let keys = KeyTemplate::parse(cfg.prefix.as_deref(), &cfg.key)?;
-        if keys.needs_run() && run.is_none() {
-            bail!(
-                "`key` {:?} names the run, but this Loadsmith core does not send the run (`configure.run`); \
-                 upgrade the engine, or use a key without {{run_id}}/{{run_date}}/{{run_time}}/{{pipeline}}",
-                cfg.key
-            );
-        }
+        let keys = ObjectKey::parse(cfg.prefix.as_deref(), &cfg.key, run.as_ref())?;
         let region = cfg
             .region
             .clone()
@@ -529,24 +444,6 @@ mod tests {
         });
         v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         v
-    }
-
-    #[test]
-    fn keys_name_the_run() {
-        let t = KeyTemplate::parse(Some("/raw/orders/"), DEFAULT_KEY).unwrap();
-        assert_eq!(t.render("events.parquet", Some(&run())).unwrap(), "raw/orders/2026-10-22/4242-1792670400000/events.parquet");
-        let t = KeyTemplate::parse(None, "{pipeline}/dt={run_date}/{run_time}-{file}").unwrap();
-        assert_eq!(t.render("f.parquet", Some(&run())).unwrap(), "orders/dt=2026-10-22/20261022T120000Z-f.parquet");
-        let t = KeyTemplate::parse(None, "{file}").unwrap();
-        assert!(!t.needs_run());
-        assert_eq!(t.render("f", None).unwrap(), "f");
-    }
-
-    #[test]
-    fn key_templates_are_validated() {
-        assert!(KeyTemplate::parse(None, "{run_id}/x").unwrap_err().to_string().contains("{file}"));
-        assert!(KeyTemplate::parse(None, "{file}/{date}").unwrap_err().to_string().contains("unknown placeholder `{date}`"));
-        assert!(KeyTemplate::parse(None, "{file").unwrap_err().to_string().contains("unclosed"));
     }
 
     #[tokio::test]

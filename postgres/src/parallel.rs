@@ -1,14 +1,27 @@
 //! Partitioned full loads (`parallel:`): `workers` connections read disjoint
-//! page ranges of one table (`ctid`, a TID range scan since PostgreSQL 14),
-//! all in the same snapshot — exported by the source's own transaction
-//! (`pg_export_snapshot()`) and imported by every worker (`SET TRANSACTION
-//! SNAPSHOT`) — so the load is one consistent read. Each worker fetches **and
-//! converts** its rows; the batches leave in whatever order they finish.
+//! partitions of one table, all in the same snapshot — exported by the
+//! source's own transaction (`pg_export_snapshot()`) and imported by every
+//! worker (`SET TRANSACTION SNAPSHOT`) — so the load is one consistent read.
+//! Each worker reads **and converts** its rows; the batches leave in whatever
+//! order they finish.
 //!
-//! The ranges cut the table's pages (`pg_relation_size`) into `8 × workers`
-//! pieces, half-open and open at the end, so every row is read exactly once
-//! (rows on pages added after the count are in the last range). They sit in
-//! one queue, so a worker that finishes early takes the next one.
+//! **Partitions.** By default (`split_by: ctid`) page ranges: the table's
+//! pages (`pg_relation_size`) cut into `8 × workers` pieces, half-open and
+//! open at the end, so every row is read exactly once (rows on pages added
+//! after the count are in the last range; a TID range scan since PostgreSQL
+//! 14). With `split_by: <column>` (an integer column, ideally indexed) ranges
+//! of its values between its minimum and maximum, open at both ends, plus one
+//! partition for its NULLs. They sit in one queue, so a worker that finishes
+//! early takes the next one.
+//!
+//! **Resume.** The source reports the partitions it has fully returned as its
+//! resume token; the core persists the token at the delivered prefix. An
+//! exported snapshot ends with its transaction, so a resumed run cannot read
+//! at the failed run's snapshot: by default it starts over. With
+//! `resume_snapshot: new` (key partitions only) it reads the partitions not
+//! yet done at a new snapshot — the output then mixes two points in time,
+//! which is why page partitions (an UPDATE moves a row to another page, so it
+//! could be read twice or not at all) cannot.
 //!
 //! The core's credit bounds the batches fetched across all workers: a worker
 //! takes a credit before each FETCH and gives it back when the FETCH comes
@@ -18,22 +31,97 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use loadsmith_plugin_sdk::FlowGate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
+use tokio_postgres::{Client, SimpleQueryMessage};
 
 use crate::conn::ConnectionConfig;
+use crate::read::{Reading, RowReader};
+use crate::types::TextRows;
 use crate::telemetry::op;
+use crate::vocab::config_enum;
 
 /// `parallel:` of the source config.
 #[derive(Debug, Deserialize)]
 pub struct ParallelConfig {
     /// Connections reading at once.
     pub workers: usize,
+    /// `ctid` (the default): page ranges. A column of the table: ranges of
+    /// its values (an integer column).
+    #[serde(default)]
+    pub split_by: Option<String>,
+    /// What a resumed run reads at (see the module docs).
+    #[serde(default)]
+    pub resume_snapshot: ResumeSnapshot,
+}
+
+config_enum! {
+    /// The snapshot a resumed partitioned load reads its remaining
+    /// partitions at.
+    #[derive(Default)]
+    pub enum ResumeSnapshot for "resume_snapshot" {
+        /// The failed run's, or none: a Postgres snapshot ends with its
+        /// transaction, so the load starts over.
+        #[default]
+        Same = "same",
+        /// A new one: the partitions not yet done are read at it (key
+        /// partitions only).
+        New = "new",
+    }
+    retired {}
+}
+
+/// How the table is cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Split {
+    Ctid,
+    /// A column, as written in the config (used verbatim in SQL).
+    Key(String),
+}
+
+impl Split {
+    /// The token's name for it.
+    fn name(&self) -> &str {
+        match self {
+            Split::Ctid => "ctid",
+            Split::Key(c) => c,
+        }
+    }
+}
+
+impl ParallelConfig {
+    /// The split, checked: a column must be one identifier (quoted or not),
+    /// and `resume_snapshot: new` needs one.
+    pub fn split(&self) -> Result<Split> {
+        let split = match self.split_by.as_deref().map(str::trim) {
+            None => Split::Ctid,
+            Some(c) if c.eq_ignore_ascii_case("ctid") => Split::Ctid,
+            Some(c) if is_identifier(c) => Split::Key(c.to_string()),
+            Some(c) => bail!("parallel.split_by `{c}` must be `ctid` or one column name"),
+        };
+        if self.resume_snapshot == ResumeSnapshot::New && split == Split::Ctid {
+            bail!(
+                "parallel.resume_snapshot: new needs a key column in `split_by`: with page ranges a row \
+                 updated between the two snapshots can move to another page and be read twice or not at all"
+            );
+        }
+        Ok(split)
+    }
+}
+
+/// One column name: a plain identifier or a double-quoted one.
+fn is_identifier(s: &str) -> bool {
+    match s.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
+        Some(quoted) => !quoted.is_empty() && !quoted.replace("\"\"", "").contains('"'),
+        None => {
+            s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        }
+    }
 }
 
 /// The most workers a load may open.
@@ -106,17 +194,33 @@ impl TableQuery {
         Ok(Self { columns, table_ref: table_ref.to_string(), alias, filter })
     }
 
-    /// The query a worker runs for `range`.
-    pub fn range_query(&self, range: &Range) -> String {
+    /// The query a worker runs for `partition` (of a `Key` split on `key`).
+    pub fn partition_query(&self, partition: &Partition, key: Option<&str>) -> String {
         let alias = self.alias.as_deref().map(|a| format!(" {a}")).unwrap_or_default();
-        let mut conds = vec![format!("ctid >= '({},0)'::tid", range.first_page)];
-        if let Some(end) = range.end_page {
-            conds.push(format!("ctid < '({end},0)'::tid"));
+        let key = key.unwrap_or("ctid");
+        let mut conds = Vec::new();
+        match partition {
+            Partition::Pages { first, end } => {
+                conds.push(format!("ctid >= '({first},0)'::tid"));
+                if let Some(end) = end {
+                    conds.push(format!("ctid < '({end},0)'::tid"));
+                }
+            }
+            Partition::Key { lo, hi } => {
+                if let Some(lo) = lo {
+                    conds.push(format!("{key} >= {lo}"));
+                }
+                if let Some(hi) = hi {
+                    conds.push(format!("{key} < {hi}"));
+                }
+            }
+            Partition::Null => conds.push(format!("{key} IS NULL")),
         }
         if let Some(f) = &self.filter {
             conds.push(format!("({f})"));
         }
-        format!("SELECT {} FROM {}{alias} WHERE {}", self.columns, self.table_ref, conds.join(" AND "))
+        let filter = if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) };
+        format!("SELECT {} FROM {}{alias}{filter}", self.columns, self.table_ref)
     }
 }
 
@@ -174,22 +278,84 @@ fn top_level_words(s: &str) -> Vec<(usize, &str)> {
     words
 }
 
-/// Pages `first_page..end_page` of the table; `None` reaches its end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Range {
-    pub first_page: u64,
-    pub end_page: Option<u64>,
+/// One partition of the table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Partition {
+    /// Pages `first..end` (`None`: to the end of the table).
+    Pages { first: u64, end: Option<u64> },
+    /// Key values `lo <= key < hi` (`None`: unbounded on that side; integer
+    /// text, checked before it becomes SQL).
+    Key { lo: Option<String>, hi: Option<String> },
+    /// The rows whose key is NULL.
+    Null,
 }
 
 /// `pages` cut into `pieces` ranges of about equal pages, the last open.
-pub fn page_ranges(pages: u64, pieces: usize) -> Vec<Range> {
+pub fn page_ranges(pages: u64, pieces: usize) -> Vec<Partition> {
     let pieces = (pieces as u64).min(pages).max(1);
     (0..pieces)
-        .map(|k| Range {
-            first_page: k * pages / pieces,
-            end_page: (k + 1 < pieces).then(|| (k + 1) * pages / pieces),
-        })
+        .map(|k| Partition::Pages { first: k * pages / pieces, end: (k + 1 < pieces).then(|| (k + 1) * pages / pieces) })
         .collect()
+}
+
+/// The key range `[min, max]` cut into `pieces` ranges of about equal width,
+/// open at both ends (values outside it, written meanwhile, are read too),
+/// then the NULLs. An empty table (no minimum) is one unbounded partition.
+pub fn key_ranges(min_max: Option<(i128, i128)>, pieces: usize) -> Vec<Partition> {
+    let Some((min, max)) = min_max else {
+        return vec![Partition::Key { lo: None, hi: None }];
+    };
+    let span = max - min + 1;
+    let mut cuts: Vec<i128> = Vec::new();
+    for k in 1..pieces as i128 {
+        let cut = min + span * k / pieces as i128;
+        if cut > min && cuts.last().is_none_or(|&last| cut > last) {
+            cuts.push(cut);
+        }
+    }
+    let mut edges: Vec<Option<String>> = vec![None];
+    edges.extend(cuts.iter().map(|c| Some(c.to_string())));
+    edges.push(None);
+    let mut parts: Vec<Partition> =
+        edges.windows(2).map(|w| Partition::Key { lo: w[0].clone(), hi: w[1].clone() }).collect();
+    parts.push(Partition::Null);
+    parts
+}
+
+/// What a partitioned load reports as its resume token: how it cut the
+/// table, and the partitions it has fully returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeToken {
+    /// `ctid` or the key column.
+    pub split_by: String,
+    pub partitions: Vec<Partition>,
+    pub done: Vec<usize>,
+}
+
+impl ResumeToken {
+    pub fn new(split: &Split, partitions: &[Partition], done: &std::collections::BTreeSet<usize>) -> Self {
+        Self { split_by: split.name().to_string(), partitions: partitions.to_vec(), done: done.iter().copied().collect() }
+    }
+
+    /// The token for `split`, if `value` is one (the same split, sane ids).
+    pub fn parse(value: serde_json::Value, split: &Split) -> Result<Self> {
+        let token: Self = serde_json::from_value(value).context("not a partitioned load's resume token")?;
+        if token.split_by != split.name() {
+            bail!("the token splits by `{}`, the config by `{}`", token.split_by, split.name());
+        }
+        if let Some(id) = token.done.iter().find(|&&id| id >= token.partitions.len()) {
+            bail!("the token names partition {id} of {}", token.partitions.len());
+        }
+        for p in &token.partitions {
+            if let Partition::Key { lo, hi } = p {
+                if [lo, hi].into_iter().flatten().any(|b| b.parse::<i128>().is_err()) {
+                    bail!("the token's key bounds are not integers");
+                }
+            }
+        }
+        Ok(token)
+    }
 }
 
 /// Opens the snapshot every worker reads in, on the source's own connection:
@@ -214,6 +380,32 @@ pub async fn export_snapshot(client: &Client, q: &TableQuery, namespace: &str) -
     Ok((snapshot, pages))
 }
 
+/// The minimum and maximum of the `key` column over the query's rows, in the
+/// snapshot (the caller's transaction); `None` when there is no value. The
+/// key must be an integer column.
+pub async fn key_min_max(client: &Client, q: &TableQuery, key: &str) -> Result<Option<(i128, i128)>> {
+    let alias = q.alias.as_deref().map(|a| format!(" {a}")).unwrap_or_default();
+    let filter = q.filter.as_deref().map(|f| format!(" WHERE {f}")).unwrap_or_default();
+    let sql = format!("SELECT min({key})::text, max({key})::text FROM {}{alias}{filter}", q.table_ref);
+    let messages = client.simple_query(&sql).await.with_context(|| format!("{sql} failed"))?;
+    let row = messages.into_iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(r) => Some(r),
+        _ => None,
+    });
+    let Some(row) = row else { return Ok(None) };
+    match (row.get(0), row.get(1)) {
+        (Some(lo), Some(hi)) => {
+            let int = |v: &str| {
+                v.parse::<i128>().map_err(|_| {
+                    anyhow::anyhow!("parallel.split_by `{key}` must be an integer column (its minimum is {v:?})")
+                })
+            };
+            Ok(Some((int(lo)?, int(hi)?)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The one value of a one-row query.
 async fn scalar(client: &Client, sql: &str) -> Result<String> {
     let messages = client.simple_query(sql).await.with_context(|| format!("{sql} failed"))?;
@@ -234,9 +426,12 @@ fn quote_literal(s: &str) -> String {
 pub struct Shared {
     pub conn: Arc<ConnectionConfig>,
     pub query: TableQuery,
+    /// The key column of a `Key` split.
+    pub key: Option<String>,
     pub snapshot: String,
-    pub ranges: Mutex<VecDeque<Range>>,
-    pub batch_size: usize,
+    /// The partitions left to read, with their ids.
+    pub partitions: Mutex<VecDeque<(usize, Partition)>>,
+    pub reading: Reading,
     pub schema: Arc<Schema>,
     pub namespace: String,
     /// The DateStyle/bytea pins the source applies to its own session.
@@ -245,10 +440,17 @@ pub struct Shared {
     pub started: AtomicU64,
 }
 
+/// What a worker hands the source: a batch, or the end of a partition (sent
+/// after its last batch, so every batch of a partition is ahead of it).
+pub enum Item {
+    Batch(RecordBatch),
+    Done(usize),
+}
+
 /// Starts `workers` tasks; their batches arrive on the returned channel, which
 /// closes once every worker is done. A worker's first error ends it (the source
 /// then fails the run, which stops the others).
-pub fn spawn_workers(shared: Arc<Shared>, workers: usize, gate: FlowGate) -> mpsc::Receiver<Result<RecordBatch>> {
+pub fn spawn_workers(shared: Arc<Shared>, workers: usize, gate: FlowGate) -> mpsc::Receiver<Result<Item>> {
     let (tx, rx) = mpsc::channel(workers);
     for _ in 0..workers {
         let (shared, gate, tx) = (shared.clone(), gate.clone(), tx.clone());
@@ -261,10 +463,10 @@ pub fn spawn_workers(shared: Arc<Shared>, workers: usize, gate: FlowGate) -> mps
     rx
 }
 
-/// One worker: its own connection in the shared snapshot; ranges from the
-/// queue until it is empty.
-async fn work(shared: &Shared, mut gate: FlowGate, tx: &mpsc::Sender<Result<RecordBatch>>) -> Result<()> {
-    let client = crate::conn::connect(&shared.conn).await?;
+/// One worker: its own connection in the shared snapshot; partitions from
+/// the queue until it is empty.
+async fn work(shared: &Shared, mut gate: FlowGate, tx: &mpsc::Sender<Result<Item>>) -> Result<()> {
+    let client = Arc::new(crate::conn::connect(&shared.conn).await?);
     let ns = shared.namespace.as_str();
     let setup = format!(
         "{}; BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT {}",
@@ -273,38 +475,29 @@ async fn work(shared: &Shared, mut gate: FlowGate, tx: &mpsc::Sender<Result<Reco
     );
     op("BEGIN", ns, None, Some(&setup), async { client.batch_execute(&setup).await.context("joining the snapshot") })
         .await?;
-    let fetch_sql = format!("FETCH FORWARD {} FROM ls_part", shared.batch_size);
     loop {
-        let Some(range) = shared.ranges.lock().map_err(|_| anyhow::anyhow!("range queue poisoned"))?.pop_front() else {
+        let next = shared.partitions.lock().map_err(|_| anyhow::anyhow!("partition queue poisoned"))?.pop_front();
+        let Some((id, partition)) = next else {
             return Ok(());
         };
-        let declare = format!("DECLARE ls_part NO SCROLL CURSOR FOR {}", shared.query.range_query(&range));
-        op("DECLARE", ns, None, Some(&declare), async { client.batch_execute(&declare).await.context("DECLARE failed") })
-            .await?;
+        let query = shared.query.partition_query(&partition, shared.key.as_deref());
+        let mut reader = RowReader::open(client.clone(), &shared.reading, &query, "ls_part", Some(&query)).await?;
         loop {
             take_credit(shared, &mut gate).await;
-            let messages = op("FETCH", ns, None, Some(&fetch_sql), async {
-                client.simple_query(&fetch_sql).await.context("FETCH failed")
-            })
-            .await?;
-            let rows: Vec<SimpleQueryRow> = messages
-                .into_iter()
-                .filter_map(|m| match m {
-                    SimpleQueryMessage::Row(r) => Some(r),
-                    _ => None,
-                })
-                .collect();
+            let rows = reader.next().await?;
             if rows.is_empty() {
-                // The end of this range: the credit is not used.
+                // The end of this partition: the credit is not used.
                 shared.started.fetch_sub(1, Ordering::AcqRel);
                 break;
             }
             let batch = crate::types::rows_to_batch_text(&rows, &shared.schema).context("RecordBatch build failed")?;
-            if tx.send(Ok(batch)).await.is_err() {
+            if tx.send(Ok(Item::Batch(batch))).await.is_err() {
                 return Ok(()); // the source is gone
             }
         }
-        client.batch_execute("CLOSE ls_part").await.context("CLOSE failed")?;
+        if tx.send(Ok(Item::Done(id))).await.is_err() {
+            return Ok(());
+        }
     }
 }
 
@@ -358,29 +551,77 @@ mod tests {
     }
 
     #[test]
-    fn the_range_query_scans_its_pages() {
+    fn the_partition_query_scans_its_pages_or_keys() {
         let q = TableQuery::parse("SELECT * FROM public.events e WHERE e.kind = 'x'").unwrap();
         assert_eq!(
-            q.range_query(&Range { first_page: 10, end_page: Some(20) }),
+            q.partition_query(&Partition::Pages { first: 10, end: Some(20) }, None),
             "SELECT * FROM public.events e WHERE ctid >= '(10,0)'::tid AND ctid < '(20,0)'::tid AND (e.kind = 'x')"
         );
         let q = TableQuery::parse("SELECT * FROM t").unwrap();
-        assert_eq!(q.range_query(&Range { first_page: 7, end_page: None }), "SELECT * FROM t WHERE ctid >= '(7,0)'::tid");
+        assert_eq!(q.partition_query(&Partition::Pages { first: 7, end: None }, None), "SELECT * FROM t WHERE ctid >= '(7,0)'::tid");
+        let key = Some("id");
+        assert_eq!(
+            q.partition_query(&Partition::Key { lo: Some("10".into()), hi: Some("20".into()) }, key),
+            "SELECT * FROM t WHERE id >= 10 AND id < 20"
+        );
+        assert_eq!(q.partition_query(&Partition::Key { lo: None, hi: Some("5".into()) }, key), "SELECT * FROM t WHERE id < 5");
+        assert_eq!(q.partition_query(&Partition::Key { lo: None, hi: None }, key), "SELECT * FROM t");
+        assert_eq!(q.partition_query(&Partition::Null, key), "SELECT * FROM t WHERE id IS NULL");
     }
 
     #[test]
     fn pages_are_cut_evenly_and_the_last_range_is_open() {
-        let r = page_ranges(100, 4);
-        assert_eq!(
-            r,
-            [
-                Range { first_page: 0, end_page: Some(25) },
-                Range { first_page: 25, end_page: Some(50) },
-                Range { first_page: 50, end_page: Some(75) },
-                Range { first_page: 75, end_page: None },
-            ]
-        );
+        let pages = |first, end| Partition::Pages { first, end };
+        assert_eq!(page_ranges(100, 4), [pages(0, Some(25)), pages(25, Some(50)), pages(50, Some(75)), pages(75, None)]);
         assert_eq!(page_ranges(2, 8).len(), 2, "no more ranges than pages");
-        assert_eq!(page_ranges(0, 8), [Range { first_page: 0, end_page: None }], "an empty table: one open range");
+        assert_eq!(page_ranges(0, 8), [pages(0, None)], "an empty table: one open range");
+    }
+
+    #[test]
+    fn keys_are_cut_evenly_open_at_both_ends_with_the_nulls_last() {
+        let key = |lo: Option<i32>, hi: Option<i32>| Partition::Key { lo: lo.map(|v| v.to_string()), hi: hi.map(|v| v.to_string()) };
+        assert_eq!(
+            key_ranges(Some((1, 100)), 4),
+            [key(None, Some(26)), key(Some(26), Some(51)), key(Some(51), Some(76)), key(Some(76), None), Partition::Null]
+        );
+        assert_eq!(key_ranges(Some((-5, -5)), 4), [key(None, None), Partition::Null], "one value: one range");
+        assert_eq!(key_ranges(Some((0, 2)), 8), [key(None, Some(1)), key(Some(1), Some(2)), key(Some(2), None), Partition::Null]);
+        assert_eq!(key_ranges(None, 4), [key(None, None)], "no value at all: read everything as one");
+    }
+
+    #[test]
+    fn split_by_is_checked() {
+        let cfg = |split: Option<&str>, snap: &str| -> Result<Split> {
+            let mut v = serde_json::json!({ "workers": 4, "resume_snapshot": snap });
+            if let Some(s) = split {
+                v["split_by"] = s.into();
+            }
+            serde_json::from_value::<ParallelConfig>(v).unwrap().split()
+        };
+        assert_eq!(cfg(None, "same").unwrap(), Split::Ctid);
+        assert_eq!(cfg(Some("CTID"), "same").unwrap(), Split::Ctid);
+        assert_eq!(cfg(Some("event_id"), "new").unwrap(), Split::Key("event_id".into()));
+        assert_eq!(cfg(Some("\"Event Id\""), "new").unwrap(), Split::Key("\"Event Id\"".into()));
+        assert!(cfg(Some("id; DROP TABLE t"), "same").is_err());
+        assert!(cfg(Some("a + b"), "same").is_err());
+        let e = cfg(None, "new").unwrap_err().to_string();
+        assert!(e.contains("needs a key column"), "{e}");
+    }
+
+    #[test]
+    fn tokens_roundtrip_and_are_checked() {
+        let split = Split::Key("id".into());
+        let parts = key_ranges(Some((1, 100)), 2);
+        let done = [0usize, 2].into_iter().collect();
+        let token = serde_json::to_value(ResumeToken::new(&split, &parts, &done)).unwrap();
+        let back = ResumeToken::parse(token.clone(), &split).unwrap();
+        assert_eq!((back.partitions, back.done), (parts, vec![0, 2]));
+        assert!(ResumeToken::parse(token.clone(), &Split::Ctid).is_err(), "another split");
+        let mut bad = token.clone();
+        bad["done"] = serde_json::json!([9]);
+        assert!(ResumeToken::parse(bad, &split).is_err());
+        let mut bad = token;
+        bad["partitions"][0]["hi"] = "1; DROP TABLE t".into();
+        assert!(ResumeToken::parse(bad, &split).is_err(), "bounds become SQL: integers only");
     }
 }

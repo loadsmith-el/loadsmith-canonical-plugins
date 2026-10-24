@@ -39,19 +39,27 @@ rejected with the valid values (`read_only` → "did you mean `read-only`?").
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `query` | string | — | Any valid `SELECT` — joins, CTEs, window functions. |
-| `batch_size` | integer | `1000` | Rows per `FETCH FORWARD n`. |
+| `batch_size` | integer | `1000` | Rows per Arrow batch (per `FETCH FORWARD n` with `fetch: cursor`). |
+| `fetch` | `copy` / `cursor` | `copy` | How rows are read (below): `COPY (<query>) TO STDOUT`, or a cursor (`DECLARE` + `FETCH`) for servers without `COPY … TO STDOUT` (Redshift, some proxies). |
 | `transaction_isolation` | `read-committed` / `repeatable-read` / `serializable` | server default (`BEGIN`; normally `read-committed`) | Isolation for the cursor transaction. `repeatable-read` gives a consistent snapshot across all `FETCH`es. |
 | `incremental` | object | — | Activates incremental reads (below). Requires a pipeline `state:` block. |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `timestamp`/`timestamptz` columns (and arrays of them). The default is the same in every canonical plugin and truncates below the millisecond; **`us` keeps Postgres' full precision**. `ns` is the µs value × 1000 and only covers the years 1677–2262 (a value outside fails the batch). |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMERIC` **without a declared precision** (a bare `numeric` column, `sum(x)`, …), emitted as `Decimal128(38, number_scale)`; see the type table. |
-| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint page ranges of the query's table in one snapshot. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
+| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint partitions of the query's table in one snapshot. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
 
-The query runs through a server-side cursor (`DECLARE … CURSOR FOR`) in a
-transaction, streamed in `batch_size` chunks, so large results never buffer
-fully in memory. The next `FETCH` runs while the last chunk is converted to
-Arrow, as far ahead as the engine's flow control allows
+The query runs in a transaction and streams in `batch_size` chunks, so large
+results never buffer fully in memory. By default it is read with `COPY
+(<query>) TO STDOUT` (text format): the rows come as tab-separated lines, with
+no per-value length and no round trip per chunk. On the bench's 34-column
+table that is 429 MiB per million rows where a cursor's `FETCH` moves 525 MiB
+(the binary protocol would move ~495 MiB), which is the run's time on a link
+to a distant database. `fetch: cursor` reads through a server-side cursor
+(`DECLARE … CURSOR FOR` + `FETCH FORWARD`) instead. Either way the next chunk
+is read while the last one is converted to Arrow, as far ahead as the engine's
+flow control allows
 ([`pipeline.flow`](https://loadsmith-el.github.io/loadsmith/reference/pipeline-yaml.html#pipelineflow);
-one chunk with an engine older than 1.1).
+one chunk with an engine older than 1.1), and the values are parsed from the
+same text format.
 
 ### Partitioned reads (`parallel`)
 
@@ -64,6 +72,8 @@ source:
     batch_size: 10000
     parallel:
       workers: 8
+      split_by: id              # optional: ctid (default) or an integer column
+      resume_snapshot: new      # optional: same (default) or new; see Resume
 ```
 
 A full load of one large table, read by `workers` connections at once
@@ -77,10 +87,14 @@ A full load of one large table, read by `workers` connections at once
   exports its snapshot (`pg_export_snapshot()`); every worker imports it (`SET
   TRANSACTION SNAPSHOT`), so all of them see the same data even while the table
   changes. `transaction_isolation` does not apply.
-- **The split.** The table's pages (`pg_relation_size`) are cut into
-  `8 × workers` ranges of about equal pages, read with `ctid` conditions (a TID
-  range scan: each worker reads only its pages). The ranges are half-open and
-  the last one is open, so every row is read exactly once.
+- **The split** (`split_by`). By default (`ctid`) the table's pages
+  (`pg_relation_size`) are cut into `8 × workers` ranges of about equal pages,
+  read with `ctid` conditions (a TID range scan: each worker reads only its
+  pages); the ranges are half-open and the last one is open. With an integer
+  column (`split_by: id`; ideally indexed), the range between its minimum and
+  maximum in the snapshot is cut into `8 × workers` ranges of about equal
+  width, open at both ends, plus one partition for its `NULL`s. Either way
+  every row is read exactly once.
 - **Each worker fetches and converts** its rows, so the conversion runs in
   parallel too. Batches leave in the order workers finish them, not in table
   order.
@@ -89,6 +103,20 @@ A full load of one large table, read by `workers` connections at once
 
 Measured on 5M rows (34 columns, the `null` destination, one machine): one
 connection 7.1 s, 4 workers 4.3 s, 8 workers 3.3 s.
+
+**Resume** (with a `state:` block and engine 1.3+). The source reports the
+partitions it has fully read as its resume token, and the engine keeps the
+last one whose rows reached the target. When the run fails, the next run
+continues it — but the failed run's snapshot ended with its transaction:
+
+- by default (`resume_snapshot: same`) the load **starts over**, under the
+  failed run's id; its files replace the failed run's;
+- with `resume_snapshot: new` (key `split_by` only) it reads **only the
+  partitions not finished**, at a new snapshot. The output then mixes two
+  points in time, and the rows of a partition that was in progress when the
+  run failed are read again (at-least-once). Page partitions cannot: an
+  `UPDATE` between the two snapshots can move a row to another page, where it
+  would be read twice or not at all.
 
 ### `incremental`
 
@@ -234,6 +262,12 @@ microseconds. Any other type (struct, map, …) fails the load.
 |---|---|---|---|
 | connection fields | — | yes (host/port default `localhost`/`5432`) | The shared connection block above, including `tls`. |
 | `target_table` | string | yes | Destination table, optionally schema-qualified (`public.events`). Used verbatim in SQL, so quote mixed-case names yourself (`'"MyTable"'`). Must already exist. |
+
+Each incoming column goes to the target column spelled the same, or else to
+the one column whose name differs only in case: an Oracle source's
+`EVENT_SEQUENCE` loads `event_sequence`. A name matching two columns ignoring
+case (`"Id"` and `id`), or none, fails at the first batch with the target's
+columns listed. `merge_key` and `update_columns` are matched the same way.
 | `mode` | `append` / `overwrite` / `merge` | no (default `append`) | How the load changes the table (below). |
 | `merge_key` | list of strings | for `merge` | The key columns the `MERGE` matches on (the table's PK / natural key). Only valid with `mode: merge`. |
 | `update_columns` | list of strings | no | `merge` only: the columns a matched row updates. Default: every incoming column that isn't a key. `[]` inserts new keys and leaves existing rows alone. |

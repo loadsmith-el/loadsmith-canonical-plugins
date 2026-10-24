@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-sink-s3"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license.workspace = true
 
@@ -38,7 +38,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "http2",
     "rustls-tls-webpki-roots-no-provider",
 ] }
-jiff = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 httpmock = "0.7"

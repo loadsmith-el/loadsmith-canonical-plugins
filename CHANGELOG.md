@@ -4,6 +4,69 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-24 — continuing failed runs, COPY reads
+
+The plugins move to the SDK of engine 1.3 (commit `3a10004`: resume tokens,
+`ObjectKey`).
+
+### postgres 0.7.0
+
+- **Reads with `COPY (<query>) TO STDOUT` by default** (`fetch: copy`): rows
+  arrive as tab-separated text, with no per-value length and no round trip
+  per batch. 429 MiB per million rows of the bench's 34-column table, where a
+  cursor moves 525 MiB (the binary protocol would move ~495 MiB). Same values,
+  parsed by the same decoder. `fetch: cursor` keeps the `DECLARE`/`FETCH` read,
+  for servers without `COPY … TO STDOUT`.
+- **`parallel.split_by: <column>`**: partitions by ranges of an integer key
+  (open at both ends, plus its NULLs) instead of page ranges.
+- **A partitioned full load reports the partitions it finished** (resume
+  token). Engine 1.3 continues a failed run with it: by default the load
+  starts over (the snapshot ended with its transaction), replacing the failed
+  run's files; with `parallel.resume_snapshot: new` and a key `split_by` it
+  reads only the partitions not finished, at a new snapshot.
+- **Destination: incoming columns match the target ignoring case** when no
+  column is spelled exactly the same, so an Oracle source's `EVENT_SEQUENCE`
+  loads `event_sequence` (before, the quoted upper-case name failed the
+  `COPY`). `merge_key`/`update_columns` match the same way; an ambiguous or
+  unknown name fails at the first batch, listing the target's columns.
+
+### oracle 0.8.0
+
+- **`parallel.split_by: <column>`**: partitions by ranges of an integer key
+  instead of ROWID ranges.
+- **A partitioned full load reports its SCN and the partitions it finished**
+  (resume token). Engine 1.3 continues a failed run at the same SCN, reading
+  only the partitions not finished, while the undo reaches back to it;
+  otherwise the load starts over, or with `parallel.resume_snapshot: new` and
+  a key `split_by` reads the remaining partitions at a new SCN.
+- **Fix: a partitioned load no longer reads a mid-sized table whole to cut
+  it.** `SAMPLE BLOCK (1)` samples whole multiblock reads, so on a table of
+  ~50,000 blocks it came back empty about half the time, and the source then
+  read every ROWID of the table to find its extent (3.6 s on 1M rows): the
+  same load took 2 or 5.6 s by the luck of the sample. The sample now grows
+  (1%, 5%, 25%) before the table is read whole.
+- **Fix: a partitioned load could miss the last seconds of commits — a table
+  loaded just before it read as empty, and succeeded.** The snapshot SCN came
+  from `TIMESTAMP_TO_SCN(SYSTIMESTAMP)`, which the database maps in steps of
+  about 3 seconds (from an older entry right after a restart): commits made
+  just before the run were after it (the lab's freshly loaded table: 0 of
+  60,000 rows, status success). That SCN is now only the start of a search:
+  an `AS OF SCN` read of the table fails (ORA-08181) past the current SCN, so
+  a few probes of a millisecond find the current one, with no privilege.
+
+### local-copy 0.3.0
+
+- **`key`: the s3 sink's object-name template**, default
+  `{run_date}/{run_id}/{file}`: each run's files land in their own directory.
+  Before, every file kept its flat name in `dest`, so a later incremental run
+  replaced an earlier run's files of the same name. `key: "{file}"` restores
+  the flat layout.
+
+### s3 0.1.2
+
+- The `key` template comes from the SDK (`ObjectKey`), shared with
+  `local-copy`. No change in behavior.
+
 ## 2026-10-23 — parallel Parquet encoding
 
 ### parquet 0.4.0

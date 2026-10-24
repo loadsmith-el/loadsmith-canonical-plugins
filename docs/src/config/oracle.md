@@ -40,7 +40,7 @@ ignored, as with every thin driver.)
 | `batch_size` | integer | `1000` | Rows per Arrow batch. |
 | `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. `cursor_column` must be one of the query's columns (a plain name folds to upper case, like unquoted SQL); any other name fails at startup. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `DATE`/`TIMESTAMP` columns. The default is the same in every canonical plugin and truncates below the millisecond; **`ns` keeps `TIMESTAMP(9)` whole** (years 1677–2262 only), `us` covers the default `TIMESTAMP(6)`. |
-| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint ROWID ranges of the query's table at one SCN. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
+| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint ROWID (or key) ranges of the query's table at one SCN. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMBER` **without a declared precision** (a bare `NUMBER` column, `SUM(x)`, `COUNT(*)`, …), emitted as `Decimal128(38, number_scale)`. A value with more decimal places (or more than 38 digits) fails the run, naming the column — nothing is rounded. Declare the type in the query instead (`CAST(x AS NUMBER(19))`) for an exact integer or decimal. |
 
 | Oracle type | Arrow type | Notes |
@@ -100,6 +100,8 @@ source:
     batch_size: 10000
     parallel:
       workers: 8
+      split_by: order_id        # optional: rowid (default) or an integer column
+      resume_snapshot: new      # optional: same (default) or new; see Resume
 ```
 
 A full load of one large table, read by `workers` connections at once:
@@ -110,15 +112,20 @@ A full load of one large table, read by `workers` connections at once:
   Wrap other shapes in a view only if you don't need `parallel`: a view can't
   be split.
 - **One snapshot.** Every worker reads `AS OF SCN` the same SCN, taken when the
-  load starts (`TIMESTAMP_TO_SCN(SYSTIMESTAMP)`, exact to a few seconds back),
-  so the load is consistent even while the table changes. The database's undo
-  retention must cover the load's duration (`ORA-01555` otherwise).
-- **The split.** A block sample (`SAMPLE BLOCK`, 1% of the table's blocks) gives
-  the extent of the table's segments; the blocks are cut into `8 × workers`
-  ROWID ranges of about equal size, and each worker takes the next range from
-  a shared queue. The ranges are half-open and open at both ends, so every row
+  load starts (the current SCN, found without privileges: probes of the table
+  `AS OF SCN`, from `TIMESTAMP_TO_SCN(SYSTIMESTAMP)` up), so the load is
+  consistent even while the table changes. The database's undo retention must
+  cover the load's duration (`ORA-01555` otherwise).
+- **The split.** A block sample (`SAMPLE BLOCK`, 1% of the table's blocks;
+  5% and 25% when that spans too few) gives the extent of the table's
+  segments; the blocks are cut into `8 × workers` ROWID ranges of about equal
+  size, and each worker takes the next range from a shared queue. The ranges are half-open and open at both ends, so every row
   is read exactly once whatever the sample. Only `SELECT` on the table is
-  needed (no `DBA_*` view, no `DBMS_PARALLEL_EXECUTE`, nothing written).
+  needed (no `DBA_*` view, no `DBMS_PARALLEL_EXECUTE`, nothing written). With
+  `split_by: <column>` (an integer column; ideally indexed) the ranges are of
+  its values instead: its minimum to maximum at the SCN cut into
+  `8 × workers` ranges of about equal width, open at both ends, plus one
+  partition for its `NULL`s.
 - **Each worker fetches and converts** its rows on its own thread, so the
   conversion runs in parallel too. Batches leave in the order workers finish
   them, not in table order.
@@ -127,6 +134,22 @@ A full load of one large table, read by `workers` connections at once:
 
 Measured on 5M rows (34 columns, the `null` destination, one machine): one
 connection 11.8 s, 4 workers 6.1 s, 8 workers 4.9 s.
+
+**Resume** (with a `state:` block and engine 1.3+). The source reports its SCN
+and the partitions it has fully read as its resume token, and the engine keeps
+the last one whose rows reached the target. When the run fails, the next run
+continues it **at the same SCN**, reading only the partitions not finished —
+one consistent snapshot, as if the run had never failed — as long as the undo
+still reaches back to that SCN (checked before it starts). The rows of a
+partition that was in progress when the run failed are read again
+(at-least-once). When the SCN is out of reach:
+
+- by default (`resume_snapshot: same`) the load **starts over**, under the
+  failed run's id; its files replace the failed run's;
+- with `resume_snapshot: new` (key `split_by` only) it reads the partitions not
+  finished at a new SCN; the output then mixes two points in time. ROWID
+  partitions cannot: a row moved between the two (a reorganized table) could
+  be read twice or not at all.
 
 ## Destination
 

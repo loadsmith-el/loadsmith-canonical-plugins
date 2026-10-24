@@ -2,15 +2,18 @@ use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{FlowGate, SourcePlugin, TieSafeCursor};
+use loadsmith_plugin_sdk::{FlowGate, Resumption, SourcePlugin, TieSafeCursor};
 use crate::conn::ConnectionConfig;
-use crate::parallel::{ParallelConfig, TableQuery};
-use crate::telemetry::{op, DbOp};
+use crate::parallel::{Item, ParallelConfig, Partition, ResumeSnapshot, ResumeToken, Split, TableQuery};
+use crate::read::{Fetch, Reading, RowReader, Rows};
+use crate::telemetry::op;
+use crate::types::TextRows;
 use crate::vocab::{config_enum, TimestampUnit};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_postgres::{Client, SimpleQueryRow};
+use tokio_postgres::Client;
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
@@ -47,6 +50,11 @@ struct PostgresConfig {
     query: String,
     #[serde(default = "default_batch_size")]
     batch_size: usize,
+
+    /// How rows are read: `copy` (the default) or `cursor` (see
+    /// [`crate::read`]).
+    #[serde(default)]
+    fetch: Fetch,
 
     /// Isolation level for the cursor transaction — source-specific (the
     /// destination opens its own transaction), so it stays here.
@@ -88,9 +96,23 @@ const CANCEL_ROLLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
-/// What the fetch task hands to `next_batch`: one FETCH's rows (empty at the
-/// end of the cursor), or the error that stopped it.
-type Fetched = Result<Vec<SimpleQueryRow>>;
+/// What the fetch task hands to `next_batch`: one batch of rows (empty at
+/// the end of the query), or the error that stopped it.
+type Fetched = Result<Rows>;
+
+/// A partitioned load: how it reads, and how far it got.
+struct Partitioned {
+    query: TableQuery,
+    workers: usize,
+    split: Split,
+    resume_snapshot: ResumeSnapshot,
+    /// Every partition of the load (empty until the workers start).
+    partitions: Vec<Partition>,
+    /// The partitions whose every batch `next_batch` has returned.
+    done: BTreeSet<usize>,
+    /// The failed run's token, when this run continues it.
+    resumed: Option<ResumeToken>,
+}
 
 pub struct PostgresSourcePlugin {
     client: Option<Arc<Client>>,
@@ -102,11 +124,14 @@ pub struct PostgresSourcePlugin {
     /// The fetch task's rows, one FETCH per message; started on the first batch.
     fetched: Option<mpsc::Receiver<Fetched>>,
     fetcher: Option<tokio::task::JoinHandle<()>>,
-    /// A partitioned load: the table query and the worker count, the
-    /// connection config the workers connect with, and their batches.
-    partitioned: Option<(TableQuery, usize)>,
+    /// A partitioned load, the connection config the workers connect with,
+    /// and their batches.
+    partitioned: Option<Partitioned>,
     conn_cfg: Option<Arc<ConnectionConfig>>,
-    partition_batches: Option<mpsc::Receiver<Result<RecordBatch>>>,
+    partition_batches: Option<mpsc::Receiver<Result<Item>>>,
+    fetch: Fetch,
+    /// The incremental cursor's column index.
+    cursor_index: Option<usize>,
 
     // ── Incremental state ──────────────────────────────────────────────────
     /// The user query, declared into the cursor lazily (after `resume_from`).
@@ -147,6 +172,8 @@ impl PostgresSourcePlugin {
             partitioned: None,
             conn_cfg: None,
             partition_batches: None,
+            fetch: Fetch::Copy,
+            cursor_index: None,
             query: String::new(),
             begin_sql: "BEGIN".to_string(),
             cursor_column: None,
@@ -158,7 +185,7 @@ impl PostgresSourcePlugin {
         }
     }
 
-    /// Builds the query declared into the cursor. For a plain (non-incremental)
+    /// Builds the query the source reads. For a plain (non-incremental)
     /// source this is the user query verbatim. For an incremental source it
     /// wraps the user query in a subquery, filtering `> watermark` and ordering
     /// by the cursor so the last row seen is the new high watermark.
@@ -191,80 +218,127 @@ impl PostgresSourcePlugin {
         }
     }
 
-    /// Opens the transaction + cursor on first use. Deferred out of `configure`
-    /// so the resume watermark (delivered after configure, via `resume_from`) is
-    /// folded into the query.
+    /// Opens the transaction on first use. Deferred out of `configure` so the
+    /// resume watermark (delivered after configure, via `resume_from`) is
+    /// folded into the query the fetch task reads.
     async fn ensure_cursor(&mut self) -> Result<()> {
         if self.cursor_declared {
             return Ok(());
         }
-        let query = self.cursor_query();
         let client = self.client.as_ref().context("postgres source: not configured")?;
         let ns = self.namespace.as_str();
         let begin = self.begin_sql.as_str();
         op("BEGIN", ns, None, Some(begin), async { client.batch_execute(begin).await.context("BEGIN failed") }).await?;
-        let text = loadsmith_plugin_sdk::telemetry::enabled()
-            .then(|| format!("DECLARE ls_cursor NO SCROLL CURSOR FOR ({})", self.cursor_query_with(true)));
-        op("DECLARE", ns, None, text.as_deref(), async {
-            client
-                .execute(&format!("DECLARE ls_cursor NO SCROLL CURSOR FOR ({query})"), &[])
-                .await
-                .context("DECLARE cursor failed")
-        })
-        .await?;
         self.cursor_declared = true;
         Ok(())
     }
 
-    /// Starts the fetch task, which FETCHes the next batches while
-    /// `next_batch` converts the last one: the database and the conversion
-    /// overlap instead of taking turns.
+    /// How this source reads its queries.
+    fn reading(&self) -> Result<Reading> {
+        Ok(Reading {
+            fetch: self.fetch,
+            batch_size: self.batch_size,
+            columns: self.schema.as_ref().context("postgres source: not configured")?.fields().len(),
+            namespace: self.namespace.clone(),
+        })
+    }
+
+    /// Starts the fetch task, which reads the next batches while `next_batch`
+    /// converts the last one: the database and the conversion overlap
+    /// instead of taking turns.
     fn start_fetching(&mut self) -> Result<()> {
         let client = self.client.clone().context("postgres source: not configured")?;
-        // One FETCH waits in the channel at most; the gate bounds the rest.
+        let read = Read {
+            how: self.reading()?,
+            query: self.cursor_query(),
+            // The statement text telemetry records (never a value).
+            text: loadsmith_plugin_sdk::telemetry::enabled().then(|| self.cursor_query_with(true)),
+        };
+        // One batch waits in the channel at most; the gate bounds the rest.
         let (tx, rx) = mpsc::channel(1);
-        let task = fetch_ahead(client, self.gate.clone(), self.batch_size, self.namespace.clone(), tx);
+        let task = fetch_ahead(client, self.gate.clone(), read, tx);
         self.fetcher = Some(tokio::spawn(tracing::Instrument::in_current_span(task)));
         self.fetched = Some(rx);
         Ok(())
     }
 
     /// A partitioned load: starts the workers on the first call, then hands
-    /// on their batches as they come; `None` once every worker is done (and
-    /// the snapshot's transaction is closed).
+    /// on their batches as they come, noting each partition they finish;
+    /// `None` once every worker is done (and the snapshot's transaction is
+    /// closed).
     async fn next_partitioned(&mut self) -> Result<Option<RecordBatch>> {
         if self.partition_batches.is_none() {
             self.start_partitions().await?;
         }
-        let rx = self.partition_batches.as_mut().context("no partition workers")?;
-        match rx.recv().await {
-            Some(batch) => Ok(Some(batch?)),
-            None => {
-                self.exhausted = true;
-                self.partition_batches = None;
-                if let Some(client) = &self.client {
-                    let _ = client.batch_execute("COMMIT").await;
+        loop {
+            let rx = self.partition_batches.as_mut().context("no partition workers")?;
+            match rx.recv().await {
+                Some(item) => match item? {
+                    Item::Batch(batch) => return Ok(Some(batch)),
+                    Item::Done(id) => {
+                        if let Some(p) = self.partitioned.as_mut() {
+                            p.done.insert(id);
+                        }
+                    }
+                },
+                None => {
+                    self.exhausted = true;
+                    self.partition_batches = None;
+                    if let Some(client) = &self.client {
+                        let _ = client.batch_execute("COMMIT").await;
+                    }
+                    return Ok(None);
                 }
-                Ok(None)
             }
         }
     }
 
-    /// Exports the snapshot (and counts the table's pages) on the source's
-    /// connection, then starts the workers in it.
+    /// Exports the snapshot on the source's connection, cuts the table (or
+    /// takes the failed run's partitions, when continuing it), then starts
+    /// the workers in the snapshot on the partitions not yet done.
     async fn start_partitions(&mut self) -> Result<()> {
-        let (query, workers) = self.partitioned.clone().context("not partitioned")?;
         let client = self.client.as_ref().context("postgres source: not configured")?;
+        let plan = self.partitioned.as_mut().context("not partitioned")?;
+        let (query, workers) = (plan.query.clone(), plan.workers);
         let (snapshot, pages) = crate::parallel::export_snapshot(client, &query, &self.namespace).await?;
-        // More ranges than workers, so one that finishes early takes another.
-        let ranges = crate::parallel::page_ranges(pages, workers * 8);
-        tracing::info!(workers, ranges = ranges.len(), pages, table = %query.table_ref, "partitioned read");
+        match plan.resumed.take() {
+            Some(token) => {
+                plan.partitions = token.partitions;
+                plan.done = token.done.into_iter().collect();
+            }
+            // More partitions than workers, so one that finishes early takes another.
+            None => {
+                plan.partitions = match &plan.split {
+                    Split::Ctid => crate::parallel::page_ranges(pages, workers * 8),
+                    Split::Key(key) => {
+                        let min_max = crate::parallel::key_min_max(client, &query, key).await?;
+                        crate::parallel::key_ranges(min_max, workers * 8)
+                    }
+                };
+            }
+        }
+        let todo: std::collections::VecDeque<(usize, Partition)> =
+            plan.partitions.iter().cloned().enumerate().filter(|(id, _)| !plan.done.contains(id)).collect();
+        tracing::info!(
+            workers,
+            partitions = plan.partitions.len(),
+            to_read = todo.len(),
+            pages,
+            split_by = ?plan.split,
+            table = %query.table_ref,
+            "partitioned read"
+        );
+        let key = match &plan.split {
+            Split::Key(k) => Some(k.clone()),
+            Split::Ctid => None,
+        };
         let shared = Arc::new(crate::parallel::Shared {
             conn: self.conn_cfg.clone().context("not configured")?,
             query,
+            key,
             snapshot,
-            ranges: std::sync::Mutex::new(ranges.into()),
-            batch_size: self.batch_size,
+            partitions: std::sync::Mutex::new(todo),
+            reading: self.reading()?,
             schema: self.schema.clone().context("not configured")?,
             namespace: self.namespace.clone(),
             session_pins: SESSION_PINS.to_string(),
@@ -275,42 +349,34 @@ impl PostgresSourcePlugin {
     }
 }
 
-/// FETCHes the cursor batch by batch, each only once the core granted it, and
-/// commits the read transaction when the cursor is exhausted.
-async fn fetch_ahead(
-    client: Arc<Client>,
-    mut gate: FlowGate,
-    batch_size: usize,
-    namespace: String,
-    tx: mpsc::Sender<Fetched>,
-) {
-    // Use simple_query (text protocol) so all types come back as strings.
-    // This avoids binary-format issues with NUMERIC, TIME, and other types
-    // that tokio_postgres's FromSql doesn't support out of the box.
-    let fetch_sql = format!("FETCH FORWARD {batch_size} FROM ls_cursor");
+/// What the fetch task reads, and how.
+struct Read {
+    how: Reading,
+    query: String,
+    text: Option<String>,
+}
+
+/// Reads the query batch by batch, each only once the core granted it, and
+/// commits the read transaction when it is exhausted.
+async fn fetch_ahead(client: Arc<Client>, mut gate: FlowGate, read: Read, tx: mpsc::Sender<Fetched>) {
+    let ns = read.how.namespace.clone();
+    let opened = RowReader::open(client.clone(), &read.how, &read.query, "ls_cursor", read.text.as_deref()).await;
+    let mut reader = match opened {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(Err(e)).await;
+            return;
+        }
+    };
     let mut seq = 0;
     loop {
         seq += 1;
         gate.wait_for(seq).await;
-        let fetch = DbOp::new("FETCH", &namespace, None, Some(&fetch_sql));
-        let span = fetch.span().clone();
-        let fetched = fetch.run(async { client.simple_query(&fetch_sql).await.context("FETCH failed") }).await;
-        let rows = fetched.map(|messages| {
-            let rows: Vec<SimpleQueryRow> = messages
-                .into_iter()
-                .filter_map(|m| match m {
-                    tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
-                    _ => None,
-                })
-                .collect();
-            span.record("db.response.returned_rows", rows.len() as u64);
-            rows
-        });
+        let rows = reader.next().await;
         let last = rows.as_ref().map_or(true, |r| r.is_empty());
         if matches!(&rows, Ok(r) if r.is_empty()) {
-            let close = "CLOSE ls_cursor; COMMIT";
-            let _ = op("COMMIT", &namespace, None, Some(close), async {
-                client.batch_execute(close).await.context("CLOSE/COMMIT failed")
+            let _ = op("COMMIT", &ns, None, Some("COMMIT"), async {
+                client.batch_execute("COMMIT").await.context("COMMIT failed")
             })
             .await;
         }
@@ -333,6 +399,34 @@ impl SourcePlugin for PostgresSourcePlugin {
         // Advertised statically: the plugin is *able* to do incremental loads.
         // Activation is per-pipeline, via the `incremental` config block.
         vec!["batch_read".into(), "schema_inference".into(), "incremental_state".into()]
+    }
+
+    async fn resume_at(&mut self, token: serde_json::Value) -> Resumption {
+        let Some(plan) = self.partitioned.as_mut() else {
+            return Resumption::StartOver("this read is not partitioned: it starts over".into());
+        };
+        let token = match ResumeToken::parse(token, &plan.split) {
+            Ok(t) => t,
+            Err(e) => return Resumption::StartOver(format!("cannot continue the failed run ({e:#}); the partitioned load starts over")),
+        };
+        let left = token.partitions.len() - token.done.len();
+        if plan.resume_snapshot != ResumeSnapshot::New {
+            return Resumption::StartOver(format!(
+                "the failed run's snapshot ended with its transaction: the partitioned load starts over \
+                 (`parallel.resume_snapshot: new` with a key `split_by` reads the {left} partitions not yet \
+                 done at a new snapshot instead)"
+            ));
+        }
+        plan.resumed = Some(token);
+        Resumption::Continue(format!("continuing the failed run: the {left} partitions not yet done, at a new snapshot"))
+    }
+
+    fn current_resume_token(&self) -> Option<serde_json::Value> {
+        let plan = self.partitioned.as_ref()?;
+        if plan.partitions.is_empty() {
+            return None;
+        }
+        serde_json::to_value(ResumeToken::new(&plan.split, &plan.partitions, &plan.done)).ok()
     }
 
     async fn resume_from(&mut self, cursor_value: Option<serde_json::Value>) {
@@ -368,7 +462,15 @@ impl SourcePlugin for PostgresSourcePlugin {
                      out of cursor order)"
                 );
             }
-            self.partitioned = Some((TableQuery::parse(&cfg.query)?, p.workers));
+            self.partitioned = Some(Partitioned {
+                query: TableQuery::parse(&cfg.query)?,
+                workers: p.workers,
+                split: p.split()?,
+                resume_snapshot: p.resume_snapshot,
+                partitions: Vec::new(),
+                done: BTreeSet::new(),
+                resumed: None,
+            });
         }
         if cfg.number_scale > 38 {
             anyhow::bail!("number_scale must be at most 38 (got {})", cfg.number_scale);
@@ -412,6 +514,7 @@ impl SourcePlugin for PostgresSourcePlugin {
         };
         if let Some(inc) = &cfg.incremental {
             check_cursor_column(&inc.cursor_column, &schema)?;
+            self.cursor_index = schema.fields().iter().position(|f| f.name() == &inc.cursor_column);
             self.cursor_column = Some(inc.cursor_column.clone());
             self.initial_value = inc.initial_value.clone();
         }
@@ -420,6 +523,7 @@ impl SourcePlugin for PostgresSourcePlugin {
         self.query = cfg.query;
         self.schema = Some(schema);
         self.batch_size = cfg.batch_size;
+        self.fetch = cfg.fetch;
         self.client = Some(Arc::new(client));
 
         Ok(())
@@ -456,10 +560,8 @@ impl SourcePlugin for PostgresSourcePlugin {
 
         // Track the watermark: rows are ordered by the cursor ascending, so the
         // batch's values are read back from its last row.
-        if let Some(col) = &self.cursor_column {
-            if let Some(i) = rows.first().and_then(|r| r.columns().iter().position(|c| c.name() == col)) {
-                self.cursor.batch(rows.iter().rev().filter_map(|r| r.get(i)).map(str::to_string));
-            }
+        if let Some(i) = self.cursor_index {
+            self.cursor.batch((0..rows.len()).rev().filter_map(|r| rows.cell(r, i)).map(str::to_string));
         }
 
         let batch =

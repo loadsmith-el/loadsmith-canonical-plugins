@@ -123,11 +123,29 @@ pub fn columns_to_schema(cols: &[Column], unit: TimeUnit, number_scale: i8) -> S
     Schema::new(fields)
 }
 
-/// Converts simple_query rows (text protocol) to an Arrow RecordBatch.
-pub fn rows_to_batch_text(
-    rows: &[tokio_postgres::SimpleQueryRow],
-    schema: &Schema,
-) -> Result<RecordBatch> {
+/// Rows whose values are Postgres' text output: `simple_query` rows, or
+/// lines of `COPY … TO STDOUT` (see [`crate::read`]).
+pub trait TextRows {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The text of one value; `None` for SQL NULL.
+    fn cell(&self, row: usize, col: usize) -> Option<&str>;
+}
+
+impl TextRows for [tokio_postgres::SimpleQueryRow] {
+    fn len(&self) -> usize {
+        <[_]>::len(self)
+    }
+
+    fn cell(&self, row: usize, col: usize) -> Option<&str> {
+        self[row].get(col)
+    }
+}
+
+/// Converts text rows to an Arrow RecordBatch.
+pub fn rows_to_batch_text<R: TextRows + ?Sized>(rows: &R, schema: &Schema) -> Result<RecordBatch> {
     let arrays: Vec<ArrayRef> = schema
         .fields()
         .iter()
@@ -139,12 +157,8 @@ pub fn rows_to_batch_text(
         .map_err(|e| anyhow::anyhow!("RecordBatch::try_new: {e}"))
 }
 
-fn build_column_text(
-    rows: &[tokio_postgres::SimpleQueryRow],
-    col_idx: usize,
-    field: &Field,
-) -> Result<ArrayRef> {
-    let values: Vec<Option<&str>> = rows.iter().map(|r| r.get(col_idx)).collect();
+fn build_column_text<R: TextRows + ?Sized>(rows: &R, col_idx: usize, field: &Field) -> Result<ArrayRef> {
+    let values: Vec<Option<&str>> = (0..rows.len()).map(|r| rows.cell(r, col_idx)).collect();
     match field.data_type() {
         DataType::List(inner_field) => build_list(&values, inner_field.clone(), field.name()),
         _ => build_values(&values, field, field.name()),
