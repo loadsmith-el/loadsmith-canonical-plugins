@@ -39,12 +39,14 @@ The plugins move to the SDK of engine 1.3 (commit `3a10004`: resume tokens,
   only the partitions not finished, while the undo reaches back to it;
   otherwise the load starts over, or with `parallel.resume_snapshot: new` and
   a key `split_by` reads the remaining partitions at a new SCN.
-- **Fix: a partitioned load no longer reads a mid-sized table whole to cut
-  it.** `SAMPLE BLOCK (1)` samples whole multiblock reads, so on a table of
-  ~50,000 blocks it came back empty about half the time, and the source then
-  read every ROWID of the table to find its extent (3.6 s on 1M rows): the
-  same load took 2 or 5.6 s by the luck of the sample. The sample now grows
-  (1%, 5%, 25%) before the table is read whole.
+- **Fix: the same partitioned load took 1.8 or 5.8 s by the luck of the
+  sample.** `SAMPLE BLOCK (1)` samples whole multiblock reads: on a table of
+  ~50,000 blocks it came back empty (and the source then read every ROWID of
+  the table to find its extent, 3.6 s on 1M rows), or covered only the first
+  fifth of the table, whose rest then fell in one open-ended range read by one
+  worker (800,000 of 1M rows). The sample now grows (1%, 5%, 25%), its spans
+  adding up, until they cover three quarters of the blocks the table's
+  statistics count (`ALL_TABLES.BLOCKS`): the 1M-row load ×8 takes 1.8–3.0 s.
 - **Fix: a partitioned load could miss the last seconds of commits — a table
   loaded just before it read as empty, and succeeded.** The snapshot SCN came
   from `TIMESTAMP_TO_SCN(SYSTIMESTAMP)`, which the database maps in steps of

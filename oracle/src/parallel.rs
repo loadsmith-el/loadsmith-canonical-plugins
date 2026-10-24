@@ -439,17 +439,37 @@ pub fn ranges_between(bounds: &[String]) -> Vec<Partition> {
     ranges
 }
 
+/// The blocks the table's statistics count (`ALL_TABLES.BLOCKS`), if it has
+/// statistics.
+fn table_blocks(conn: &Connection, q: &TableQuery) -> Option<i64> {
+    let row = match &q.owner {
+        Some(owner) => conn.query_row(
+            "SELECT TO_CHAR(BLOCKS) FROM ALL_TABLES WHERE OWNER = :1 AND TABLE_NAME = :2",
+            &[owner, &q.table],
+        ),
+        None => conn.query_row(
+            "SELECT TO_CHAR(BLOCKS) FROM ALL_TABLES WHERE OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND TABLE_NAME = :1",
+            &[&q.table],
+        ),
+    };
+    let blocks: Option<String> = row.ok()?.get(0).ok()?;
+    blocks?.trim().parse().ok().filter(|b: &i64| *b > 0)
+}
+
 /// `pieces - 1` ROWIDs that cut the table into about equal parts. A block
 /// sample gives each segment's span of blocks (data object, file, first and
 /// last block); the spans are cut evenly by block, rows per block being about
 /// even in a heap table, and Oracle builds and sorts the boundary ROWIDs.
 ///
-/// `SAMPLE BLOCK` samples whole multiblock reads, so a small percentage of a
-/// mid-sized table often comes back empty (1% of a 50,000-block table: some
-/// thousands of rows one time, none the next). The percentage grows until the
-/// sample spans enough blocks; only a table still too small for that is read
-/// whole — which for a mid-sized table cost seconds, and made the same
-/// partitioned load take 2 or 5.6 s by the luck of the sample.
+/// `SAMPLE BLOCK` samples whole multiblock reads, so a small sample is a few
+/// runs of blocks: some thousands of rows one time, none the next, or all in
+/// the first fifth of the table — the rest then fell in the last, open-ended
+/// range, which one worker read alone (the same 1M-row load took 1.8 or
+/// 5.8 s by the luck of the sample). So the sample grows (1%, 5%, 25%, then
+/// the whole table), the spans it found adding up, until they cover most of
+/// the blocks the table's statistics count (`ALL_TABLES.BLOCKS`, readable
+/// with `SELECT` on the table); without statistics, until they span
+/// `8 × pieces` blocks.
 pub fn sample_bounds(conn: &Connection, q: &TableQuery, pieces: usize) -> Result<Vec<String>> {
     let spans = |sample: &str| -> Result<Vec<(i64, i64, i64, i64)>> {
         let sql = format!(
@@ -471,13 +491,16 @@ pub fn sample_bounds(conn: &Connection, q: &TableQuery, pieces: usize) -> Result
             })
             .collect()
     };
-    let enough = |segments: &[(i64, i64, i64, i64)]| {
-        segments.iter().map(|&(_, _, lo, hi)| hi - lo + 1).sum::<i64>() >= pieces as i64 * 8
-    };
+    let target = table_blocks(conn, q).map(|b| b * 3 / 4).unwrap_or(0).max(pieces as i64 * 8);
+    let mut spans_by_segment: std::collections::BTreeMap<(i64, i64), (i64, i64)> = Default::default();
     let mut segments = Vec::new();
     for sample in [" SAMPLE BLOCK (1)", " SAMPLE BLOCK (5)", " SAMPLE BLOCK (25)", ""] {
-        segments = spans(sample)?;
-        if enough(&segments) {
+        for (o, f, lo, hi) in spans(sample)? {
+            let span = spans_by_segment.entry((o, f)).or_insert((lo, hi));
+            *span = (span.0.min(lo), span.1.max(hi));
+        }
+        segments = spans_by_segment.iter().map(|(&(o, f), &(lo, hi))| (o, f, lo, hi)).collect();
+        if segments.iter().map(|&(_, _, lo, hi)| hi - lo + 1).sum::<i64>() >= target {
             break;
         }
     }

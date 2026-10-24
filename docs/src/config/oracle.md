@@ -117,7 +117,8 @@ A full load of one large table, read by `workers` connections at once:
   consistent even while the table changes. The database's undo retention must
   cover the load's duration (`ORA-01555` otherwise).
 - **The split.** A block sample (`SAMPLE BLOCK`, 1% of the table's blocks;
-  5% and 25% when that spans too few) gives the extent of the table's
+  5% and 25% until it covers three quarters of the blocks the table's
+  statistics count, `ALL_TABLES.BLOCKS`) gives the extent of the table's
   segments; the blocks are cut into `8 × workers` ROWID ranges of about equal
   size, and each worker takes the next range from a shared queue. The ranges are half-open and open at both ends, so every row
   is read exactly once whatever the sample. Only `SELECT` on the table is
