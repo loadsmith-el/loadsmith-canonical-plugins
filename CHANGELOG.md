@@ -32,6 +32,10 @@ parquet 60 and reqwest 0.13.
   `TO_YMINTERVAL` / `TO_DSINTERVAL` (a value the column can't hold fails),
   into any other column as ISO-8601; a UUID as its text (its bytes into RAW).
 - **`parallel.partitions`**, as in postgres.
+- **`target_table: schema.table`**: a table in another schema, each part
+  quoted on its own.
+- **CLOBs over 4000 bytes are read whole**: fetched inline like BLOBs, no
+  longer through `TO_CHAR` (which failed past 4000 bytes).
 
 ### mysql 0.3.0
 

@@ -63,9 +63,9 @@ ignored, as with every thin driver.)
 
 `DATE` and `TIMESTAMP` columns are fetched in Oracle's binary form (7 and 11
 bytes a value); the zoned timestamps are converted to UTC by the server and
-fetched the same way. `INTERVAL` and `LONG` are rendered server-side with
-`TO_CHAR`. CLOBs are read through `TO_CHAR`, so values over 4000 bytes aren't
-supported yet. `BFILE` is not supported (its contents are not fetched). Years
+fetched the same way. `INTERVAL` (with `interval_as: text`) and `LONG` are
+rendered server-side with `TO_CHAR`. CLOBs and BLOBs are fetched whole, inline
+(any size, held in memory one batch at a time). `BFILE` is not supported (its contents are not fetched). Years
 BC are not supported.
 
 The source streams: the query's cursor stays open and `batch_size` rows are
@@ -162,7 +162,7 @@ shrink that. When the SCN is out of reach:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `target_table` | string | — | Table to load, in the login user's schema (schema-qualified names aren't supported yet). A plain identifier folds to upper case like unquoted SQL (`events` → `EVENTS`); anything else (mixed symbols, spaces) is used verbatim as a quoted name. `merge_key` columns resolve the same way. |
+| `target_table` | string | — | Table to load: `table`, or `schema.table` for another schema (the login user needs the privileges; `merge` creates its staging table in the login user's schema). Each part folds to upper case like unquoted SQL when it is a plain identifier (`sales.events` → `"SALES"."EVENTS"`); anything else (mixed symbols, spaces) is used verbatim as a quoted name, and a part written in double quotes is taken as is (`'"Sales"."my.table"'`). `merge_key` columns resolve the same way. |
 | `mode` | `append` / `overwrite` / `merge` | `append` | How the load changes the table (below). |
 | `merge_key` | list of strings | — | The key columns of the `MERGE … ON (…)` match. Required for `merge`, rejected in the other modes. |
 | `update_columns` | list of strings | every non-key column | `merge` only: the columns a matched row updates. `[]` inserts new keys and leaves existing rows alone. |

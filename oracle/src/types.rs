@@ -13,7 +13,7 @@
 //!
 //! `DATE` and `TIMESTAMP` are fetched natively (Oracle's 7/11-byte binary form);
 //! the zoned timestamps are normalized server-side with `SYS_EXTRACT_UTC` and
-//! fetched the same way. CLOB/LONG/INTERVAL are rendered with `TO_CHAR` (see
+//! fetched the same way; CLOBs whole, inline. LONG/INTERVAL are rendered with `TO_CHAR` (see
 //! [`projected_select`]). The destination wraps temporal binds in the matching
 //! `TO_DATE`/`TO_TIMESTAMP`/`TO_TIMESTAMP_TZ` ([`typed_expr`]).
 
@@ -138,17 +138,11 @@ fn projected_expr(col: &str, t: &DbType) -> Option<String> {
         Some(format!("SYS_EXTRACT_UTC(CAST({quoted} AS TIMESTAMP(9) WITH TIME ZONE))"))
     } else if is_one_of(
         t,
-        &[
-            oracledb::DB_TYPE_CLOB,
-            oracledb::DB_TYPE_NCLOB,
-            oracledb::DB_TYPE_LONG,
-            oracledb::DB_TYPE_INTERVAL_YM,
-            oracledb::DB_TYPE_INTERVAL_DS,
-        ],
+        &[oracledb::DB_TYPE_LONG, oracledb::DB_TYPE_INTERVAL_YM, oracledb::DB_TYPE_INTERVAL_DS],
     ) {
-        // CLOB/LONG/INTERVAL render to text with the default model. (CLOB via
-        // TO_CHAR is limited to 4000 bytes — fine for the canonical dataset;
-        // streaming larger LOBs is a future improvement.)
+        // LONG/INTERVAL render to text with the default model. (A CLOB is
+        // fetched whole, inline, like a BLOB: `TO_CHAR` would stop it at
+        // 4000 bytes.)
         Some(format!("TO_CHAR({quoted})"))
     } else {
         None
@@ -156,7 +150,7 @@ fn projected_expr(col: &str, t: &DbType) -> Option<String> {
 }
 
 /// Builds the projected `SELECT` list and the matching Arrow `Schema` from the
-/// described columns. Zoned timestamps and CLOB/LONG/INTERVAL columns are
+/// described columns. Zoned timestamps and LONG/INTERVAL columns are
 /// wrapped (`SYS_EXTRACT_UTC(...)`, `TO_CHAR(...)`) `AS "name"`; every other
 /// column is selected verbatim. All fields are nullable.
 pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit, number_scale: i8, interval_text: bool) -> (String, Schema) {
@@ -775,6 +769,35 @@ pub fn quote_ident(name: &str) -> String {
     }
 }
 
+/// Quotes a table name that may be schema-qualified (`sales.orders` →
+/// `"SALES"."ORDERS"`): each part as [`quote_ident`] does, a part already in
+/// double quotes verbatim (`"Mixed"."my.table"`). A name without a dot outside
+/// quotes is one identifier.
+pub fn quote_table(name: &str) -> String {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut quoted = false;
+    for c in name.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                part.push(c);
+            }
+            '.' if !quoted => parts.push(std::mem::take(&mut part)),
+            _ => part.push(c),
+        }
+    }
+    parts.push(part);
+    parts
+        .iter()
+        .map(|p| match p.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
+            Some(inner) if !inner.is_empty() => format!("\"{}\"", inner.replace("\"\"", "\"").replace('"', "\"\"")),
+            _ => quote_ident(p),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// The form a config identifier resolves to for *comparison* against Oracle's
 /// catalog names (which arrive upper-cased): a simple identifier folded to
 /// upper-case, anything else verbatim — i.e. [`quote_ident`] without the quotes.
@@ -1008,6 +1031,15 @@ mod tests {
         let secs = TimestampSecondArray::from(vec![1_705_321_845]);
         assert!(matches!(cell_to_bind(&secs, 0, Some(oracledb::DB_TYPE_TIMESTAMP)).unwrap(),
             Bind::Text(Some(s)) if s == "2024-01-15 12:30:45.000000000"));
+    }
+
+    #[test]
+    fn quote_table_quotes_each_part() {
+        assert_eq!(quote_table("events_sink"), "\"EVENTS_SINK\"");
+        assert_eq!(quote_table("sales.orders"), "\"SALES\".\"ORDERS\"");
+        assert_eq!(quote_table("\"Sales\".orders"), "\"Sales\".\"ORDERS\"");
+        assert_eq!(quote_table("\"my.table\""), "\"my.table\"");
+        assert_eq!(quote_table("weird name"), "\"weird name\"");
     }
 
     #[test]

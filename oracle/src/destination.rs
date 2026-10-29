@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::conn::ConnectionConfig;
 use crate::telemetry::{op, DbOp};
-use crate::types::{cell_to_bind, fold_ident, quote_ident, typed_expr, Bind};
+use crate::types::{cell_to_bind, fold_ident, quote_ident, quote_table, typed_expr, Bind};
 use crate::vocab::config_enum;
 
 /// Load-order column of the staging table: the last row of a key wins.
@@ -207,7 +207,7 @@ impl DestinationPlugin for OracleDestPlugin {
         // Nothing is durable until finalize() commits (Oracle holds the
         // transaction open implicitly).
         let cfg = self.cfg()?;
-        let target = quote_ident(&cfg.target_table);
+        let target = quote_table(&cfg.target_table);
         let describe = format!("SELECT * FROM {target} WHERE 1 = 0");
 
         let ns = crate::conn::namespace(&cfg.conn);
@@ -365,7 +365,7 @@ fn build_insert_sql(target: &str, columns: &[String], binds: &[String], seq_bind
         col_list.push(quote_ident(STAGING_SEQ));
         values.push(seq.to_string());
     }
-    format!("INSERT INTO {} ({}) VALUES ({})", quote_ident(target), col_list.join(", "), values.join(", "))
+    format!("INSERT INTO {} ({}) VALUES ({})", quote_table(target), col_list.join(", "), values.join(", "))
 }
 
 /// A deterministic, session-private staging-table name for `merge`. Oracle
@@ -444,7 +444,7 @@ fn build_staged_merge_sql(
     Ok(format!(
         "MERGE INTO {target} t USING ({latest}) s ON ({on}){matched} \
          WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({src_list})",
-        target = quote_ident(target),
+        target = quote_table(target),
     ))
 }
 
@@ -483,6 +483,12 @@ mod tests {
     async fn retired_modes_name_the_new_value() {
         let e = configure(serde_json::json!({ "mode": "atomic" })).await.unwrap_err().to_string();
         assert!(e.contains("did you mean `append`?"), "{e}");
+    }
+
+    #[test]
+    fn a_schema_qualified_target_is_quoted_part_by_part() {
+        let sql = build_insert_sql("sales.orders", &["id".to_string()], &[":1".to_string()], None);
+        assert_eq!(sql, "INSERT INTO \"SALES\".\"ORDERS\" (\"ID\") VALUES (:1)");
     }
 
     #[test]
