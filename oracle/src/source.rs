@@ -68,6 +68,8 @@ fn default_batch_size() -> usize {
 struct Partitioned {
     query: TableQuery,
     workers: usize,
+    /// The partitions a new load is cut into (`parallel.partitions`).
+    pieces: usize,
     split: Split,
     resume_snapshot: ResumeSnapshot,
     /// The SCN the partitions are read at (once the workers start).
@@ -265,7 +267,7 @@ impl OracleSourcePlugin {
     fn start_partitions(&mut self) -> Result<()> {
         let conn = self.conn.as_ref().context("not configured")?;
         let plan = self.partitioned.as_mut().context("not partitioned")?;
-        let (query, workers) = (plan.query.clone(), plan.workers);
+        let (query, workers, pieces) = (plan.query.clone(), plan.workers, plan.pieces);
         tokio::task::block_in_place(|| -> Result<()> {
             match plan.resumed.take() {
                 Some(token) => {
@@ -278,11 +280,11 @@ impl OracleSourcePlugin {
                     plan.scn = crate::parallel::snapshot_scn(conn, &query)?;
                     plan.partitions = match &plan.split {
                         Split::Rowid => {
-                            crate::parallel::ranges_between(&crate::parallel::sample_bounds(conn, &query, workers * 8)?)
+                            crate::parallel::ranges_between(&crate::parallel::sample_bounds(conn, &query, pieces)?)
                         }
                         Split::Key(key) => crate::parallel::key_ranges(
                             crate::parallel::key_min_max(conn, &query, key, plan.scn)?,
-                            workers * 8,
+                            pieces,
                         ),
                     };
                 }
@@ -438,9 +440,7 @@ impl SourcePlugin for OracleSourcePlugin {
         // `--ignore-unknown-keys`.
         let cfg: OracleConfig = config.parse()?;
         if let Some(p) = &cfg.parallel {
-            if !(1..=crate::parallel::MAX_WORKERS).contains(&p.workers) {
-                anyhow::bail!("parallel.workers must be 1–{} (got {})", crate::parallel::MAX_WORKERS, p.workers);
-            }
+            let (workers, pieces) = p.sizes()?;
             if cfg.incremental.is_some() {
                 anyhow::bail!(
                     "`parallel` reads a full load; it cannot be combined with `incremental` (batches would leave \
@@ -449,7 +449,8 @@ impl SourcePlugin for OracleSourcePlugin {
             }
             self.partitioned = Some(Partitioned {
                 query: TableQuery::parse(&cfg.query)?,
-                workers: p.workers,
+                workers,
+                pieces,
                 split: p.split()?,
                 resume_snapshot: p.resume_snapshot,
                 scn: 0,

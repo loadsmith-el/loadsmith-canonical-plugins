@@ -40,7 +40,7 @@ ignored, as with every thin driver.)
 | `batch_size` | integer | `1000` | Rows per Arrow batch. |
 | `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. `cursor_column` must be one of the query's columns (a plain name folds to upper case, like unquoted SQL); any other name fails at startup. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `DATE`/`TIMESTAMP` columns. The default is the same in every canonical plugin and truncates below the millisecond; **`ns` keeps `TIMESTAMP(9)` whole** (years 1677–2262 only), `us` covers the default `TIMESTAMP(6)`. |
-| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint ROWID (or key) ranges of the query's table at one SCN. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
+| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint ROWID (or key) ranges (`partitions`, default `8 × workers`) of the query's table at one SCN. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMBER` **without a declared precision** (a bare `NUMBER` column, `SUM(x)`, `COUNT(*)`, …), emitted as `Decimal128(38, number_scale)`. A value with more decimal places (or more than 38 digits) fails the run, naming the column — nothing is rounded. Declare the type in the query instead (`CAST(x AS NUMBER(19))`) for an exact integer or decimal. |
 
 | Oracle type | Arrow type | Notes |
@@ -101,6 +101,7 @@ source:
     parallel:
       workers: 8
       split_by: order_id        # optional: rowid (default) or an integer column
+      partitions: 256           # optional: default 8 × workers
       resume_snapshot: new      # optional: same (default) or new; see Resume
 ```
 
@@ -126,7 +127,9 @@ A full load of one large table, read by `workers` connections at once:
   `split_by: <column>` (an integer column; ideally indexed) the ranges are of
   its values instead: its minimum to maximum at the SCN cut into
   `8 × workers` ranges of about equal width, open at both ends, plus one
-  partition for its `NULL`s.
+  partition for its `NULL`s. `partitions` (from `workers` to 4096) sets the
+  number of ranges instead of `8 × workers`: more, smaller ranges cost a query
+  each but make a resumed run re-read less (see Resume).
 - **Each worker fetches and converts** its rows on its own thread, so the
   conversion runs in parallel too. Batches leave in the order workers finish
   them, not in table order.
@@ -143,7 +146,8 @@ continues it **at the same SCN**, reading only the partitions not finished —
 one consistent snapshot, as if the run had never failed — as long as the undo
 still reaches back to that SCN (checked before it starts). The rows of a
 partition that was in progress when the run failed are read again
-(at-least-once). When the SCN is out of reach:
+(at-least-once) — about one partition per worker, so raise `partitions` to
+shrink that. When the SCN is out of reach:
 
 - by default (`resume_snapshot: same`) the load **starts over**, under the
   failed run's id; its files replace the failed run's;

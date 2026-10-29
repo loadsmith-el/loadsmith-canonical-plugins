@@ -104,6 +104,8 @@ type Fetched = Result<Rows>;
 struct Partitioned {
     query: TableQuery,
     workers: usize,
+    /// The partitions a new load is cut into (`parallel.partitions`).
+    pieces: usize,
     split: Split,
     resume_snapshot: ResumeSnapshot,
     /// Every partition of the load (empty until the workers start).
@@ -299,7 +301,7 @@ impl PostgresSourcePlugin {
     async fn start_partitions(&mut self) -> Result<()> {
         let client = self.client.as_ref().context("postgres source: not configured")?;
         let plan = self.partitioned.as_mut().context("not partitioned")?;
-        let (query, workers) = (plan.query.clone(), plan.workers);
+        let (query, workers, pieces) = (plan.query.clone(), plan.workers, plan.pieces);
         let (snapshot, pages) = crate::parallel::export_snapshot(client, &query, &self.namespace).await?;
         match plan.resumed.take() {
             Some(token) => {
@@ -309,10 +311,10 @@ impl PostgresSourcePlugin {
             // More partitions than workers, so one that finishes early takes another.
             None => {
                 plan.partitions = match &plan.split {
-                    Split::Ctid => crate::parallel::page_ranges(pages, workers * 8),
+                    Split::Ctid => crate::parallel::page_ranges(pages, pieces),
                     Split::Key(key) => {
                         let min_max = crate::parallel::key_min_max(client, &query, key).await?;
-                        crate::parallel::key_ranges(min_max, workers * 8)
+                        crate::parallel::key_ranges(min_max, pieces)
                     }
                 };
             }
@@ -453,9 +455,7 @@ impl SourcePlugin for PostgresSourcePlugin {
         // `--ignore-unknown-keys`.
         let cfg: PostgresConfig = config.parse()?;
         if let Some(p) = &cfg.parallel {
-            if !(1..=crate::parallel::MAX_WORKERS).contains(&p.workers) {
-                anyhow::bail!("parallel.workers must be 1–{} (got {})", crate::parallel::MAX_WORKERS, p.workers);
-            }
+            let (workers, pieces) = p.sizes()?;
             if cfg.incremental.is_some() {
                 anyhow::bail!(
                     "`parallel` reads a full load; it cannot be combined with `incremental` (batches would leave \
@@ -464,7 +464,8 @@ impl SourcePlugin for PostgresSourcePlugin {
             }
             self.partitioned = Some(Partitioned {
                 query: TableQuery::parse(&cfg.query)?,
-                workers: p.workers,
+                workers,
+                pieces,
                 split: p.split()?,
                 resume_snapshot: p.resume_snapshot,
                 partitions: Vec::new(),

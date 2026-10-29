@@ -45,7 +45,7 @@ rejected with the valid values (`read_only` → "did you mean `read-only`?").
 | `incremental` | object | — | Activates incremental reads (below). Requires a pipeline `state:` block. |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `timestamp`/`timestamptz` columns (and arrays of them). The default is the same in every canonical plugin and truncates below the millisecond; **`us` keeps Postgres' full precision**. `ns` is the µs value × 1000 and only covers the years 1677–2262 (a value outside fails the batch). |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMERIC` **without a declared precision** (a bare `numeric` column, `sum(x)`, …), emitted as `Decimal128(38, number_scale)`; see the type table. |
-| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint partitions of the query's table in one snapshot. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
+| `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint partitions (`partitions`, default `8 × workers`) of the query's table in one snapshot. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
 
 The query runs in a transaction and streams in `batch_size` chunks, so large
 results never buffer fully in memory. By default it is read with `COPY
@@ -73,6 +73,7 @@ source:
     parallel:
       workers: 8
       split_by: id              # optional: ctid (default) or an integer column
+      partitions: 256           # optional: default 8 × workers
       resume_snapshot: new      # optional: same (default) or new; see Resume
 ```
 
@@ -94,7 +95,9 @@ A full load of one large table, read by `workers` connections at once
   column (`split_by: id`; ideally indexed), the range between its minimum and
   maximum in the snapshot is cut into `8 × workers` ranges of about equal
   width, open at both ends, plus one partition for its `NULL`s. Either way
-  every row is read exactly once.
+  every row is read exactly once. `partitions` (from `workers` to 4096) sets
+  the number of ranges instead of `8 × workers`: more, smaller ranges cost a
+  query each but make a resumed run re-read less (see Resume).
 - **Each worker fetches and converts** its rows, so the conversion runs in
   parallel too. Batches leave in the order workers finish them, not in table
   order.
@@ -114,7 +117,8 @@ continues it — but the failed run's snapshot ended with its transaction:
 - with `resume_snapshot: new` (key `split_by` only) it reads **only the
   partitions not finished**, at a new snapshot. The output then mixes two
   points in time, and the rows of a partition that was in progress when the
-  run failed are read again (at-least-once). Page partitions cannot: an
+  run failed are read again (at-least-once) — about one partition per worker,
+  so raise `partitions` to shrink that. Page partitions cannot: an
   `UPDATE` between the two snapshots can move a row to another page, where it
   would be read twice or not at all.
 

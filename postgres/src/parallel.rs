@@ -54,6 +54,11 @@ pub struct ParallelConfig {
     /// its values (an integer column).
     #[serde(default)]
     pub split_by: Option<String>,
+    /// How many partitions the table is cut into (default `8 × workers`).
+    /// More, smaller partitions: a failed run's resume re-reads less, at the
+    /// cost of more queries and a bigger resume token.
+    #[serde(default)]
+    pub partitions: Option<usize>,
     /// What a resumed run reads at (see the module docs).
     #[serde(default)]
     pub resume_snapshot: ResumeSnapshot,
@@ -126,6 +131,27 @@ fn is_identifier(s: &str) -> bool {
 
 /// The most workers a load may open.
 pub const MAX_WORKERS: usize = 64;
+
+/// The most partitions a load may be cut into (every one is in the resume
+/// token the state keeps).
+pub const MAX_PARTITIONS: usize = 4096;
+
+impl ParallelConfig {
+    /// `workers` and `partitions`, checked; the partitions, defaulted.
+    pub fn sizes(&self) -> Result<(usize, usize)> {
+        if !(1..=MAX_WORKERS).contains(&self.workers) {
+            bail!("parallel.workers must be 1–{MAX_WORKERS} (got {})", self.workers);
+        }
+        let partitions = self.partitions.unwrap_or(self.workers * 8);
+        if !(self.workers..=MAX_PARTITIONS).contains(&partitions) {
+            bail!(
+                "parallel.partitions must be {}–{MAX_PARTITIONS}, at least the workers (got {partitions})",
+                self.workers
+            );
+        }
+        Ok((self.workers, partitions))
+    }
+}
 
 /// The oldest server with TID range scans (without them every worker would
 /// read the whole table).
@@ -587,6 +613,19 @@ mod tests {
         assert_eq!(key_ranges(Some((-5, -5)), 4), [key(None, None), Partition::Null], "one value: one range");
         assert_eq!(key_ranges(Some((0, 2)), 8), [key(None, Some(1)), key(Some(1), Some(2)), key(Some(2), None), Partition::Null]);
         assert_eq!(key_ranges(None, 4), [key(None, None)], "no value at all: read everything as one");
+    }
+
+    #[test]
+    fn partitions_default_to_eight_per_worker_and_are_checked() {
+        let sizes = |v: serde_json::Value| serde_json::from_value::<ParallelConfig>(v).unwrap().sizes();
+        assert_eq!(sizes(serde_json::json!({ "workers": 4 })).unwrap(), (4, 32));
+        assert_eq!(sizes(serde_json::json!({ "workers": 4, "partitions": 256 })).unwrap(), (4, 256));
+        assert_eq!(sizes(serde_json::json!({ "workers": 4, "partitions": 4 })).unwrap(), (4, 4));
+        let e = sizes(serde_json::json!({ "workers": 4, "partitions": 3 })).unwrap_err().to_string();
+        assert!(e.contains("at least the workers"), "{e}");
+        assert!(sizes(serde_json::json!({ "workers": 4, "partitions": MAX_PARTITIONS + 1 })).is_err());
+        assert!(sizes(serde_json::json!({ "workers": 0 })).is_err());
+        assert!(sizes(serde_json::json!({ "workers": MAX_WORKERS + 1 })).is_err());
     }
 
     #[test]
