@@ -4,6 +4,17 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-29 — oracle 0.9.1: oracledb beta.5
+
+### oracle 0.9.1
+
+- **Driver `oracledb` 26.0.0-beta.5.** Connects to Oracle Database 12c (it
+  panicked on 12.1, oracle/rust-oracledb#55) and to databases that send
+  Application Continuity or LTXID data (`unknown TTC message type` before);
+  re-parses a statement retried after an error (#51); fixes piggybacked
+  messages on non-data packets (#59), the per-description SDU and integer
+  encoding with trailing zeros (#37). No configuration or schema change.
+
 ## 2026-10-29 — native TIME/UUID/INTERVAL/DECIMAL, `parallel.partitions`, AWS roles
 
 The plugins move to the SDK of loadsmith `5d9ec7b` (arrow 60), and to arrow /
