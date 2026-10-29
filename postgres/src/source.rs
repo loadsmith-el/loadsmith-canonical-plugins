@@ -18,6 +18,20 @@ use tokio_postgres::Client;
 // ── Config structs ────────────────────────────────────────────────────────────
 
 config_enum! {
+    /// How a type with a native Arrow form that some consumers can't read
+    /// (`uuid_as`, `interval_as`) is emitted.
+    #[derive(Default)]
+    enum NativeOrText for "uuid_as` / `interval_as" {
+        /// The native Arrow type (the default).
+        #[default]
+        Native = "native",
+        /// The database's own text.
+        Text = "text",
+    }
+    retired {}
+}
+
+config_enum! {
     /// Isolation level of the cursor transaction.
     enum TransactionIsolation for "transaction_isolation" {
         ReadCommitted = "read-committed",
@@ -74,6 +88,17 @@ struct PostgresConfig {
     #[serde(default = "default_number_scale")]
     number_scale: u8,
 
+    /// `uuid` as `FixedSizeBinary(16)` with the `arrow.uuid` extension
+    /// (`native`, the default: Parquet's UUID type) or as its text (`text`,
+    /// for consumers that show a UUID column as bytes).
+    #[serde(default)]
+    uuid_as: NativeOrText,
+
+    /// `interval` as `Interval(MonthDayNano)` (`native`, the default) or as
+    /// Postgres' text in the session's IntervalStyle (`text`).
+    #[serde(default)]
+    interval_as: NativeOrText,
+
     /// Partitioned full load: `workers` connections read disjoint page
     /// ranges of the query's table in one snapshot (see [`crate::parallel`]).
     #[serde(default)]
@@ -82,6 +107,8 @@ struct PostgresConfig {
 
 /// The output formats the text decoder parses, pinned on every session.
 const SESSION_PINS: &str = "SET DateStyle = 'ISO'; SET bytea_output = 'hex'";
+/// Added to the pins when intervals are decoded (`interval_as: native`).
+const INTERVAL_PIN: &str = "; SET IntervalStyle = 'iso_8601'";
 
 fn default_number_scale() -> u8 {
     crate::types::DEFAULT_NUMBER_SCALE as u8
@@ -153,6 +180,8 @@ pub struct PostgresSourcePlugin {
     cursor_declared: bool,
     /// `db.namespace` of the telemetry spans (the database name).
     namespace: String,
+    /// The pins of every session ([`SESSION_PINS`], [`INTERVAL_PIN`]).
+    session_pins: String,
 }
 
 impl Default for PostgresSourcePlugin {
@@ -184,6 +213,7 @@ impl PostgresSourcePlugin {
             cursor: TieSafeCursor::new(),
             cursor_declared: false,
             namespace: String::new(),
+            session_pins: SESSION_PINS.to_string(),
         }
     }
 
@@ -343,7 +373,7 @@ impl PostgresSourcePlugin {
             reading: self.reading()?,
             schema: self.schema.clone().context("not configured")?,
             namespace: self.namespace.clone(),
-            session_pins: SESSION_PINS.to_string(),
+            session_pins: self.session_pins.clone(),
             started: Default::default(),
         });
         self.partition_batches = Some(crate::parallel::spawn_workers(shared, workers, self.gate.clone()));
@@ -485,8 +515,12 @@ impl SourcePlugin for PostgresSourcePlugin {
         // DMY/MDY input order. TimeZone is deliberately left alone: timestamptz
         // offsets are parsed, and changing it would alter the query's semantics.
         let ns = cfg.conn.dbname.as_str();
-        let pin = SESSION_PINS;
-        op("SET", ns, None, Some(pin), async { client.batch_execute(pin).await.context("pinning DateStyle/bytea_output") })
+        self.session_pins = match cfg.interval_as {
+            NativeOrText::Native => format!("{SESSION_PINS}{INTERVAL_PIN}"),
+            NativeOrText::Text => SESSION_PINS.to_string(),
+        };
+        let pin = self.session_pins.as_str();
+        op("SET", ns, None, Some(pin), async { client.batch_execute(pin).await.context("pinning the output formats") })
             .await?;
 
         // ── Schema inference via prepare() ────────────────────────────────
@@ -497,7 +531,12 @@ impl SourcePlugin for PostgresSourcePlugin {
             client.prepare(&cfg.query).await.context("failed to prepare query")
         })
         .await?;
-        let schema = Arc::new(crate::types::columns_to_schema(stmt.columns(), cfg.timestamp_unit.arrow(), cfg.number_scale as i8));
+        let map = crate::types::TypeMap {
+            uuid_text: cfg.uuid_as == NativeOrText::Text,
+            interval_text: cfg.interval_as == NativeOrText::Text,
+            ..crate::types::TypeMap::new(cfg.timestamp_unit.arrow(), cfg.number_scale as i8)
+        };
+        let schema = Arc::new(crate::types::columns_to_schema(stmt.columns(), &map));
 
         // The transaction + cursor are opened lazily on the first batch, after
         // `resume_from` has supplied the watermark (see `ensure_cursor`).

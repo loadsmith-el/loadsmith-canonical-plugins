@@ -3,8 +3,10 @@
 //! `NUMBER` crosses as the closest exact Arrow number (see [`number_to_arrow`]):
 //! `NUMBER(p)` as `Int32`/`Int64` (or `Decimal128(p, 0)` past 18 digits),
 //! `NUMBER(p,s)` as `Decimal128(p, s)`, a `NUMBER` without a declared precision
-//! as `Decimal128(38, number_scale)`, `FLOAT(b)` as `Float64`. `INTERVAL`,
-//! `ROWID` and the character types cross as exact text (`Utf8`); `RAW`/`BLOB`
+//! as `Decimal128(38, number_scale)`, `FLOAT(b)` as `Float64`. `INTERVAL YEAR
+//! TO MONTH` / `DAY TO SECOND` as `Interval(MonthDayNano)` (or their text, with
+//! `interval_as: text`); `ROWID` and the character types cross as exact text
+//! (`Utf8`); `RAW`/`BLOB`
 //! as `Binary`; the IEEE `BINARY_FLOAT`/`BINARY_DOUBLE` as Arrow floats; `DATE`, `TIMESTAMP` and
 //! `TIMESTAMP WITH [LOCAL] TIME ZONE` as Arrow timestamps in the source's
 //! `timestamp_unit` (the zoned ones normalized to UTC).
@@ -18,20 +20,21 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::AsArray;
 use arrow::datatypes::{
-    Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Date32Type, Date64Type, IntervalDayTimeType, IntervalMonthDayNano, IntervalMonthDayNanoType,
+    IntervalYearMonthType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
     Int8Type, Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
     UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{
     builder::{
-        BinaryBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder, Int32Builder,
+        BinaryBuilder, BooleanBuilder, Decimal128Builder, IntervalMonthDayNanoBuilder, Float32Builder, Float64Builder, Int32Builder,
         Int64Builder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
         TimestampNanosecondBuilder, TimestampSecondBuilder,
     },
     Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch,
 };
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use chrono::NaiveDateTime;
 use oracledb::{DbType, Row, ToDbValue};
 use std::borrow::Cow;
@@ -114,6 +117,10 @@ fn is_one_of(t: &DbType, set: &[&DbType]) -> bool {
     set.contains(&t)
 }
 
+fn is_interval(t: &DbType) -> bool {
+    is_one_of(t, &[oracledb::DB_TYPE_INTERVAL_YM, oracledb::DB_TYPE_INTERVAL_DS])
+}
+
 fn is_zoned(t: &DbType) -> bool {
     is_one_of(t, &[oracledb::DB_TYPE_TIMESTAMP_TZ, oracledb::DB_TYPE_TIMESTAMP_LTZ])
 }
@@ -152,7 +159,7 @@ fn projected_expr(col: &str, t: &DbType) -> Option<String> {
 /// described columns. Zoned timestamps and CLOB/LONG/INTERVAL columns are
 /// wrapped (`SYS_EXTRACT_UTC(...)`, `TO_CHAR(...)`) `AS "name"`; every other
 /// column is selected verbatim. All fields are nullable.
-pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit, number_scale: i8) -> (String, Schema) {
+pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit, number_scale: i8, interval_text: bool) -> (String, Schema) {
     let mut select = Vec::with_capacity(cols.len());
     let mut fields = Vec::with_capacity(cols.len());
     for c in cols {
@@ -161,7 +168,12 @@ pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit, number_scale: i8) -
             None => quote_ident(&c.name),
         };
         select.push(expr);
-        fields.push(Field::new(&c.name, column_to_arrow(c, unit, number_scale), true));
+        let dt = if is_interval(c.oracle_type) && !interval_text {
+            DataType::Interval(IntervalUnit::MonthDayNano)
+        } else {
+            column_to_arrow(c, unit, number_scale)
+        };
+        fields.push(Field::new(&c.name, dt, true));
     }
     (select.join(", "), Schema::new(fields))
 }
@@ -207,6 +219,10 @@ pub fn typed_expr(inner: &str, t: &DbType) -> String {
         format!("TO_TIMESTAMP({inner}, '{FMT_TIMESTAMP_IN}')")
     } else if is_zoned(t) {
         format!("TO_TIMESTAMP_TZ({inner}, '{FMT_TIMESTAMP_TZ_IN}')")
+    } else if t == oracledb::DB_TYPE_INTERVAL_YM {
+        format!("TO_YMINTERVAL({inner})")
+    } else if t == oracledb::DB_TYPE_INTERVAL_DS {
+        format!("TO_DSINTERVAL({inner})")
     } else {
         inner.to_string()
     }
@@ -476,6 +492,18 @@ fn build_column<R: FetchedRow>(rows: &[R], idx: usize, field: &Field) -> Result<
             }
             Ok(Arc::new(b.finish()))
         }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let mut b = IntervalMonthDayNanoBuilder::with_capacity(rows.len());
+            for row in rows {
+                match row.value(idx)?.text(&mut buf) {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(
+                        parse_interval(v).map_err(|e| anyhow::anyhow!("col {name}: interval '{v}': {e}"))?,
+                    ),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
@@ -490,7 +518,95 @@ fn build_column<R: FetchedRow>(rows: &[R], idx: usize, field: &Field) -> Result<
     }
 }
 
+/// An Oracle interval's `TO_CHAR` text: `+01-02` (YEAR TO MONTH: years and
+/// months) or `-03 04:05:06.500000` (DAY TO SECOND), one sign for the whole.
+pub fn parse_interval(s: &str) -> Result<IntervalMonthDayNano> {
+    let (negative, body) = match s.trim().as_bytes().first() {
+        Some(b'-') => (true, &s.trim()[1..]),
+        Some(b'+') => (false, &s.trim()[1..]),
+        _ => (false, s.trim()),
+    };
+    let sign = |v: i64| if negative { -v } else { v };
+    let int = |t: &str| t.parse::<i64>().map_err(|_| anyhow::anyhow!("not an interval"));
+    let overflow = || anyhow::anyhow!("out of range");
+    if let Some((days, time)) = body.split_once(' ') {
+        let mut hms = time.splitn(3, ':');
+        let (h, m, sec) = (hms.next().unwrap_or(""), hms.next().unwrap_or(""), hms.next().unwrap_or(""));
+        let (whole, frac) = sec.split_once('.').unwrap_or((sec, ""));
+        if frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("not an interval");
+        }
+        let nanos = ((int(h)? * 60 + int(m)?) * 60 + int(whole)?) * 1_000_000_000
+            + if frac.is_empty() { 0 } else { int(&format!("{frac:0<9}"))? };
+        Ok(IntervalMonthDayNano::new(0, i32::try_from(sign(int(days)?)).map_err(|_| overflow())?, sign(nanos)))
+    } else {
+        let (years, months) = body.split_once('-').ok_or_else(|| anyhow::anyhow!("not an interval"))?;
+        let months = int(years)?.checked_mul(12).and_then(|y| y.checked_add(int(months).ok()?)).ok_or_else(overflow)?;
+        Ok(IntervalMonthDayNano::new(i32::try_from(sign(months)).map_err(|_| overflow())?, 0, 0))
+    }
+}
+
+/// An interval as the text `TO_YMINTERVAL` (`+Y-M`) or `TO_DSINTERVAL`
+/// (`+D HH:MI:SS.FFFFFFFFF`) reads for a target of that type, or ISO-8601
+/// for any other column. A value the target type can't hold (months for a
+/// DAY TO SECOND column, mixed signs) fails instead of being cut.
+fn interval_text(months: i32, days: i32, nanos: i64, target: Option<&DbType>) -> Result<String> {
+    match target {
+        Some(t) if t == oracledb::DB_TYPE_INTERVAL_YM => {
+            if days != 0 || nanos != 0 {
+                bail!("an interval with days or time does not fit INTERVAL YEAR TO MONTH");
+            }
+            let sign = if months < 0 { '-' } else { '+' };
+            Ok(format!("{sign}{}-{}", months.unsigned_abs() / 12, months.unsigned_abs() % 12))
+        }
+        Some(t) if t == oracledb::DB_TYPE_INTERVAL_DS => {
+            if months != 0 {
+                bail!("an interval with months does not fit INTERVAL DAY TO SECOND");
+            }
+            if (days < 0 && nanos > 0) || (days > 0 && nanos < 0) {
+                bail!("an interval whose days and time differ in sign does not fit INTERVAL DAY TO SECOND");
+            }
+            let sign = if days < 0 || nanos < 0 { '-' } else { '+' };
+            let n = nanos.unsigned_abs();
+            let (secs, frac) = (n / 1_000_000_000, n % 1_000_000_000);
+            Ok(format!(
+                "{sign}{} {:02}:{:02}:{:02}.{frac:09}",
+                days.unsigned_abs(),
+                secs / 3600,
+                secs / 60 % 60,
+                secs % 60
+            ))
+        }
+        _ => {
+            let sign = if nanos < 0 { "-" } else { "" };
+            let n = nanos.unsigned_abs();
+            let (secs, frac) = (n / 1_000_000_000, n % 1_000_000_000);
+            let frac = if frac == 0 { String::new() } else { format!(".{frac:09}").trim_end_matches('0').to_string() };
+            Ok(format!("P{months}M{days}DT{sign}{secs}{frac}S"))
+        }
+    }
+}
+
 // ── Arrow → Oracle bind (destination) ────────────────────────────────────────
+
+/// Whether `field` is a UUID (`FixedSizeBinary(16)` of the `arrow.uuid`
+/// extension).
+pub fn is_uuid(field: &Field) -> bool {
+    field.data_type() == &DataType::FixedSizeBinary(16)
+        && field.metadata().get("ARROW:extension:name").map(String::as_str) == Some("arrow.uuid")
+}
+
+/// A UUID cell's canonical text (`a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`);
+/// `None` for NULL.
+pub fn uuid_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let b = array.as_fixed_size_binary_opt().context("array type mismatch")?.value(row);
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(Some(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])))
+}
+
 
 /// One bind value: text (the default — Oracle converts server-side under the
 /// `TO_*` wrappers / implicit char→number) or raw bytes for binary columns.
@@ -602,6 +718,20 @@ pub fn cell_to_bind(array: &dyn Array, row: usize, target: Option<&DbType>) -> R
             let dt = from_epoch(v, *unit).ok_or_else(|| anyhow::anyhow!("timestamp out of range: {v}"))?;
             text(temporal_text(dt, tz.is_some(), target))
         }
+        DataType::Interval(unit) => {
+            let (months, days, nanos) = match unit {
+                IntervalUnit::YearMonth => (prim!(IntervalYearMonthType), 0, 0),
+                IntervalUnit::DayTime => {
+                    let v = prim!(IntervalDayTimeType);
+                    (0, v.days, i64::from(v.milliseconds) * 1_000_000)
+                }
+                IntervalUnit::MonthDayNano => {
+                    let v = prim!(IntervalMonthDayNanoType);
+                    (v.months, v.days, v.nanoseconds)
+                }
+            };
+            text(interval_text(months, days, nanos, target)?)
+        }
         // Oracle has no time-of-day type: the value is bound as text
         // (`HH:MM:SS[.f]`), e.g. for a VARCHAR2 column.
         DataType::Time32(unit) | DataType::Time64(unit) => {
@@ -695,7 +825,7 @@ mod tests {
             ColumnDesc::new("TS", oracledb::DB_TYPE_TIMESTAMP),
             ColumnDesc::new("D", oracledb::DB_TYPE_DATE),
         ];
-        let (select, schema) = projected_select(&cols, TimeUnit::Nanosecond, DEFAULT_NUMBER_SCALE);
+        let (select, schema) = projected_select(&cols, TimeUnit::Nanosecond, DEFAULT_NUMBER_SCALE, false);
         assert_eq!(
             select,
             "\"EVENT_ID\", SYS_EXTRACT_UTC(\"EVENT_TSTZ\") AS \"EVENT_TSTZ\", \
@@ -823,6 +953,32 @@ mod tests {
         assert_eq!(typed_expr(":1", oracledb::DB_TYPE_DATE), "TO_DATE(:1, 'YYYY-MM-DD HH24:MI:SS')");
         assert_eq!(typed_expr(":1", oracledb::DB_TYPE_TIMESTAMP), "TO_TIMESTAMP(:1, 'YYYY-MM-DD HH24:MI:SS.FF')");
         assert_eq!(typed_expr(":1", oracledb::DB_TYPE_NUMBER), ":1");
+    }
+
+    #[test]
+    fn intervals_read_from_to_char_and_bound_for_their_target() {
+        let i = IntervalMonthDayNano::new;
+        assert_eq!(parse_interval("+01-02").unwrap(), i(14, 0, 0));
+        assert_eq!(parse_interval("-01-02").unwrap(), i(-14, 0, 0));
+        assert_eq!(parse_interval("+03 04:05:06.500000").unwrap(), i(0, 3, 14_706_500_000_000));
+        assert_eq!(parse_interval("-03 04:05:06.000001").unwrap(), i(0, -3, -14_706_000_001_000));
+        assert_eq!(parse_interval("+00 00:00:00").unwrap(), i(0, 0, 0));
+        assert!(parse_interval("3 days").is_err());
+        let (ym, ds) = (Some(oracledb::DB_TYPE_INTERVAL_YM), Some(oracledb::DB_TYPE_INTERVAL_DS));
+        assert_eq!(interval_text(-14, 0, 0, ym).unwrap(), "-1-2");
+        assert_eq!(interval_text(0, 3, 14_706_500_000_000, ds).unwrap(), "+3 04:05:06.500000000");
+        assert_eq!(interval_text(0, -3, -1_000, ds).unwrap(), "-3 00:00:00.000001000");
+        assert!(interval_text(1, 0, 0, ds).is_err(), "months don't fit DAY TO SECOND");
+        assert!(interval_text(0, 1, 0, ym).is_err(), "days don't fit YEAR TO MONTH");
+        assert!(interval_text(0, 1, -5, ds).is_err(), "mixed signs");
+        assert_eq!(interval_text(14, -3, 5_500_000_000, None).unwrap(), "P14M-3DT5.5S");
+        assert_eq!(typed_expr(":1", oracledb::DB_TYPE_INTERVAL_DS), "TO_DSINTERVAL(:1)");
+        let cols = vec![ColumnDesc::new("D", oracledb::DB_TYPE_INTERVAL_DS)];
+        let (select, schema) = projected_select(&cols, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE, false);
+        assert_eq!(select, "TO_CHAR(\"D\") AS \"D\"");
+        assert_eq!(schema.field(0).data_type(), &DataType::Interval(IntervalUnit::MonthDayNano));
+        let (_, schema) = projected_select(&cols, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE, true);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
     }
 
     #[test]

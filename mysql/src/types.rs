@@ -2,26 +2,29 @@
 //!
 //! Symmetric with the postgres plugin's text-protocol approach: rows come back
 //! over `mysql_async`'s text protocol as `Value::Bytes` (the server's own text
-//! rendering), so DECIMAL / TIME / and friends round-trip losslessly by mapping
-//! to `Utf8`. A destination that needs native decimals parses the string itself.
+//! rendering), parsed into the closest Arrow type: `DECIMAL(p,s)` into an exact
+//! `Decimal128`/`Decimal256(p, s)`; TIME (a duration up to ±838 h, not a time
+//! of day), JSON, ENUM, SET and friends stay their exact text (`Utf8`).
 
 use anyhow::{bail, Context, Result};
 use arrow::array::AsArray;
 use arrow::datatypes::{
-    Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Date32Type, Date64Type, Decimal128Type, Decimal256Type, IntervalDayTimeType, IntervalMonthDayNanoType,
+    IntervalYearMonthType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
     Int8Type, Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
     UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{
     builder::{
-        BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int32Builder,
+        BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder, Float32Builder,
+        Float64Builder, Int32Builder,
         Int64Builder, StringBuilder, UInt64Builder,
     },
     Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
 use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::{Column, Row, Value};
@@ -47,9 +50,10 @@ fn unix_epoch() -> NaiveDate {
 /// - `FLOAT`/`DOUBLE` → float; `DATE` → `Date32`.
 /// - `DATETIME` → `Timestamp(unit)`; `TIMESTAMP` → `Timestamp(unit, "UTC")`
 ///   (the session `time_zone` is pinned to UTC, so it reads as an instant).
+/// - `DECIMAL(p,s)` → `Decimal128(p, s)`, `Decimal256` past 38 digits.
 /// - `BIT(n)` → `UInt64`; `GEOMETRY` → `Binary` (WKB).
 /// - BLOB/STRING families split on the binary collation (binary → `Binary`,
-///   else `Utf8`); everything else (DECIMAL, TIME, JSON, ENUM, SET, …) → `Utf8`.
+///   else `Utf8`); everything else (TIME, JSON, ENUM, SET, …) → `Utf8`.
 pub fn column_to_arrow(col: &Column, unit: TimeUnit) -> DataType {
     use ColumnType::*;
     let binary = col.character_set() == BINARY_CHARSET;
@@ -65,6 +69,7 @@ pub fn column_to_arrow(col: &Column, unit: TimeUnit) -> DataType {
         MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => DataType::Date32,
         MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => DataType::Timestamp(unit, None),
         MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => DataType::Timestamp(unit, Some("UTC".into())),
+        MYSQL_TYPE_NEWDECIMAL | MYSQL_TYPE_DECIMAL => decimal_type(col.column_length(), col.decimals(), unsigned),
         MYSQL_TYPE_BIT => DataType::UInt64,
         MYSQL_TYPE_GEOMETRY => DataType::Binary,
         MYSQL_TYPE_BLOB | MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB
@@ -77,6 +82,33 @@ pub fn column_to_arrow(col: &Column, unit: TimeUnit) -> DataType {
         }
         _ => DataType::Utf8,
     }
+}
+
+/// Arrow's widest `Decimal128`.
+const MAX_DECIMAL128_PRECISION: u8 = 38;
+
+/// The decimal type of a `DECIMAL(p,s)` column, from its display length
+/// (the digits, plus a point when `s > 0`, plus a sign unless unsigned).
+fn decimal_type(length: u32, scale: u8, unsigned: bool) -> DataType {
+    let overhead = u32::from(scale > 0) + u32::from(!unsigned);
+    // MySQL's widest DECIMAL is 65 digits, so the precision always fits.
+    let precision = (length.saturating_sub(overhead) as u8).clamp(scale.max(1), 76);
+    if precision <= MAX_DECIMAL128_PRECISION {
+        DataType::Decimal128(precision, scale as i8)
+    } else {
+        DataType::Decimal256(precision, scale as i8)
+    }
+}
+
+/// The unscaled value of a DECIMAL's text at `scale`. MySQL prints exactly
+/// `scale` fractional digits, so nothing is ever rounded; more digits than
+/// that, or than `precision`, is an error.
+fn parse_decimal<T: arrow::datatypes::DecimalType>(v: &str, precision: u8, scale: i8) -> Result<T::Native> {
+    let frac = v.split_once('.').map_or(0, |(_, f)| f.len());
+    if frac > scale.max(0) as usize {
+        bail!("{frac} decimal places, more than the column's scale {scale}");
+    }
+    arrow::compute::kernels::cast_utils::parse_decimal::<T>(v, precision, scale).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Field metadata key carrying a MySQL type whose bytes need decoding:
@@ -179,6 +211,36 @@ fn build_column(rows: &[Row], idx: usize, field: &Field) -> Result<ArrayRef> {
         DataType::Int64 => parse_into!(Int64Builder::with_capacity(rows.len()), i64, "int64"),
         DataType::Float32 => parse_into!(Float32Builder::with_capacity(rows.len()), f32, "float32"),
         DataType::Float64 => parse_into!(Float64Builder::with_capacity(rows.len()), f64, "float64"),
+        DataType::Decimal128(p, s) => {
+            let mut b = Decimal128Builder::with_capacity(rows.len())
+                .with_precision_and_scale(*p, *s)
+                .map_err(|e| anyhow::anyhow!("col {name}: {e}"))?;
+            for row in rows {
+                match row.as_ref(idx).and_then(value_text) {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(
+                        parse_decimal::<Decimal128Type>(&v, *p, *s)
+                            .map_err(|e| anyhow::anyhow!("col {name}: decimal '{v}': {e}"))?,
+                    ),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Decimal256(p, s) => {
+            let mut b = Decimal256Builder::with_capacity(rows.len())
+                .with_precision_and_scale(*p, *s)
+                .map_err(|e| anyhow::anyhow!("col {name}: {e}"))?;
+            for row in rows {
+                match row.as_ref(idx).and_then(value_text) {
+                    None => b.append_null(),
+                    Some(v) => b.append_value(
+                        parse_decimal::<Decimal256Type>(&v, *p, *s)
+                            .map_err(|e| anyhow::anyhow!("col {name}: decimal '{v}': {e}"))?,
+                    ),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
 
         // BIGINT UNSIGNED arrives as decimal text; BIT(n) as its raw
         // big-endian bytes (at most 8).
@@ -308,6 +370,25 @@ fn parse_timestamp(s: &str, unit: TimeUnit) -> Result<i64> {
 
 // ── Arrow → MySQL Value (destination) ───────────────────────────────────────
 
+/// Whether `field` is a UUID (`FixedSizeBinary(16)` of the `arrow.uuid`
+/// extension).
+pub fn is_uuid(field: &Field) -> bool {
+    field.data_type() == &DataType::FixedSizeBinary(16)
+        && field.metadata().get("ARROW:extension:name").map(String::as_str) == Some("arrow.uuid")
+}
+
+/// A UUID cell's canonical text (`a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`);
+/// `None` for NULL.
+pub fn uuid_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let b = array.as_fixed_size_binary_opt().context("array type mismatch")?.value(row);
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(Some(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])))
+}
+
+
 /// Converts one Arrow cell to a `mysql_async::Value` for parameter binding.
 /// Temporal and decimal types are rendered to their MySQL text form and sent
 /// as `Bytes`; the server coerces them into the target column type. A
@@ -371,6 +452,25 @@ pub fn cell_to_value(array: &dyn Array, row: usize) -> Result<Value> {
             };
             let dt = from_epoch(v, *unit).ok_or_else(|| anyhow::anyhow!("timestamp out of range: {v}"))?;
             text(dt.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        }
+        // MySQL has no interval type: ISO-8601 text, for a text column.
+        DataType::Interval(unit) => {
+            let (months, days, nanos) = match unit {
+                IntervalUnit::YearMonth => (prim!(IntervalYearMonthType), 0, 0),
+                IntervalUnit::DayTime => {
+                    let v = array.as_primitive_opt::<IntervalDayTimeType>().context("array type mismatch")?.value(row);
+                    (0, v.days, i64::from(v.milliseconds) * 1_000_000)
+                }
+                IntervalUnit::MonthDayNano => {
+                    let v = array.as_primitive_opt::<IntervalMonthDayNanoType>().context("array type mismatch")?.value(row);
+                    (v.months, v.days, v.nanoseconds)
+                }
+            };
+            let sign = if nanos < 0 { "-" } else { "" };
+            let n = nanos.unsigned_abs();
+            let (secs, frac) = (n / 1_000_000_000, n % 1_000_000_000);
+            let frac = if frac == 0 { String::new() } else { format!(".{frac:09}").trim_end_matches('0').to_string() };
+            text(format!("P{months}M{days}DT{sign}{secs}{frac}S"))
         }
         DataType::Time32(unit) | DataType::Time64(unit) => {
             let v = match array.data_type() {
@@ -443,6 +543,35 @@ mod tests {
         assert_eq!(bit_value(&[0x01, 0x00]).unwrap(), 256);
         assert_eq!(bit_value(&[0xff; 8]).unwrap(), u64::MAX);
         assert!(bit_value(&[0; 9]).is_err());
+    }
+
+    #[test]
+    fn uuids_and_intervals_go_as_text() {
+        use arrow::datatypes::IntervalMonthDayNano;
+        let bytes: Vec<u8> = (0u8..16).collect();
+        let ids = arrow_array::FixedSizeBinaryArray::try_from_iter(vec![bytes].into_iter()).unwrap();
+        assert_eq!(uuid_text(&ids, 0).unwrap().unwrap(), "00010203-0405-0607-0809-0a0b0c0d0e0f");
+        let f = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "arrow.uuid".to_string(),
+        )]));
+        assert!(is_uuid(&f) && !is_uuid(&Field::new("raw", DataType::FixedSizeBinary(16), true)));
+        let iv = arrow_array::IntervalMonthDayNanoArray::from(vec![IntervalMonthDayNano::new(14, -3, 5_500_000_000)]);
+        assert_eq!(cell_to_value(&iv, 0).unwrap(), Value::Bytes(b"P14M-3DT5.5S".to_vec()));
+    }
+
+    #[test]
+    fn decimals_are_exact() {
+        assert_eq!(decimal_type(12, 2, false), DataType::Decimal128(10, 2)); // DECIMAL(10,2)
+        assert_eq!(decimal_type(11, 2, true), DataType::Decimal128(10, 2)); // UNSIGNED
+        assert_eq!(decimal_type(11, 0, false), DataType::Decimal128(10, 0));
+        assert_eq!(decimal_type(67, 30, false), DataType::Decimal256(65, 30));
+        assert_eq!(parse_decimal::<Decimal128Type>("-123.45", 10, 2).unwrap(), -12345);
+        assert_eq!(parse_decimal::<Decimal128Type>("7", 10, 2).unwrap(), 700);
+        assert!(parse_decimal::<Decimal128Type>("1.005", 10, 2).is_err(), "never rounded");
+        assert!(parse_decimal::<Decimal128Type>("123456789.00", 5, 2).is_err(), "too many digits");
+        let big = parse_decimal::<Decimal256Type>(&format!("{}.5", "9".repeat(60)), 65, 1).unwrap();
+        assert!(big > arrow::datatypes::i256::from_i128(i128::MAX));
     }
 
     #[test]

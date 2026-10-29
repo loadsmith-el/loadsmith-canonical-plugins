@@ -4,6 +4,64 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-29 — native TIME/UUID/INTERVAL/DECIMAL, `parallel.partitions`, AWS roles
+
+The plugins move to the SDK of loadsmith `5d9ec7b` (arrow 60), and to arrow /
+parquet 60 and reqwest 0.13.
+
+### postgres 0.8.0
+
+- **`TIME`, `UUID` and `INTERVAL` are read as native Arrow types** instead of
+  text: `Time32`/`Time64` in `timestamp_unit`, `FixedSizeBinary(16)` with the
+  `arrow.uuid` extension, and `Interval(MonthDayNano)` (read under
+  `IntervalStyle = iso_8601`, pinned on the session). `uuid_as: text` and
+  `interval_as: text` keep the text. An incremental pipeline's `state:`
+  refuses the new schema until reset or `on_schema_change: continue` (see
+  *Migrating from 0.7*).
+- **`parallel.partitions`** sets how many ranges a partitioned load is cut
+  into (default `8 × workers`, up to 4096): more, smaller partitions make a
+  resumed run re-read less.
+- Destination: a UUID is written as its text, an interval as ISO-8601,
+  `Decimal32`/`Decimal64` as decimals, and `24:00:00` as itself.
+
+### oracle 0.9.0
+
+- **`INTERVAL YEAR TO MONTH` / `DAY TO SECOND` are read as
+  `Interval(MonthDayNano)`** (`interval_as: text` keeps the `TO_CHAR` text).
+- Destination: an interval goes into an INTERVAL column through
+  `TO_YMINTERVAL` / `TO_DSINTERVAL` (a value the column can't hold fails),
+  into any other column as ISO-8601; a UUID as its text (its bytes into RAW).
+- **`parallel.partitions`**, as in postgres.
+
+### mysql 0.3.0
+
+- **`DECIMAL(p,s)` is read as `Decimal128(p, s)`** (`Decimal256` past 38
+  digits) instead of text. See *Migrating from 0.2*.
+- Destination: a UUID is written as its text, an interval as ISO-8601.
+
+### parquet 0.5.0
+
+- A UUID (`arrow.uuid`) is written as Parquet's `UUID` type.
+- An `Interval(MonthDayNano)`, which Parquet cannot store, is written as an
+  exact `struct<months: int32, days: int32, nanoseconds: int64>`.
+
+### jsonl 0.3.0
+
+- A UUID (`arrow.uuid`) is written as its canonical string, not base64.
+- `Decimal32`/`Decimal64` as exact strings.
+
+### s3 0.2.0
+
+- **The AWS credential chain**: without keys in the config or `AWS_*`
+  variables, the sink reads the shared credentials file, EKS IRSA (web
+  identity at STS), the container endpoint (ECS task roles, EKS Pod Identity)
+  and the EC2 instance profile (IMDSv2), and fetches role credentials again
+  before they expire.
+
+### sharepoint 0.2.1
+
+- reqwest 0.13 (no behavior change).
+
 ## 2026-10-24 — continuing failed runs, COPY reads
 
 The plugins move to the SDK of engine 1.3 (commit `3a10004`: resume tokens,

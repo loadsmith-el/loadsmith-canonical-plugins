@@ -29,7 +29,8 @@ loadsmith-plugin-sdk = { workspace = true }
 mimalloc             = { workspace = true }
 
 # Parquet writer — released in lockstep with `arrow` (shared major), so this
-# must match arrow = "54". `bytesize` parses human sizes ("500KiB"); both pure
+# must match arrow = "60". `arrow_canonical_extension_types`: an `arrow.uuid`
+# field is written as Parquet's UUID type. `bytesize` parses human sizes ("500KiB"); both pure
 # Rust, keeping the multi-arch-first / pure-Rust posture.
-parquet  = "60"
+parquet  = { version = "60", features = ["arrow_canonical_extension_types"] }
 bytesize = "1"

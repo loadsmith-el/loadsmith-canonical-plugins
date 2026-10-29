@@ -72,6 +72,7 @@ or panics:
 | `Decimal128/256` | **string** with the scale applied, e.g. `"123.45"` (exact) |
 | `Utf8`, `LargeUtf8`, `Utf8View` | string |
 | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary` | base64 string (standard, padded) |
+| `FixedSizeBinary(16)` of the `arrow.uuid` extension | the UUID's canonical string (`a0eebc99-9c0b-4ef8-…`) |
 | dates, times, timestamps, durations | see [Temporal values](#temporal-values) |
 | `Interval` | `{"months": n}` / `{"days": d, "milliseconds": ms}` / `{"months": m, "days": d, "nanoseconds": ns}` |
 | `List`, `LargeList`, `FixedSizeList` | array of the converted items (e.g. Postgres arrays) |

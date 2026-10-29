@@ -123,6 +123,22 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+// ── Native or text ───────────────────────────────────────────────────────────
+
+config_enum! {
+    /// How a type with a native Arrow form that some consumers can't read
+    /// (`interval_as`) is emitted.
+    #[derive(Default)]
+    pub enum NativeOrText for "interval_as" {
+        /// The native Arrow type (the default).
+        #[default]
+        Native = "native",
+        /// The database's own text.
+        Text = "text",
+    }
+    retired {}
+}
+
 // ── Timestamp unit ───────────────────────────────────────────────────────────
 
 config_enum! {

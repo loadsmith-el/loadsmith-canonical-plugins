@@ -37,7 +37,12 @@ and a wrong `compression` names the valid values and the likely one (`none` →
 ``did you mean `uncompressed`?``).
 
 Every Arrow type the protocol carries is written natively (timestamps keep
-their unit and zone, decimals their precision and scale, lists stay lists).
+their unit and zone, decimals their precision and scale, lists stay lists; a
+`FixedSizeBinary(16)` of the `arrow.uuid` extension is Parquet's `UUID`
+type). One exception: Parquet has no type for an `Interval(MonthDayNano)` (a
+Postgres or Oracle `INTERVAL`; Parquet's own `INTERVAL` is unsigned
+milliseconds), so it is written as an exact
+`struct<months: int32, days: int32, nanoseconds: int64>` — query `col.days`.
 
 ## `max_file_size` syntax
 

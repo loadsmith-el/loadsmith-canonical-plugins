@@ -7,22 +7,25 @@
 //! round-trip without the binary `ToSql`/`FromSql` pitfalls.
 //!
 //! Accepted Arrow types: every integer width (signed and unsigned), floats,
-//! `Decimal128`/`Decimal256`, booleans, strings (`Utf8`, `LargeUtf8`,
+//! every decimal width, booleans, strings (`Utf8`, `LargeUtf8`,
 //! `Utf8View`), binaries (`Binary`, `LargeBinary`, `FixedSizeBinary`,
-//! `BinaryView`), `Date32`/`Date64`, `Timestamp` in every unit with or without
-//! a zone, `Time32`/`Time64` in every unit, and `List`/`LargeList`/
+//! `BinaryView`; a `FixedSizeBinary(16)` of the `arrow.uuid` extension as the
+//! UUID's text), `Date32`/`Date64`, `Timestamp` in every unit with or without
+//! a zone, `Time32`/`Time64` in every unit, `Interval` (as ISO-8601, which
+//! Postgres reads into an `interval`), and `List`/`LargeList`/
 //! `FixedSizeList` of any of these (written as Postgres arrays; nested lists
 //! as multi-dimensional arrays, which Postgres requires to be rectangular).
 
 use anyhow::{bail, Context, Result};
 use arrow::array::AsArray;
 use arrow::datatypes::{
-    Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Date32Type, Date64Type, Decimal32Type, Decimal64Type, Float16Type, IntervalDayTimeType,
+    IntervalMonthDayNanoType, IntervalYearMonthType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
     Int8Type, Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
     UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch};
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
 
 use crate::vocab::{from_epoch, time_of_day};
 
@@ -38,8 +41,8 @@ pub fn batch_to_copy_text(batch: &RecordBatch) -> Result<String> {
             if col > 0 {
                 out.push('\t');
             }
-            let name = batch.schema_ref().field(col).name().clone();
-            match value_text(batch.column(col).as_ref(), row).with_context(|| format!("column `{name}`"))? {
+            let field = batch.schema_ref().field(col);
+            match value_text(batch.column(col).as_ref(), row, field).with_context(|| format!("column `{}`", field.name()))? {
                 Some(s) => out.push_str(&escape(&s)),
                 None => out.push_str("\\N"),
             }
@@ -64,8 +67,8 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// The Postgres input text of one value, or `None` for SQL NULL.
-fn value_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
+/// The Postgres input text of one value of `field`, or `None` for SQL NULL.
+fn value_text(array: &dyn Array, row: usize, field: &Field) -> Result<Option<String>> {
     if array.is_null(row) {
         return Ok(None);
     }
@@ -89,6 +92,8 @@ fn value_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
             if v.is_finite() { v.to_string() } else { float_text(v as f64) }
         }
         DataType::Float64 => float_text(array.as_primitive_opt::<Float64Type>().context("array type mismatch")?.value(row)),
+        DataType::Decimal32(..) => array.as_primitive_opt::<Decimal32Type>().context("array type mismatch")?.value_as_string(row),
+        DataType::Decimal64(..) => array.as_primitive_opt::<Decimal64Type>().context("array type mismatch")?.value_as_string(row),
         DataType::Decimal128(..) => downcast::<Decimal128Array>(array)?.value_as_string(row),
         DataType::Decimal256(..) => downcast::<Decimal256Array>(array)?.value_as_string(row),
         DataType::Boolean => {
@@ -100,7 +105,24 @@ fn value_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
         DataType::Binary => bytea(array.as_binary_opt::<i32>().context("array type mismatch")?.value(row)),
         DataType::LargeBinary => bytea(array.as_binary_opt::<i64>().context("array type mismatch")?.value(row)),
         DataType::BinaryView => bytea(array.as_binary_view_opt().context("array type mismatch")?.value(row)),
+        DataType::FixedSizeBinary(16) if is_uuid(field) => {
+            uuid_text(array.as_fixed_size_binary_opt().context("array type mismatch")?.value(row))
+        }
         DataType::FixedSizeBinary(_) => bytea(array.as_fixed_size_binary_opt().context("array type mismatch")?.value(row)),
+        DataType::Interval(unit) => {
+            let (months, days, nanos) = match unit {
+                IntervalUnit::YearMonth => (array.as_primitive_opt::<IntervalYearMonthType>().context("array type mismatch")?.value(row), 0, 0),
+                IntervalUnit::DayTime => {
+                    let v = array.as_primitive_opt::<IntervalDayTimeType>().context("array type mismatch")?.value(row);
+                    (0, v.days, i64::from(v.milliseconds) * 1_000_000)
+                }
+                IntervalUnit::MonthDayNano => {
+                    let v = array.as_primitive_opt::<IntervalMonthDayNanoType>().context("array type mismatch")?.value(row);
+                    (v.months, v.days, v.nanoseconds)
+                }
+            };
+            iso_interval(months, days, nanos)
+        }
         DataType::Date32 => {
             let days = array.as_primitive_opt::<Date32Type>().context("array type mismatch")?.value(row);
             let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
@@ -136,19 +158,50 @@ fn value_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
                 }
                 _ => array.as_primitive_opt::<Time64NanosecondType>().context("array type mismatch")?.value(row),
             };
-            time_of_day(v, *unit)
-                .ok_or_else(|| anyhow::anyhow!("time of day out of range: {v}"))?
-                .format("%H:%M:%S%.f")
-                .to_string()
+            let per_second: i64 = match unit {
+                TimeUnit::Second => 1,
+                TimeUnit::Millisecond => 1_000,
+                TimeUnit::Microsecond => 1_000_000,
+                TimeUnit::Nanosecond => 1_000_000_000,
+            };
+            if v == 86_400 * per_second {
+                // Postgres' own end of day (`24:00:00`), past chrono's range.
+                "24:00:00".to_string()
+            } else {
+                time_of_day(v, *unit)
+                    .ok_or_else(|| anyhow::anyhow!("time of day out of range: {v}"))?
+                    .format("%H:%M:%S%.f")
+                    .to_string()
+            }
         }
-        DataType::List(_) => array_literal(&array.as_list_opt::<i32>().context("array type mismatch")?.value(row))?,
-        DataType::LargeList(_) => array_literal(&array.as_list_opt::<i64>().context("array type mismatch")?.value(row))?,
-        DataType::FixedSizeList(..) => {
-            array_literal(&array.as_fixed_size_list_opt().context("array type mismatch")?.value(row))?
+        DataType::List(item) => array_literal(&array.as_list_opt::<i32>().context("array type mismatch")?.value(row), item)?,
+        DataType::LargeList(item) => array_literal(&array.as_list_opt::<i64>().context("array type mismatch")?.value(row), item)?,
+        DataType::FixedSizeList(item, _) => {
+            array_literal(&array.as_fixed_size_list_opt().context("array type mismatch")?.value(row), item)?
         }
         other => bail!("the postgres destination does not support Arrow type {other:?}"),
     };
     Ok(Some(text))
+}
+
+/// Whether `field` is of the `arrow.uuid` extension.
+fn is_uuid(field: &Field) -> bool {
+    field.metadata().get("ARROW:extension:name").map(String::as_str) == Some("arrow.uuid")
+}
+
+/// `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`.
+fn uuid_text(b: &[u8]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
+}
+
+/// An interval as ISO-8601 (`P14M-3DT5.000000001S`), each part signed on
+/// its own, as Postgres reads it.
+fn iso_interval(months: i32, days: i32, nanos: i64) -> String {
+    let sign = if nanos < 0 { "-" } else { "" };
+    let (secs, frac) = (nanos.unsigned_abs() / 1_000_000_000, nanos.unsigned_abs() % 1_000_000_000);
+    let frac = if frac == 0 { String::new() } else { format!(".{frac:09}").trim_end_matches('0').to_string() };
+    format!("P{months}M{days}DT{sign}{secs}{frac}S")
 }
 
 /// The raw epoch value of a timestamp cell, in its own unit.
@@ -191,14 +244,14 @@ fn bytea(bytes: &[u8]) -> String {
 /// A Postgres array literal of a list value: `{"1","2",NULL}`. Every non-null
 /// element is quoted (with `\` and `"` escaped), which Postgres accepts for
 /// any element type; a nested list becomes a sub-array.
-fn array_literal(items: &ArrayRef) -> Result<String> {
+fn array_literal(items: &ArrayRef, item: &Field) -> Result<String> {
     let mut out = String::from("{");
     for i in 0..items.len() {
         if i > 0 {
             out.push(',');
         }
         let nested = matches!(items.data_type(), DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..));
-        match value_text(items.as_ref(), i)? {
+        match value_text(items.as_ref(), i, item)? {
             None => out.push_str("NULL"),
             Some(s) if nested => out.push_str(&s),
             Some(s) => {
@@ -245,6 +298,30 @@ mod tests {
     fn one(col: ArrayRef) -> String {
         let schema = Arc::new(Schema::new(vec![Field::new("c", col.data_type().clone(), true)]));
         batch_to_copy_text(&RecordBatch::try_new(schema, vec![col]).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn uuids_and_intervals_in_postgres_input_text() {
+        use arrow::datatypes::IntervalMonthDayNano;
+        let bytes: Vec<u8> = (0u8..16).collect();
+        let ids: ArrayRef = Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_iter(vec![bytes.clone()].into_iter()).unwrap(),
+        );
+        let uuid = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "arrow.uuid".to_string(),
+        )]));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![uuid])), vec![ids.clone()]).unwrap();
+        assert_eq!(batch_to_copy_text(&batch).unwrap(), "00010203-0405-0607-0809-0a0b0c0d0e0f\n");
+        assert!(one(ids).starts_with("\\\\x0001"), "plain FixedSizeBinary stays bytea");
+        let iv = arrow_array::IntervalMonthDayNanoArray::from(vec![
+            IntervalMonthDayNano::new(14, -3, 5_500_000_000),
+            IntervalMonthDayNano::new(0, 0, -1_000),
+            IntervalMonthDayNano::new(0, 0, 0),
+        ]);
+        assert_eq!(one(Arc::new(iv)), "P14M-3DT5.5S\nP0M0DT-0.000001S\nP0M0DT0S\n");
+        let t = arrow_array::Time32MillisecondArray::from(vec![86_400_000, 3_723_500]);
+        assert_eq!(one(Arc::new(t)), "24:00:00\n01:02:03.500\n");
     }
 
     #[test]

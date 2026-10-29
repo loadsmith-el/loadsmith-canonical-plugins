@@ -277,13 +277,25 @@ impl DestinationPlugin for OracleDestPlugin {
         }
         let staged = self.staging_table.is_some();
         let targets: Vec<Option<&'static DbType>> = self.columns.iter().map(|c| self.target_type(c)).collect();
+        // A UUID goes as its text, unless the column holds raw bytes (RAW(16)).
+        let uuid_text: Vec<bool> = batch
+            .schema_ref()
+            .fields()
+            .iter()
+            .zip(&targets)
+            .map(|(f, t)| crate::types::is_uuid(f) && !t.is_some_and(|t| t == oracledb::DB_TYPE_RAW))
+            .collect();
 
         // Materialise all binds (owned) up front, then run the array DML.
         let mut rows: Vec<Vec<Bind>> = Vec::with_capacity(nrows);
         for row in 0..nrows {
             let mut cells: Vec<Bind> = Vec::with_capacity(batch.num_columns() + 1);
-            for col in 0..batch.num_columns() {
-                cells.push(cell_to_bind(batch.column(col), row, targets.get(col).copied().flatten())?);
+            for (col, &as_text) in uuid_text.iter().enumerate() {
+                cells.push(if as_text {
+                    Bind::Text(crate::types::uuid_text(batch.column(col), row)?)
+                } else {
+                    cell_to_bind(batch.column(col), row, targets.get(col).copied().flatten())?
+                });
             }
             if staged {
                 cells.push(Bind::Text(Some((self.rows_written + row as u64).to_string())));

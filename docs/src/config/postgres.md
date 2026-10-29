@@ -44,6 +44,8 @@ rejected with the valid values (`read_only` → "did you mean `read-only`?").
 | `transaction_isolation` | `read-committed` / `repeatable-read` / `serializable` | server default (`BEGIN`; normally `read-committed`) | Isolation for the cursor transaction. `repeatable-read` gives a consistent snapshot across all `FETCH`es. |
 | `incremental` | object | — | Activates incremental reads (below). Requires a pipeline `state:` block. |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `timestamp`/`timestamptz` columns (and arrays of them). The default is the same in every canonical plugin and truncates below the millisecond; **`us` keeps Postgres' full precision**. `ns` is the µs value × 1000 and only covers the years 1677–2262 (a value outside fails the batch). |
+| `uuid_as` | `native` / `text` | `native` | `UUID` as `FixedSizeBinary(16)` with the `arrow.uuid` extension (Parquet's `UUID` type) or as its text. `text` is for consumers that show a Parquet UUID as bytes (Spark, Athena, Glue). |
+| `interval_as` | `native` / `text` | `native` | `INTERVAL` as `Interval(MonthDayNano)` or as Postgres' text in the session's `IntervalStyle`. |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMERIC` **without a declared precision** (a bare `numeric` column, `sum(x)`, …), emitted as `Decimal128(38, number_scale)`; see the type table. |
 | `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint partitions (`partitions`, default `8 × workers`) of the query's table in one snapshot. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
 
@@ -153,12 +155,15 @@ State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.h
 | `DATE` | `Date32` | BC dates supported; `infinity`/`-infinity` are rejected with a clear error (map them in the query, e.g. `NULLIF(col, 'infinity')`). |
 | `TIMESTAMP` | `Timestamp(unit, None)` | `unit` is `timestamp_unit` (default `ms`: sub-millisecond digits are truncated; `us` keeps them all). BC and `infinity` as for `DATE`. |
 | `TIMESTAMPTZ` | `Timestamp(unit, "UTC")` | The session zone's offset (incl. local-mean-time `+HH:MM:SS`) is parsed and the value normalized to UTC, so the session `TimeZone` doesn't change the instant. |
+| `TIME` | `Time32(unit)` / `Time64(unit)` | A time of day in `timestamp_unit` (`ms`, `s` → `Time32`; `us`, `ns` → `Time64`); sub-unit digits truncated like a timestamp's. `24:00:00` is kept (one day). `TIMETZ` stays text. |
+| `UUID` | `FixedSizeBinary(16)` + `arrow.uuid` | Parquet's `UUID` type; text outputs (JSONL, the Postgres/MySQL/Oracle destinations) write the canonical `a0eebc99-…` string. `uuid_as: text` keeps the text. |
+| `INTERVAL` | `Interval(MonthDayNano)` | Months, days and nanoseconds, each signed, nothing lost (read with `IntervalStyle` `iso_8601`, pinned on the session). `interval_as: text` keeps Postgres' text. |
 | `BYTEA` | `Binary` | |
 | `anytype[]` (arrays) | `List(inner)` | Inner type follows the same mapping; `NULL` elements preserved, a quoted `"NULL"` element is the string. One-dimensional values only (explicit bounds like `[0:2]={…}` are fine): a multi-dimensional value fails with a hint — select `array_to_json(col)` to keep its shape as JSON, or `col::text`. |
 | `NUMERIC(p,s)` | `Decimal128(p, s)` | Exact; `Decimal256(p, s)` past 38 digits. A negative scale (Postgres 15+) is a whole-number decimal. |
 | `NUMERIC` (no precision) | `Decimal128(38, number_scale)` | Default scale 10. A value with more decimal places or more than 38 digits, or `NaN`/`Infinity`, fails the run naming the column — nothing is rounded. Declare the type in the query instead (`col::numeric(20,4)`), or keep it as text (`col::text`) / floating point (`col::float8`). |
 | `hstore` | `Utf8` (JSON) | `"k"=>"v"` → `{"k":"v"}`; null values become JSON `null`. |
-| Everything else (`TEXT`, `UUID`, `TIME`, `INTERVAL`, `JSON`, …) | `Utf8` | Text as returned by the Postgres text protocol. |
+| Everything else (`TEXT`, `TIMETZ`, `JSON`, …) | `Utf8` | Text as returned by the Postgres text protocol. |
 
 Rows are read over the text protocol, so the source pins the two output
 settings its decoder depends on — `DateStyle = 'ISO'` (output style only; your
@@ -313,6 +318,12 @@ destination:
     merge_key: [id]          # required for merge
     update_columns: [status, updated_at]   # optional; default: every non-key column
 ```
+
+### Migrating from 0.7
+
+| 0.7 | 0.8 |
+|---|---|
+| `TIME`, `UUID`, `INTERVAL` → `Utf8` text | `Time32`/`Time64`, `FixedSizeBinary(16)` (`arrow.uuid`), `Interval(MonthDayNano)` (see the type table). Parquet columns become `TIME`, `UUID` and a `struct<months, days, nanoseconds>`. `uuid_as: text` / `interval_as: text` keep the old text. An incremental pipeline's next run sees the new schema: its `state:` refuses it (`on_schema_change: refuse`, the default) until the state is reset (`loadsmith state rm`) or the run uses `on_schema_change: continue`. |
 
 ### Migrating from 0.3
 

@@ -48,6 +48,11 @@ struct OracleConfig {
     #[serde(default = "default_number_scale")]
     number_scale: u8,
 
+    /// `INTERVAL` columns as `Interval(MonthDayNano)` (`native`, the
+    /// default) or as Oracle's `TO_CHAR` text (`text`).
+    #[serde(default)]
+    interval_as: crate::vocab::NativeOrText,
+
     /// Partitioned full load: `workers` connections read disjoint ROWID
     /// ranges of the query's table at one SCN (see [`crate::parallel`]).
     #[serde(default)]
@@ -476,7 +481,12 @@ impl SourcePlugin for OracleSourcePlugin {
             Ok((conn, cols))
         })?;
 
-        let (select_list, schema) = types::projected_select(&cols, cfg.timestamp_unit.arrow(), cfg.number_scale as i8);
+        let (select_list, schema) = types::projected_select(
+            &cols,
+            cfg.timestamp_unit.arrow(),
+            cfg.number_scale as i8,
+            cfg.interval_as == crate::vocab::NativeOrText::Text,
+        );
 
         if let Some(inc) = &cfg.incremental {
             // Resolve the config cursor name against the catalog's upper-cased

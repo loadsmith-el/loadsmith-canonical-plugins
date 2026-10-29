@@ -4,7 +4,9 @@ use arrow::datatypes::i256;
 use arrow_array::{
     builder::{
         BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
-        Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+        Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder, Time32MillisecondBuilder,
+        Time32SecondBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder, FixedSizeBinaryBuilder,
+        IntervalMonthDayNanoBuilder,
         TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
         TimestampSecondBuilder,
     },
@@ -12,8 +14,8 @@ use arrow_array::{
     types::{TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType},
     ArrayRef, ListArray, RecordBatch,
 };
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use postgres_types::Kind;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,57 +72,91 @@ fn decimal_of(precision: u8, scale: i8) -> DataType {
     }
 }
 
+/// Field metadata naming an Arrow extension type (`arrow.uuid`).
+pub const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
+/// The canonical Arrow UUID extension: `FixedSizeBinary(16)`.
+pub const UUID_EXTENSION: &str = "arrow.uuid";
+
+/// How the source maps the types that have a choice.
+#[derive(Debug, Clone, Copy)]
+pub struct TypeMap {
+    /// The timestamps' (and times') unit.
+    pub unit: TimeUnit,
+    /// The scale of an unconstrained `numeric`.
+    pub number_scale: i8,
+    /// `uuid` as its text instead of `FixedSizeBinary(16)` (`uuid_as: text`).
+    pub uuid_text: bool,
+    /// `interval` as its text instead of `Interval(MonthDayNano)`
+    /// (`interval_as: text`).
+    pub interval_text: bool,
+}
+
+impl TypeMap {
+    /// The defaults: every type native.
+    pub fn new(unit: TimeUnit, number_scale: i8) -> Self {
+        Self { unit, number_scale, uuid_text: false, interval_text: false }
+    }
+}
+
 /// Maps a Postgres type (and its type modifier, which carries `numeric`'s
 /// precision and scale) to an Arrow DataType.
 ///
 /// - `array` (any element type) → `DataType::List` with a recursively-mapped inner type
 /// - `hstore` → `DataType::Utf8` (JSON-encoded; see HSTORE_TYPE_KEY metadata on the Field)
 /// - `numeric` → an exact decimal (see [`numeric_to_arrow`])
-/// - everything else → mapped by type name (UUID/JSON/etc. fall through to Utf8)
-pub fn pg_type_to_arrow(pg_type: &PgType, typmod: i32, unit: TimeUnit, number_scale: i8) -> DataType {
+/// - `time` → `Time32`/`Time64` in the timestamps' unit
+/// - `uuid` → `FixedSizeBinary(16)` (the field carries the `arrow.uuid` extension)
+/// - `interval` → `Interval(MonthDayNano)`
+/// - everything else → mapped by type name (JSON/text/etc. fall through to Utf8)
+pub fn pg_type_to_arrow(pg_type: &PgType, typmod: i32, map: &TypeMap) -> DataType {
+    arrow_field("", pg_type, typmod, map).data_type().clone()
+}
+
+/// The Arrow field of a column (or array element) named `name`, with the
+/// metadata its type needs (hstore, the UUID extension).
+fn arrow_field(name: &str, pg_type: &PgType, typmod: i32, map: &TypeMap) -> Field {
+    let field = |dt: DataType| Field::new(name, dt, true);
+    let tagged = |dt: DataType, key: &str, value: &str| {
+        field(dt).with_metadata(HashMap::from([(key.to_string(), value.to_string())]))
+    };
     if pg_type.name() == "hstore" {
-        return DataType::Utf8;
+        return tagged(DataType::Utf8, HSTORE_TYPE_KEY, HSTORE_TYPE_VALUE);
     }
     if let Kind::Array(inner) = pg_type.kind() {
         // An array column's typmod is its element's.
-        let inner_dt = pg_type_to_arrow(inner, typmod, unit, number_scale);
-        return DataType::List(Arc::new(Field::new("item", inner_dt, true)));
+        return field(DataType::List(Arc::new(arrow_field("item", inner, typmod, map))));
     }
-    match pg_type.name() {
-        "numeric" => numeric_to_arrow(typmod, number_scale),
+    let unit = map.unit;
+    field(match pg_type.name() {
+        "numeric" => numeric_to_arrow(typmod, map.number_scale),
         "int2" | "int4" => DataType::Int32,
         "int8" => DataType::Int64,
         "float4" => DataType::Float32,
         "float8" => DataType::Float64,
         "bool" => DataType::Boolean,
         "date" => DataType::Date32,
+        // A time of day, in the timestamps' unit (Arrow keeps seconds and
+        // milliseconds in 32 bits).
+        "time" => match unit {
+            TimeUnit::Second | TimeUnit::Millisecond => DataType::Time32(unit),
+            TimeUnit::Microsecond | TimeUnit::Nanosecond => DataType::Time64(unit),
+        },
         "timestamp" => DataType::Timestamp(unit, None),
         // An absolute instant: decoded to UTC, and tagged so downstream (e.g.
         // Parquet) keeps it zone-aware.
         "timestamptz" => DataType::Timestamp(unit, Some("UTC".into())),
         "bytea" => DataType::Binary,
+        "uuid" if !map.uuid_text => {
+            return tagged(DataType::FixedSizeBinary(16), EXTENSION_NAME_KEY, UUID_EXTENSION);
+        }
+        "interval" if !map.interval_text => DataType::Interval(IntervalUnit::MonthDayNano),
         _ => DataType::Utf8,
-    }
+    })
 }
 
 /// Builds an Arrow Schema from a slice of tokio-postgres columns.
-pub fn columns_to_schema(cols: &[Column], unit: TimeUnit, number_scale: i8) -> Schema {
-    let fields: Vec<Field> = cols
-        .iter()
-        .map(|c| {
-            let dt = pg_type_to_arrow(c.type_(), c.type_modifier(), unit, number_scale);
-            if c.type_().name() == "hstore" {
-                let meta = HashMap::from([(
-                    HSTORE_TYPE_KEY.to_string(),
-                    HSTORE_TYPE_VALUE.to_string(),
-                )]);
-                Field::new(c.name(), dt, true).with_metadata(meta)
-            } else {
-                Field::new(c.name(), dt, true)
-            }
-        })
-        .collect();
-    Schema::new(fields)
+pub fn columns_to_schema(cols: &[Column], map: &TypeMap) -> Schema {
+    Schema::new(cols.iter().map(|c| arrow_field(c.name(), c.type_(), c.type_modifier(), map)).collect::<Vec<_>>())
 }
 
 /// Rows whose values are Postgres' text output: `simple_query` rows, or
@@ -268,6 +304,29 @@ fn build_values(values: &[Option<&str>], field: &Field, col_name: &str) -> Resul
                 TimeUnit::Microsecond => timestamps!(TimestampMicrosecondBuilder, TimestampMicrosecondType),
                 TimeUnit::Nanosecond => timestamps!(TimestampNanosecondBuilder, TimestampNanosecondType),
             }
+        }
+        DataType::Time32(unit) => match unit {
+            TimeUnit::Second => parsed!(Time32SecondBuilder, |v| parse_time(v, *unit).map(|t| t as i32)),
+            _ => parsed!(Time32MillisecondBuilder, |v| parse_time(v, *unit).map(|t| t as i32)),
+        },
+        DataType::Time64(unit) => match unit {
+            TimeUnit::Microsecond => parsed!(Time64MicrosecondBuilder, |v| parse_time(v, *unit)),
+            _ => parsed!(Time64NanosecondBuilder, |v| parse_time(v, *unit)),
+        },
+        DataType::FixedSizeBinary(16) => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(values.len(), 16);
+            for v in values {
+                match v {
+                    None => b.append_null(),
+                    Some(v) => b
+                        .append_value(parse_uuid(v).map_err(|e| anyhow::anyhow!("col {col_name}: uuid '{v}': {e}"))?)
+                        .map_err(|e| anyhow::anyhow!("col {col_name}: {e}"))?,
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            parsed!(IntervalMonthDayNanoBuilder, parse_iso_interval)
         }
         DataType::Binary => {
             let mut b = BinaryBuilder::with_capacity(values.len(), values.len() * 16);
@@ -621,6 +680,81 @@ fn parse_timestamp(s: &str, with_offset: bool, unit: TimeUnit) -> Result<i64> {
     crate::vocab::epoch_in(utc, unit).map_err(|e| anyhow::anyhow!(e))
 }
 
+/// A `uuid`'s 16 bytes from its text (`a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`;
+/// Postgres prints it lower-case and hyphenated).
+pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
+    let hex: Vec<u8> = s.bytes().filter(|&b| b != b'-').collect();
+    if hex.len() != 32 {
+        bail!("not a UUID");
+    }
+    let mut out = [0u8; 16];
+    for (i, pair) in hex.chunks(2).enumerate() {
+        let digit = |c: u8| (c as char).to_digit(16).ok_or_else(|| anyhow::anyhow!("not a UUID"));
+        out[i] = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
+    }
+    Ok(out)
+}
+
+/// An `interval` in IntervalStyle `iso_8601` (`P1Y2M3DT4H5M6.5S`, every
+/// field signed: `P-1Y-2M3DT-4H`, `PT0S`): months, days, nanoseconds.
+pub fn parse_iso_interval(s: &str) -> Result<arrow::datatypes::IntervalMonthDayNano> {
+    let body = s.strip_prefix('P').ok_or_else(|| anyhow::anyhow!("not an ISO-8601 interval"))?;
+    let (date, time) = body.split_once('T').unwrap_or((body, ""));
+    let (mut months, mut days, mut nanos) = (0i64, 0i64, 0i128);
+    let overflow = || anyhow::anyhow!("out of range");
+    for (part, in_time) in [(date, false), (time, true)] {
+        let mut rest = part;
+        while !rest.is_empty() {
+            let at = rest.find(|c: char| c.is_ascii_alphabetic()).ok_or_else(|| anyhow::anyhow!("a number without its unit"))?;
+            let (number, unit) = (&rest[..at], rest.as_bytes()[at]);
+            rest = &rest[at + 1..];
+            match (in_time, unit) {
+                (false, b'Y') => months = months.checked_add(number.parse::<i64>()?.checked_mul(12).ok_or_else(overflow)?).ok_or_else(overflow)?,
+                (false, b'M') => months = months.checked_add(number.parse()?).ok_or_else(overflow)?,
+                (false, b'W') => days = days.checked_add(number.parse::<i64>()?.checked_mul(7).ok_or_else(overflow)?).ok_or_else(overflow)?,
+                (false, b'D') => days = days.checked_add(number.parse()?).ok_or_else(overflow)?,
+                (true, b'H') => nanos += i128::from(number.parse::<i64>()?) * 3_600_000_000_000,
+                (true, b'M') => nanos += i128::from(number.parse::<i64>()?) * 60_000_000_000,
+                (true, b'S') => nanos += seconds_in_nanos(number)?,
+                _ => bail!("unexpected `{}`", unit as char),
+            }
+        }
+    }
+    Ok(arrow::datatypes::IntervalMonthDayNano::new(
+        i32::try_from(months).map_err(|_| overflow())?,
+        i32::try_from(days).map_err(|_| overflow())?,
+        i64::try_from(nanos).map_err(|_| overflow())?,
+    ))
+}
+
+/// `-6.5` seconds in nanoseconds (up to nine fractional digits).
+fn seconds_in_nanos(s: &str) -> Result<i128> {
+    let (negative, digits) = s.strip_prefix('-').map_or((false, s), |d| (true, d));
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("bad seconds `{s}`");
+    }
+    let v = i128::from(whole.parse::<i64>()?) * 1_000_000_000 + format!("{frac:0<9}").parse::<i128>().unwrap_or(0);
+    Ok(if negative { -v } else { v })
+}
+
+/// A `time` value (`HH:MM:SS[.f]`, up to `24:00:00`) since midnight, in
+/// `unit`; digits below the unit are dropped, like a timestamp's.
+fn parse_time(s: &str, unit: TimeUnit) -> Result<i64> {
+    let nanos = if s == "24:00:00" {
+        86_400 * 1_000_000_000
+    } else {
+        let t = parse_iso_time(s).ok_or_else(|| anyhow::anyhow!("not a time of day (HH:MM:SS[.f])"))?;
+        i64::from(t.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(t.nanosecond())
+    };
+    Ok(match unit {
+        TimeUnit::Second => nanos / 1_000_000_000,
+        TimeUnit::Millisecond => nanos / 1_000_000,
+        TimeUnit::Microsecond => nanos / 1_000,
+        TimeUnit::Nanosecond => nanos,
+    })
+}
+
 /// The `HH:MM:SS[.f]` layout Postgres prints (DateStyle ISO), up to nine
 /// fractional digits; `None` for anything else.
 fn parse_iso_time(s: &str) -> Option<NaiveTime> {
@@ -801,7 +935,7 @@ mod tests {
     #[test]
     fn type_int4_array_becomes_list_of_int32() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::INT4_ARRAY, -1, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE);
+        let dt = pg_type_to_arrow(&Type::INT4_ARRAY, -1, &TypeMap::new(TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE));
         assert!(matches!(dt, DataType::List(_)));
         if let DataType::List(inner) = dt {
             assert_eq!(inner.data_type(), &DataType::Int32);
@@ -811,14 +945,14 @@ mod tests {
     #[test]
     fn type_text_becomes_utf8() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::TEXT, -1, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE);
+        let dt = pg_type_to_arrow(&Type::TEXT, -1, &TypeMap::new(TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE));
         assert_eq!(dt, DataType::Utf8);
     }
 
     #[test]
     fn type_float8_becomes_float64() {
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::FLOAT8, -1, TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE);
+        let dt = pg_type_to_arrow(&Type::FLOAT8, -1, &TypeMap::new(TimeUnit::Millisecond, DEFAULT_NUMBER_SCALE));
         assert_eq!(dt, DataType::Float64);
     }
 
@@ -834,7 +968,7 @@ mod tests {
         assert_eq!(numeric_to_arrow(typmod(5, -2), 10), DataType::Decimal128(7, 0));
         assert_eq!(numeric_to_arrow(typmod(2, 5), 10), DataType::Decimal128(5, 5));
         use tokio_postgres::types::Type;
-        let dt = pg_type_to_arrow(&Type::NUMERIC_ARRAY, typmod(9, 3), TimeUnit::Millisecond, 10);
+        let dt = pg_type_to_arrow(&Type::NUMERIC_ARRAY, typmod(9, 3), &TypeMap::new(TimeUnit::Millisecond, 10));
         let DataType::List(inner) = dt else { panic!("{dt:?}") };
         assert_eq!(inner.data_type(), &DataType::Decimal128(9, 3));
     }
@@ -902,6 +1036,55 @@ mod tests {
     }
 
     // ── parse_timestamp_millis / parse_bytea_hex (unchanged) ─────────────────
+
+    #[test]
+    fn uuids_are_16_bytes_tagged_as_the_arrow_extension() {
+        let bytes = parse_uuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11").unwrap();
+        assert_eq!(bytes[..4], [0xa0, 0xee, 0xbc, 0x99]);
+        assert_eq!(parse_uuid("A0EEBC999C0B4EF8BB6D6BB9BD380A11").unwrap(), bytes);
+        assert!(parse_uuid("a0eebc99").is_err());
+        assert!(parse_uuid("g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11").is_err());
+        let map = TypeMap::new(TimeUnit::Millisecond, 10);
+        let f = arrow_field("id", &PgType::UUID, -1, &map);
+        assert_eq!(f.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(f.metadata().get(EXTENSION_NAME_KEY).map(String::as_str), Some(UUID_EXTENSION));
+        let list = arrow_field("ids", &PgType::UUID_ARRAY, -1, &map);
+        let DataType::List(item) = list.data_type() else { panic!("{list:?}") };
+        assert_eq!(item.metadata().get(EXTENSION_NAME_KEY).map(String::as_str), Some(UUID_EXTENSION));
+        let text = TypeMap { uuid_text: true, ..map };
+        assert_eq!(pg_type_to_arrow(&PgType::UUID, -1, &text), DataType::Utf8);
+    }
+
+    #[test]
+    fn intervals_are_months_days_and_nanoseconds() {
+        use arrow::datatypes::IntervalMonthDayNano as I;
+        assert_eq!(parse_iso_interval("P1Y2M3DT4H5M6.5S").unwrap(), I::new(14, 3, 14_706_500_000_000));
+        assert_eq!(parse_iso_interval("P-1Y-2M3DT-4H-5M-6.000001S").unwrap(), I::new(-14, 3, -14_706_000_001_000));
+        assert_eq!(parse_iso_interval("PT0S").unwrap(), I::new(0, 0, 0));
+        assert_eq!(parse_iso_interval("P2W").unwrap(), I::new(0, 14, 0));
+        assert_eq!(parse_iso_interval("PT-0.5S").unwrap(), I::new(0, 0, -500_000_000));
+        assert!(parse_iso_interval("1 day").is_err());
+        assert!(parse_iso_interval("P1X").is_err());
+        let map = TypeMap::new(TimeUnit::Millisecond, 10);
+        assert_eq!(pg_type_to_arrow(&PgType::INTERVAL, -1, &map), DataType::Interval(IntervalUnit::MonthDayNano));
+        assert_eq!(pg_type_to_arrow(&PgType::INTERVAL, -1, &TypeMap { interval_text: true, ..map }), DataType::Utf8);
+    }
+
+    #[test]
+    fn time_is_a_time_of_day_in_the_unit() {
+        assert_eq!(parse_time("13:45:30.123456", TimeUnit::Millisecond).unwrap(), 49_530_123);
+        assert_eq!(parse_time("13:45:30.123456", TimeUnit::Microsecond).unwrap(), 49_530_123_456);
+        assert_eq!(parse_time("00:00:00", TimeUnit::Second).unwrap(), 0);
+        assert_eq!(parse_time("24:00:00", TimeUnit::Microsecond).unwrap(), 86_400_000_000);
+        assert!(parse_time("13:45", TimeUnit::Millisecond).is_err());
+        let t = PgType::TIME;
+        assert_eq!(pg_type_to_arrow(&t, -1, &TypeMap::new(TimeUnit::Millisecond, 10)), DataType::Time32(TimeUnit::Millisecond));
+        assert_eq!(pg_type_to_arrow(&t, -1, &TypeMap::new(TimeUnit::Microsecond, 10)), DataType::Time64(TimeUnit::Microsecond));
+        let values = [Some("01:02:03.5"), None];
+        let a = build_values(&values, &Field::new("t", DataType::Time32(TimeUnit::Millisecond), true), "t").unwrap();
+        assert_eq!(a.as_primitive::<arrow_array::types::Time32MillisecondType>().value(0), 3_723_500);
+        assert!(a.is_null(1));
+    }
 
     #[test]
     fn parse_timestamp_millis_basic() {

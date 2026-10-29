@@ -14,6 +14,7 @@
 //! | `Decimal32/64/128/256` | string with the scale applied (`"123.45"`, exact) |
 //! | `Utf8`, `LargeUtf8`, `Utf8View` | string |
 //! | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary` | base64 string (standard, padded) |
+//! | `FixedSizeBinary(16)` of the `arrow.uuid` extension | the UUID's canonical string (`a0eebc99-9c0b-…`) |
 //! | `Interval` | `{"months"}` / `{"days", "milliseconds"}` / `{"months", "days", "nanoseconds"}` |
 //! | `List`, `LargeList`, `FixedSizeList` | array |
 //! | `Struct` | object keyed by child name |
@@ -49,7 +50,8 @@ pub enum Temporal {
 pub fn rows(batch: &RecordBatch, t: Temporal) -> Vec<Value> {
     let num_rows = batch.num_rows();
     let schema = batch.schema();
-    let columns: Vec<Vec<Value>> = batch.columns().iter().map(|c| column_values(c.as_ref(), t)).collect();
+    let columns: Vec<Vec<Value>> =
+        batch.columns().iter().zip(schema.fields().iter()).map(|(c, f)| field_values(c.as_ref(), f, t)).collect();
     let mut rows: Vec<Map<String, Value>> = (0..num_rows).map(|_| Map::new()).collect();
     for (field, values) in schema.fields().iter().zip(columns) {
         for (row, value) in rows.iter_mut().zip(values) {
@@ -57,6 +59,28 @@ pub fn rows(batch: &RecordBatch, t: Temporal) -> Vec<Value> {
         }
     }
     rows.into_iter().map(Value::Object).collect()
+}
+
+/// The values of `arr`, a column of `field`: the field's metadata names the
+/// `arrow.uuid` extension, which the array alone doesn't carry.
+fn field_values(arr: &dyn Array, field: &arrow_schema::Field, t: Temporal) -> Vec<Value> {
+    if is_uuid(field) {
+        if let Some(a) = arr.as_fixed_size_binary_opt() {
+            return a.iter().map(|v| v.map(|b| Value::String(uuid_text(b))).unwrap_or(Value::Null)).collect();
+        }
+    }
+    column_values(arr, t)
+}
+
+fn is_uuid(field: &arrow_schema::Field) -> bool {
+    field.metadata().get("ARROW:extension:name").map(String::as_str) == Some("arrow.uuid")
+        && field.data_type() == &DataType::FixedSizeBinary(16)
+}
+
+/// `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`.
+fn uuid_text(b: &[u8]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
 }
 
 /// One JSON value per slot of `arr` (`arr.len()` values).
@@ -304,13 +328,13 @@ fn convert(arr: &dyn Array, t: Temporal) -> Option<Vec<Value>> {
         DataType::Interval(IntervalUnit::MonthDayNano) => prim::<IntervalMonthDayNanoType, _>(arr, |v| {
             serde_json::json!({ "months": v.months, "days": v.days, "nanoseconds": v.nanoseconds })
         })?,
-        DataType::List(_) => {
+        DataType::List(item) => {
             let a = arr.as_list_opt::<i32>()?;
-            windows(&column_values(a.values().as_ref(), t), offset_pairs(a.value_offsets()))
+            windows(&field_values(a.values().as_ref(), item, t), offset_pairs(a.value_offsets()))
         }
-        DataType::LargeList(_) => {
+        DataType::LargeList(item) => {
             let a = arr.as_list_opt::<i64>()?;
-            windows(&column_values(a.values().as_ref(), t), offset_pairs(a.value_offsets()))
+            windows(&field_values(a.values().as_ref(), item, t), offset_pairs(a.value_offsets()))
         }
         DataType::FixedSizeList(_, size) => {
             let a = arr.as_fixed_size_list_opt()?;
@@ -450,6 +474,24 @@ mod tests {
         // Dates keep their stored form.
         assert_eq!(values_as(Arc::new(Date32Array::from(vec![19000])), ms), [json!(19000)]);
         assert_eq!(values_as(Arc::new(Date64Array::from(vec![86_400_000])), ms), [json!(86_400_000)]);
+    }
+
+    #[test]
+    fn uuids_are_their_canonical_text() {
+        use arrow_array::FixedSizeBinaryArray;
+        use arrow_schema::{Field, Schema};
+        let bytes: Vec<u8> = (0u8..16).collect();
+        let ids = FixedSizeBinaryArray::try_from_sparse_iter_with_size(vec![Some(bytes.clone()), None].into_iter(), 16).unwrap();
+        let uuid = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(
+            std::collections::HashMap::from([("ARROW:extension:name".to_string(), "arrow.uuid".to_string())]),
+        );
+        let plain = Field::new("raw", DataType::FixedSizeBinary(16), true);
+        let schema = Arc::new(Schema::new(vec![uuid, plain]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids.clone()), Arc::new(ids)]).unwrap();
+        let out = rows(&batch, Temporal::Iso);
+        assert_eq!(out[0]["id"], json!("00010203-0405-0607-0809-0a0b0c0d0e0f"));
+        assert_eq!(out[1]["id"], json!(null));
+        assert_eq!(out[0]["raw"], json!(base64_encode(&bytes)), "without the extension: bytes");
     }
 
     #[test]

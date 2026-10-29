@@ -66,7 +66,8 @@ Type mapping (text protocol, so text-rendered types round-trip losslessly):
 | `BIT(n)` | `UInt64` | The bit value (`b'101'` → `5`). |
 | `GEOMETRY` (and its subtypes) | `Binary` | Standard WKB. MySQL's SRID prefix is dropped; select `ST_SRID(col)` alongside to keep it. |
 | `BLOB`, `BINARY`, `VARBINARY` (binary collation) | `Binary` | |
-| everything else (`DECIMAL`, `TIME`, `JSON`, `ENUM`, `SET`, text types, …) | `Utf8` | Exact server text, so `DECIMAL` keeps every digit. |
+| `DECIMAL(p,s)` | `Decimal128(p, s)` | Exact; `Decimal256(p, s)` past 38 digits (MySQL allows 65). Nothing is rounded. Keep the text with `CAST(col AS CHAR)`. |
+| everything else (`TIME`, `JSON`, `ENUM`, `SET`, text types, …) | `Utf8` | Exact server text. (`TIME` is a duration up to ±838 h, not a time of day.) |
 
 Zero dates/datetimes (`0000-00-00…`) fail to parse; map them in SQL, e.g.
 `NULLIF(col, '0000-00-00')`.
@@ -96,7 +97,7 @@ Writes Arrow batches via batched, parameter-bound `INSERT`. The target table
 must already exist.
 
 Accepted Arrow input types: every integer width (signed and unsigned), floats,
-`Decimal128`/`Decimal256` (exact text), `Boolean`, the string and binary types
+`Decimal128`/`Decimal256` (exact text), `Boolean`, a UUID (`arrow.uuid`, as its canonical text), an `Interval` (ISO-8601 text: MySQL has no interval type), the string and binary types
 (plain, large, view, fixed-size), `Date32`/`Date64`, `Timestamp` in **every
 unit** with or without a zone (written as the UTC wall clock — right for a
 `TIMESTAMP` column, since the session zone is UTC; MySQL keeps up to
@@ -148,6 +149,12 @@ destination:
     merge_key: [id]
     # merge_strategy: on-duplicate-key   # match on the table's unique indexes instead
 ```
+
+### Migrating from 0.2
+
+| 0.2 | 0.3 |
+|---|---|
+| `DECIMAL` → `Utf8` text | an exact `Decimal128(p, s)` (`Decimal256` past 38 digits); Parquet columns become `DECIMAL`. Keep the text with `CAST(col AS CHAR)`. An incremental pipeline's next run sees the new schema: its `state:` refuses it (`on_schema_change: refuse`, the default) until the state is reset (`loadsmith state rm`) or the run uses `on_schema_change: continue`. |
 
 ### Migrating from 0.1
 

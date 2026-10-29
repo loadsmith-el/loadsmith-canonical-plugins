@@ -412,6 +412,7 @@ impl DestinationPlugin for ParquetPlugin {
     }
 
     async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let batch = crate::storable::storable(batch).context("converting the batch for Parquet")?;
         self.batches += 1;
         if self.current.is_none() {
             self.open_writer(&batch)?;

@@ -41,6 +41,7 @@ ignored, as with every thin driver.)
 | `incremental` | object | — | `cursor_column` (+ optional `initial_value`). The core persists the high watermark; the source resumes `> watermark ORDER BY` it. `cursor_column` must be one of the query's columns (a plain name folds to upper case, like unquoted SQL); any other name fails at startup. Requires a pipeline `state:` block. See [Incremental State](https://loadsmith-el.github.io/loadsmith/architecture/incremental-state.html). |
 | `timestamp_unit` | `s` / `ms` / `us` / `ns` | `ms` | Arrow unit of `DATE`/`TIMESTAMP` columns. The default is the same in every canonical plugin and truncates below the millisecond; **`ns` keeps `TIMESTAMP(9)` whole** (years 1677–2262 only), `us` covers the default `TIMESTAMP(6)`. |
 | `parallel` | object | — | **Partitioned full load**: `workers` (1–64) connections read disjoint ROWID (or key) ranges (`partitions`, default `8 × workers`) of the query's table at one SCN. See [Partitioned reads](#partitioned-reads-parallel). Not with `incremental`. |
+| `interval_as` | `native` / `text` | `native` | `INTERVAL` columns as `Interval(MonthDayNano)` or as Oracle's `TO_CHAR` text. |
 | `number_scale` | integer 0–38 | `10` | Scale of a `NUMBER` **without a declared precision** (a bare `NUMBER` column, `SUM(x)`, `COUNT(*)`, …), emitted as `Decimal128(38, number_scale)`. A value with more decimal places (or more than 38 digits) fails the run, naming the column — nothing is rounded. Declare the type in the query instead (`CAST(x AS NUMBER(19))`) for an exact integer or decimal. |
 
 | Oracle type | Arrow type | Notes |
@@ -56,8 +57,9 @@ ignored, as with every thin driver.)
 | `DATE` | `Timestamp(unit, None)` | Oracle `DATE` carries a time of day. |
 | `TIMESTAMP` | `Timestamp(unit, None)` | Digits finer than `unit` are truncated. |
 | `TIMESTAMP WITH TIME ZONE`, `… WITH LOCAL TIME ZONE` | `Timestamp(unit, "UTC")` | Normalized to the UTC instant (`SYS_EXTRACT_UTC`; `LOCAL TIME ZONE` through the session time zone). The original offset/region is not kept: select `TO_CHAR(col, 'YYYY-MM-DD HH24:MI:SS.FF9 TZR')` to carry it as text. |
+| `INTERVAL YEAR TO MONTH` / `INTERVAL DAY TO SECOND` | `Interval(MonthDayNano)` | Months; or days and nanoseconds (all nine fractional digits). `interval_as: text` keeps the `TO_CHAR` text (`+01-02`, `+03 04:05:06.500000`). |
 | `RAW`, `LONG RAW`, `BLOB` | `Binary` | |
-| everything else (`VARCHAR2`, `CHAR`, `CLOB`, `INTERVAL`, `ROWID`, …) | `Utf8` | |
+| everything else (`VARCHAR2`, `CHAR`, `CLOB`, `ROWID`, …) | `Utf8` | |
 
 `DATE` and `TIMESTAMP` columns are fetched in Oracle's binary form (7 and 11
 bytes a value); the zoned timestamps are converted to UTC by the server and
@@ -165,6 +167,8 @@ shrink that. When the SCN is out of reach:
 | `merge_key` | list of strings | — | The key columns of the `MERGE … ON (…)` match. Required for `merge`, rejected in the other modes. |
 | `update_columns` | list of strings | every non-key column | `merge` only: the columns a matched row updates. `[]` inserts new keys and leaves existing rows alone. |
 
+An interval goes into an `INTERVAL YEAR TO MONTH` / `DAY TO SECOND` column through `TO_YMINTERVAL` / `TO_DSINTERVAL` (a value the column can't hold — months into `DAY TO SECOND`, days into `YEAR TO MONTH` — fails the batch instead of being cut), and into any other column as ISO-8601 text (`P14M3DT4.5S`). A UUID (`arrow.uuid`) goes as its canonical text, or as its 16 bytes into a `RAW` column.
+
 Every mode runs in **one transaction**, committed at the end of the load.
 
 - **`append`** (default) — array `INSERT` straight into the target.
@@ -217,6 +221,12 @@ other spelling is rejected with the valid values.
 | a duplicate key within one load failed the `MERGE` (ORA-30926) | the last row of the key wins |
 | `DATE`/`TIMESTAMP`/`TIMESTAMP WITH TZ` → text (`FF6`) | `Timestamp(ms)` / `Timestamp(ms, "UTC")`; `timestamp_unit` for finer units |
 | unknown keys ignored (except in `tls`) | rejected (or warned with `--ignore-unknown-keys`) |
+
+### Migrating from 0.8
+
+| 0.8 | 0.9 |
+|---|---|
+| `INTERVAL` → `Utf8` text | `Interval(MonthDayNano)`; Parquet columns become a `struct<months, days, nanoseconds>`. `interval_as: text` keeps the text. An incremental pipeline's next run sees the new schema: its `state:` refuses it (`on_schema_change: refuse`, the default) until the state is reset (`loadsmith state rm`) or the run uses `on_schema_change: continue`. |
 
 ### Migrating from 0.4
 

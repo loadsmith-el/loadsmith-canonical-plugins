@@ -1,5 +1,6 @@
 mod encoder;
 mod plugin;
+mod storable;
 mod vocab;
 
 // mimalloc: release builds are static musl, whose default allocator is slow

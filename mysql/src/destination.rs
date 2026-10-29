@@ -230,7 +230,12 @@ impl DestinationPlugin for MysqlDestPlugin {
         for row in 0..nrows {
             let mut cells: Vec<Value> = Vec::with_capacity(batch.num_columns());
             for col in 0..batch.num_columns() {
-                cells.push(crate::types::cell_to_value(batch.column(col), row)?);
+                cells.push(if crate::types::is_uuid(batch.schema_ref().field(col)) {
+                    // A UUID goes as its text, for a CHAR(36)/VARCHAR column.
+                    crate::types::uuid_text(batch.column(col), row)?.map_or(Value::NULL, |s| Value::Bytes(s.into_bytes()))
+                } else {
+                    crate::types::cell_to_value(batch.column(col), row)?
+                });
             }
             params.push(cells);
         }
