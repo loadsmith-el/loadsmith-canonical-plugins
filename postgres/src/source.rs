@@ -374,7 +374,7 @@ impl PostgresSourcePlugin {
             schema: self.schema.clone().context("not configured")?,
             namespace: self.namespace.clone(),
             session_pins: self.session_pins.clone(),
-            started: Default::default(),
+            credits: Default::default(),
         });
         self.partition_batches = Some(crate::parallel::spawn_workers(shared, workers, self.gate.clone()));
         Ok(())

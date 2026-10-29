@@ -321,7 +321,7 @@ impl OracleSourcePlugin {
             batch_size: self.batch_size,
             schema: self.schema.clone().context("not configured")?,
             namespace: self.namespace.clone(),
-            started: Default::default(),
+            credits: Default::default(),
         });
         let rx = crate::parallel::spawn_workers(shared, workers, self.gate.clone(), tokio::runtime::Handle::current())?;
         self.partition_batches = Some(rx);

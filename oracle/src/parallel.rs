@@ -657,7 +657,7 @@ pub struct Shared {
     pub schema: Arc<Schema>,
     pub namespace: String,
     /// Fetches started and not given back, across workers (the credit taken).
-    pub started: AtomicU64,
+    pub credits: Credits,
 }
 
 /// What a worker hands the source: a batch, or the end of a partition (sent
@@ -718,7 +718,7 @@ fn work(
                 .map_err(|e| anyhow::anyhow!("partition query failed: {e}"))
         })?;
         loop {
-            take_credit(shared, &mut gate, runtime);
+            runtime.block_on(shared.credits.take(&mut gate));
             let rows = cursor
                 .by_ref()
                 .take(shared.batch_size)
@@ -727,7 +727,7 @@ fn work(
             let rows = match rows {
                 Ok(rows) if rows.is_empty() => {
                     // The end of this range: the credit is not used.
-                    shared.started.fetch_sub(1, Ordering::AcqRel);
+                    shared.credits.give_back();
                     break;
                 }
                 Ok(rows) => rows,
@@ -752,24 +752,68 @@ fn work(
     }
 }
 
-/// Waits until the core's grant covers one more fetch than all workers have
-/// started, and takes it.
-fn take_credit(shared: &Shared, gate: &mut FlowGate, runtime: &tokio::runtime::Handle) {
-    loop {
-        let started = shared.started.load(Ordering::Acquire);
-        if gate.granted() > started {
-            if shared.started.compare_exchange(started, started + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                return;
+/// The fetches started across workers, against the core's grant (the credit
+/// taken). A fetch that finds its range empty gives its credit back and wakes
+/// the waiting workers: one waiting for a grant past that credit would
+/// otherwise sleep with nothing in flight to raise the grant.
+#[derive(Debug, Default)]
+pub struct Credits {
+    started: AtomicU64,
+    returned: tokio::sync::Notify,
+}
+
+impl Credits {
+    /// Waits until the core's grant covers one more fetch than all workers
+    /// have started, and takes it.
+    pub async fn take(&self, gate: &mut FlowGate) {
+        loop {
+            // Registered before reading `started`, so a credit given back in
+            // between still wakes this wait.
+            let returned = self.returned.notified();
+            tokio::pin!(returned);
+            returned.as_mut().enable();
+            let started = self.started.load(Ordering::Acquire);
+            if gate.granted() > started {
+                if self.started.compare_exchange(started, started + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return;
+                }
+            } else {
+                tokio::select! {
+                    _ = gate.wait_for(started + 1) => {}
+                    _ = returned => {}
+                }
             }
-        } else {
-            runtime.block_on(gate.wait_for(started + 1));
         }
+    }
+
+    /// Gives back a credit taken for a fetch that read nothing.
+    pub fn give_back(&self) {
+        self.started.fetch_sub(1, Ordering::AcqRel);
+        self.returned.notify_waiters();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credit_given_back_wakes_a_waiting_worker() {
+        // A window of one: worker A takes the only credit, B waits for the
+        // next grant. A's range is empty, so it gives the credit back — B must
+        // take it, as no batch is in flight to raise the grant.
+        let gate = FlowGate::fixed(1);
+        let credits = Arc::new(Credits::default());
+        credits.take(&mut gate.clone()).await;
+        let waiting = tokio::spawn({
+            let (credits, mut gate) = (credits.clone(), gate.clone());
+            async move { credits.take(&mut gate).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "the only credit is taken");
+        credits.give_back();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await.unwrap().unwrap();
+    }
 
     #[test]
     fn plain_table_queries_parse() {

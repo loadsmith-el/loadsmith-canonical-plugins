@@ -4,6 +4,20 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-29 — postgres 0.8.1, oracle 0.9.2: partitioned loads no longer stall
+
+The plugins move to the SDK of loadsmith `de670cb`.
+
+### postgres 0.8.1 / oracle 0.9.2
+
+- **A partitioned load (`parallel`) could stop for good mid-run**, idle on
+  both ends. A worker whose range turned out empty gave its credit back, but
+  a worker already waiting for the next grant was not woken, and with no
+  batch in flight the grant never grew. Likely with large rows — the core's
+  memory budget then grants one batch at a time — and an Oracle table of
+  CLOB/BLOB rows (50k rows, 1.2 GB) stalled on every run. It now wakes the
+  waiting workers.
+
 ## 2026-10-29 — oracle 0.9.1: oracledb beta.5
 
 ### oracle 0.9.1
