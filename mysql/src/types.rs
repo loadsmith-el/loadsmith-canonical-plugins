@@ -97,7 +97,7 @@ pub fn columns_to_schema(cols: &[Column], unit: TimeUnit) -> Schema {
                 _ => None,
             };
             match special {
-                Some(t) => f.with_metadata([(MYSQL_TYPE_KEY.to_string(), t.to_string())].into()),
+                Some(t) => f.with_metadata(std::collections::HashMap::from([(MYSQL_TYPE_KEY.to_string(), t.to_string())])),
                 None => f,
             }
         })

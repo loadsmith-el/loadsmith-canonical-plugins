@@ -51,6 +51,7 @@ impl GraphClient {
         // reqwest builds its rustls TLS config.
         loadsmith_tls::install_provider();
         let http = reqwest::Client::builder()
+            .tls_backend_preconfigured(loadsmith_tls::public_web_config(&[b"h2", b"http/1.1"])?)
             .timeout(timeout)
             .build()
             .context("failed to build HTTP client")?;

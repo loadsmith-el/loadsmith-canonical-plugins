@@ -31,5 +31,5 @@ mimalloc             = { workspace = true }
 # Parquet writer — released in lockstep with `arrow` (shared major), so this
 # must match arrow = "54". `bytesize` parses human sizes ("500KiB"); both pure
 # Rust, keeping the multi-arch-first / pure-Rust posture.
-parquet  = "54"
+parquet  = "60"
 bytesize = "1"

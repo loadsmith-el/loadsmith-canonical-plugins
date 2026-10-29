@@ -46,11 +46,12 @@ unicode-normalization = "0.1"
 # Microsoft Graph HTTP client. rustls with the *installed* crypto provider
 # (rustls-rustcrypto, set via loadsmith-tls::install_provider) + webpki roots — the
 # `-no-provider` feature avoids pulling ring/aws-lc-rs (banned: native-per-arch crypto).
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "charset",
+    "form",
     "http2",
     "json",
-    "rustls-tls-webpki-roots-no-provider",
+    "rustls-no-provider",
 ] }
 mimalloc             = { workspace = true }
 

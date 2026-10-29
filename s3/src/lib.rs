@@ -27,6 +27,8 @@ use loadsmith_plugin_sdk::{telemetry, ObjectKey, RunInfo, SinkPlugin};
 use reqwest::{Client, StatusCode};
 use rusty_s3::actions::S3Action;
 use rusty_s3::{Bucket, Credentials, UrlStyle};
+
+mod creds;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tracing::Span;
@@ -68,8 +70,7 @@ struct S3Config {
     /// `{pipeline}`.
     #[serde(default = "default_key")]
     key: String,
-    /// Default `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
-    /// `AWS_SESSION_TOKEN` from the environment.
+    /// Default: the AWS credential chain ([`creds`]).
     #[serde(default)]
     access_key_id: Option<String>,
     #[serde(default)]
@@ -105,7 +106,7 @@ fn default_max_attempts() -> u32 {
 /// Everything a configured sink needs to upload.
 struct Target {
     bucket: Bucket,
-    credentials: Credentials,
+    credentials: creds::Provider,
     keys: ObjectKey,
     run: Option<RunInfo>,
     part_size: u64,
@@ -134,35 +135,8 @@ fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn make_credentials(key: String, secret: String, token: Option<String>) -> Credentials {
-    match token {
-        Some(token) => Credentials::new_with_token(key, secret, token),
-        None => Credentials::new(key, secret),
-    }
-}
-
-fn credentials(cfg: &S3Config) -> Result<Credentials> {
-    match (&cfg.access_key_id, &cfg.secret_access_key) {
-        (Some(key), Some(secret)) => {
-            Ok(make_credentials(key.clone(), secret.clone(), cfg.session_token.clone()))
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            bail!("set both `access_key_id` and `secret_access_key`, or neither (to read them from AWS_* variables)")
-        }
-        (None, None) => match (env_var("AWS_ACCESS_KEY_ID"), env_var("AWS_SECRET_ACCESS_KEY")) {
-            (Some(key), Some(secret)) => {
-                Ok(make_credentials(key, secret, cfg.session_token.clone().or_else(|| env_var("AWS_SESSION_TOKEN"))))
-            }
-            _ => bail!(
-                "no S3 credentials: set `access_key_id` and `secret_access_key` (e.g. from `secret()`), \
-                 or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the environment"
-            ),
-        },
-    }
-}
-
 impl Target {
-    fn from_config(cfg: S3Config, run: Option<RunInfo>) -> Result<Self> {
+    async fn from_config(cfg: S3Config, run: Option<RunInfo>) -> Result<Self> {
         if cfg.bucket.trim().is_empty() {
             bail!("`bucket` is empty");
         }
@@ -188,12 +162,18 @@ impl Target {
             UrlStyleConfig::VirtualHost => UrlStyle::VirtualHost,
         };
         let url = endpoint.parse().with_context(|| format!("`endpoint` {endpoint:?} is not a URL"))?;
-        let bucket = Bucket::new(url, style, cfg.bucket.clone(), region)
+        let bucket = Bucket::new(url, style, cfg.bucket.clone(), region.clone())
             .map_err(|e| anyhow::anyhow!("bucket {:?} at {endpoint}: {e}", cfg.bucket))?;
-        let credentials = credentials(&cfg)?;
 
         loadsmith_tls::install_provider();
+        let explicit = creds::Explicit {
+            access_key_id: cfg.access_key_id.as_deref(),
+            secret_access_key: cfg.secret_access_key.as_deref(),
+            session_token: cfg.session_token.as_deref(),
+        };
+        let credentials = creds::Provider::resolve(explicit, &region).await?;
         let http = Client::builder()
+            .tls_backend_preconfigured(loadsmith_tls::public_web_config(&[b"h2", b"http/1.1"])?)
             .timeout(Duration::from_secs(cfg.request_timeout_seconds))
             .build()
             .context("failed to build the HTTP client")?;
@@ -208,12 +188,14 @@ impl Target {
         })
     }
 
-    /// Sends one request, built anew (and signed anew) for every attempt.
-    /// Retries network errors, `429` and `5xx`; any other status fails.
-    async fn send(&self, what: &str, build: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    /// Sends one request, built anew (and signed anew, with the current
+    /// credentials) for every attempt. Retries network errors, `429` and
+    /// `5xx`; any other status fails.
+    async fn send(&self, what: &str, build: impl Fn(&Credentials) -> reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let mut attempt = 1;
         loop {
-            let outcome = build().send().await;
+            let credentials = self.credentials.get().await?;
+            let outcome = build(&credentials).send().await;
             let retryable = match &outcome {
                 Ok(r) if r.status().is_success() => return Ok(outcome.expect("checked Ok")),
                 Ok(r) => r.status() == StatusCode::TOO_MANY_REQUESTS || r.status().is_server_error(),
@@ -237,8 +219,10 @@ impl Target {
     }
 
     async fn put_object(&self, key: &str, body: Vec<u8>) -> Result<()> {
-        let action = self.bucket.put_object(Some(&self.credentials), key);
-        self.send(&format!("PUT {key}"), || self.http.put(action.sign(SIGNATURE_TTL)).body(body.clone())).await?;
+        self.send(&format!("PUT {key}"), |c| {
+            self.http.put(self.bucket.put_object(Some(c), key).sign(SIGNATURE_TTL)).body(body.clone())
+        })
+        .await?;
         Ok(())
     }
 
@@ -249,8 +233,11 @@ impl Target {
     }
 
     async fn multipart(&self, path: &Path, key: &str, size: u64) -> Result<()> {
-        let create = self.bucket.create_multipart_upload(Some(&self.credentials), key);
-        let resp = self.send(&format!("create multipart upload {key}"), || self.http.post(create.sign(SIGNATURE_TTL))).await?;
+        let resp = self
+            .send(&format!("create multipart upload {key}"), |c| {
+                self.http.post(self.bucket.create_multipart_upload(Some(c), key).sign(SIGNATURE_TTL))
+            })
+            .await?;
         let body = resp.text().await.context("create multipart upload: reading the response")?;
         // Read the `UploadId` element alone: S3-compatible stores differ on the
         // root element (`InitiateMultipartUploadResult` on AWS) and namespace.
@@ -266,9 +253,15 @@ impl Target {
         if completed.is_err() {
             // Best effort: an incomplete upload keeps its parts (and their
             // storage cost) until aborted or expired by a lifecycle rule.
-            let abort = self.bucket.abort_multipart_upload(Some(&self.credentials), key, &upload_id);
-            if let Err(e) = self.http.delete(abort.sign(SIGNATURE_TTL)).send().await {
-                tracing::warn!("abort multipart upload {key}: {e}");
+            let aborted = match self.credentials.get().await {
+                Ok(c) => {
+                    let abort = self.bucket.abort_multipart_upload(Some(&c), key, &upload_id);
+                    self.http.delete(abort.sign(SIGNATURE_TTL)).send().await.map(drop).map_err(anyhow::Error::from)
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = aborted {
+                tracing::warn!("abort multipart upload {key}: {e:#}");
             }
         }
         completed
@@ -284,9 +277,10 @@ impl Target {
             let len = remaining.min(part_size);
             let mut part = vec![0u8; len as usize];
             file.read_exact(&mut part).await.with_context(|| format!("read {}", path.display()))?;
-            let action = self.bucket.upload_part(Some(&self.credentials), key, number, upload_id);
             let resp = self
-                .send(&format!("upload part {number} of {key}"), || self.http.put(action.sign(SIGNATURE_TTL)).body(part.clone()))
+                .send(&format!("upload part {number} of {key}"), |c| {
+                    self.http.put(self.bucket.upload_part(Some(c), key, number, upload_id).sign(SIGNATURE_TTL)).body(part.clone())
+                })
                 .await?;
             let etag = resp
                 .headers()
@@ -301,11 +295,12 @@ impl Target {
     }
 
     async fn complete(&self, key: &str, upload_id: &str, etags: &[String]) -> Result<()> {
-        let action =
-            self.bucket.complete_multipart_upload(Some(&self.credentials), key, upload_id, etags.iter().map(String::as_str));
-        let url = action.sign(SIGNATURE_TTL);
-        let body = action.body();
-        let resp = self.send(&format!("complete multipart upload {key}"), || self.http.post(url.clone()).body(body.clone())).await?;
+        let resp = self
+            .send(&format!("complete multipart upload {key}"), |c| {
+                let action = self.bucket.complete_multipart_upload(Some(c), key, upload_id, etags.iter().map(String::as_str));
+                self.http.post(action.sign(SIGNATURE_TTL)).body(action.body())
+            })
+            .await?;
         // S3 can answer 200 and still report the failure in the body.
         let text = resp.text().await.unwrap_or_default();
         if text.contains("<Error>") {
@@ -357,7 +352,7 @@ impl SinkPlugin for S3SinkPlugin {
 
     async fn configure(&mut self, config: loadsmith_plugin_sdk::PluginConfig) -> Result<()> {
         let cfg: S3Config = config.parse()?;
-        self.target = Some(Target::from_config(cfg, config.run().cloned())?);
+        self.target = Some(Target::from_config(cfg, config.run().cloned()).await?);
         Ok(())
     }
 
@@ -617,12 +612,13 @@ mod tests {
         assert_eq!(xml_element("<Error/>", "UploadId"), None);
     }
 
-    #[test]
-    fn part_size_stays_within_s3_limits() {
+    #[tokio::test]
+    async fn part_size_stays_within_s3_limits() {
         let t = Target::from_config(
             serde_json::from_value(json!({ "bucket": "b", "access_key_id": "k", "secret_access_key": "s", "key": "{file}" })).unwrap(),
             None,
         )
+        .await
         .unwrap();
         assert_eq!(t.part_size_for(1), 16 * 1024 * 1024);
         let huge = 400 * 1024 * 1024 * 1024u64; // 400 GiB

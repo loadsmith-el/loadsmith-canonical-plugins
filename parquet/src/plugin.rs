@@ -378,7 +378,7 @@ impl DestinationPlugin for ParquetPlugin {
         if rows == 0 {
             bail!("row_group_size must be at least 1");
         }
-        props = props.set_max_row_group_size(rows);
+        props = props.set_max_row_group_row_count(Some(rows));
         let encode_threads = match cfg.encode_threads {
             Some(0) => bail!("encode_threads must be at least 1"),
             Some(n) => n,

@@ -1,7 +1,7 @@
 //! A Parquet writer that encodes the columns of each batch in parallel.
 //!
 //! It does exactly what `ArrowWriter` does — the same row group boundaries
-//! (`max_row_group_size` rows, a batch split across them), the same column
+//! (`max_row_group_row_count` rows, a batch split across them), the same column
 //! writers fed the same leaves in the same order, the same footer with the
 //! encoded Arrow schema — so the file is byte for byte the one `ArrowWriter`
 //! writes. Only the encoding of a batch's columns, each by its own column
@@ -12,17 +12,18 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use parquet::arrow::arrow_writer::{compute_leaves, get_column_writers, ArrowColumnWriter};
+use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnWriter, ArrowRowGroupWriterFactory};
 use parquet::arrow::{add_encoded_arrow_schema_to_metadata, ArrowSchemaConverter};
 use parquet::errors::{ParquetError, Result};
-use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
+use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::{SchemaDescriptor, Type};
 
 pub struct ColumnParallelWriter<W: std::io::Write + Send> {
     writer: SerializedFileWriter<W>,
     schema: SchemaRef,
-    props: WriterPropertiesPtr,
+    /// Makes each row group's column writers.
+    columns: ArrowRowGroupWriterFactory,
     /// For each top-level field, the index of its first leaf column writer.
     leaf_offsets: Vec<usize>,
     max_row_group_size: usize,
@@ -41,11 +42,11 @@ impl<W: std::io::Write + Send> ColumnParallelWriter<W> {
         let mut props = props;
         let parquet = ArrowSchemaConverter::new().with_coerce_types(props.coerce_types()).convert(&schema)?;
         add_encoded_arrow_schema_to_metadata(&schema, &mut props);
-        let max_row_group_size = props.max_row_group_size();
-        let props = Arc::new(props);
-        let writer = SerializedFileWriter::new(out, parquet.root_schema_ptr(), props.clone())?;
+        let max_row_group_size = props.max_row_group_row_count().unwrap_or(usize::MAX);
+        let writer = SerializedFileWriter::new(out, parquet.root_schema_ptr(), Arc::new(props))?;
+        let columns = ArrowRowGroupWriterFactory::new(&writer, schema.clone());
         let leaf_offsets = leaf_offsets(&parquet);
-        Ok(Self { writer, schema, props, leaf_offsets, max_row_group_size, threads: threads.max(1), in_progress: None })
+        Ok(Self { writer, schema, columns, leaf_offsets, max_row_group_size, threads: threads.max(1), in_progress: None })
     }
 
     /// Encodes `batch`, flushing a row group whenever one reaches
@@ -61,7 +62,7 @@ impl<W: std::io::Write + Send> ColumnParallelWriter<W> {
             return self.write(&batch.slice(to_write, batch.num_rows() - to_write));
         }
         if self.in_progress.is_none() {
-            let writers = get_column_writers(self.writer.schema_descr(), &self.props, &self.schema)?;
+            let writers = self.columns.create_column_writers(self.writer.flushed_row_groups().len())?;
             self.in_progress = Some(RowGroup { writers: writers.into_iter().map(Mutex::new).collect(), rows: 0 });
         }
         let group = self.in_progress.as_mut().expect("just set");
@@ -220,7 +221,7 @@ mod tests {
         let props = || {
             WriterProperties::builder()
                 .set_compression(Compression::SNAPPY)
-                .set_max_row_group_size(2_500)
+                .set_max_row_group_row_count(Some(2_500))
                 .build()
         };
         let mut expected = Vec::new();

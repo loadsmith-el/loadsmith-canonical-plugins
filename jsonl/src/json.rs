@@ -11,7 +11,7 @@
 //! | `Boolean` | `true` / `false` |
 //! | `Int*`, `UInt*` | number (exact) |
 //! | `Float16/32/64` | number; NaN and ±Infinity become `null` |
-//! | `Decimal128/256` | string with the scale applied (`"123.45"`, exact) |
+//! | `Decimal32/64/128/256` | string with the scale applied (`"123.45"`, exact) |
 //! | `Utf8`, `LargeUtf8`, `Utf8View` | string |
 //! | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary` | base64 string (standard, padded) |
 //! | `Interval` | `{"months"}` / `{"days", "milliseconds"}` / `{"months", "days", "nanoseconds"}` |
@@ -226,6 +226,14 @@ fn convert(arr: &dyn Array, t: Temporal) -> Option<Vec<Value>> {
         DataType::Float16 => prim::<Float16Type, _>(arr, |v| float(v.to_f64()))?,
         DataType::Float32 => prim::<Float32Type, _>(arr, |v| float(f64::from(v)))?,
         DataType::Float64 => prim::<Float64Type, _>(arr, float)?,
+        DataType::Decimal32(..) => {
+            let a = arr.as_primitive_opt::<Decimal32Type>()?;
+            (0..a.len()).map(|i| Value::String(a.value_as_string(i))).collect()
+        }
+        DataType::Decimal64(..) => {
+            let a = arr.as_primitive_opt::<Decimal64Type>()?;
+            (0..a.len()).map(|i| Value::String(a.value_as_string(i))).collect()
+        }
         DataType::Decimal128(..) => {
             let a = arr.as_primitive_opt::<Decimal128Type>()?;
             (0..a.len()).map(|i| Value::String(a.value_as_string(i))).collect()

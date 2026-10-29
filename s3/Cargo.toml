@@ -29,14 +29,16 @@ async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { workspace = true }
 loadsmith-tls        = { workspace = true }
 mimalloc             = { workspace = true }
+chrono               = { version = "0.4", default-features = false, features = ["std", "clock"] }
 # SigV4 signing (presigned URLs) with the RustCrypto hmac/sha2 — pure Rust, no
 # ring/aws-lc-rs. Sans-IO: the HTTP goes through reqwest below.
 rusty-s3 = { version = "0.10", default-features = false, features = ["rustcrypto", "full"] }
 # rustls with the *installed* crypto provider (rustls-rustcrypto, set via
 # loadsmith-tls::install_provider) + webpki roots, like sharepoint.
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "http2",
-    "rustls-tls-webpki-roots-no-provider",
+    "query",
+    "rustls-no-provider",
 ] }
 
 [dev-dependencies]
