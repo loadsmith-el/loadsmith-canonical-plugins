@@ -17,7 +17,7 @@ jobs:
       name: ${{ steps.parse.outputs.name }}
       version: ${{ steps.parse.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: parse
         run: |
           tag="${GITHUB_REF_NAME}"
@@ -39,7 +39,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build + test in rust:1-alpine (native ${{ matrix.arch }}, static musl)
         # Native per-arch build inside rust:1-alpine, whose host target is
         # *-unknown-linux-musl: every binary is fully static (no libc, no loader),
@@ -75,7 +75,7 @@ jobs:
           tar -czf "$tarball" -C target/release "${bins[@]}"
           sha256sum "$tarball" > "${tarball}.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.arch }}
           path: |
@@ -90,10 +90,10 @@ jobs:
       contents: write          # create the release + commit index.json
     concurrency: index-commit   # serialize index.json commits across releases
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main             # we commit the updated index back to main
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
