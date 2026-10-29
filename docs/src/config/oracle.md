@@ -68,6 +68,11 @@ server-side with `TO_CHAR`. CLOB, LONG and BLOB are fetched whole, inline (any
 size, held in memory one batch at a time). `BFILE` is not supported (its contents are not fetched). Years
 BC are not supported.
 
+With large LOBs, size `batch_size` by bytes, not rows: a batch holds every
+LOB of its rows. Measured on 50,000 rows of a 1–32 KB CLOB and a 0.5–16 KB
+BLOB (1.2 GB in all), the default `1000` peaked at 565 MiB; `10000` at
+2.7 GB, and no faster.
+
 The source streams: the query's cursor stays open and `batch_size` rows are
 fetched per round trip, ahead of the batch being converted as far as the
 engine's flow control allows
