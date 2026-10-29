@@ -102,7 +102,7 @@ pub struct OracleSourcePlugin {
     /// The user's base query (inner SELECT).
     query: String,
     /// The projected SELECT list (zoned timestamps in `SYS_EXTRACT_UTC`,
-    /// LONG/INTERVAL columns in `TO_CHAR`).
+    /// INTERVAL columns in `TO_CHAR`).
     select_list: String,
 
     cursor_column: Option<String>,

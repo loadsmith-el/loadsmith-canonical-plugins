@@ -13,7 +13,7 @@
 //!
 //! `DATE` and `TIMESTAMP` are fetched natively (Oracle's 7/11-byte binary form);
 //! the zoned timestamps are normalized server-side with `SYS_EXTRACT_UTC` and
-//! fetched the same way; CLOBs whole, inline. LONG/INTERVAL are rendered with `TO_CHAR` (see
+//! fetched the same way; CLOB/LONG whole, inline. INTERVAL is rendered with `TO_CHAR` (see
 //! [`projected_select`]). The destination wraps temporal binds in the matching
 //! `TO_DATE`/`TO_TIMESTAMP`/`TO_TIMESTAMP_TZ` ([`typed_expr`]).
 
@@ -138,11 +138,11 @@ fn projected_expr(col: &str, t: &DbType) -> Option<String> {
         Some(format!("SYS_EXTRACT_UTC(CAST({quoted} AS TIMESTAMP(9) WITH TIME ZONE))"))
     } else if is_one_of(
         t,
-        &[oracledb::DB_TYPE_LONG, oracledb::DB_TYPE_INTERVAL_YM, oracledb::DB_TYPE_INTERVAL_DS],
+        &[oracledb::DB_TYPE_INTERVAL_YM, oracledb::DB_TYPE_INTERVAL_DS],
     ) {
-        // LONG/INTERVAL render to text with the default model. (A CLOB is
-        // fetched whole, inline, like a BLOB: `TO_CHAR` would stop it at
-        // 4000 bytes.)
+        // INTERVAL renders to text with the default model. (CLOB and LONG are
+        // fetched whole, inline — the driver describes a CLOB as LONG — where
+        // `TO_CHAR` would stop a CLOB at 4000 bytes and reject a LONG.)
         Some(format!("TO_CHAR({quoted})"))
     } else {
         None
@@ -150,7 +150,7 @@ fn projected_expr(col: &str, t: &DbType) -> Option<String> {
 }
 
 /// Builds the projected `SELECT` list and the matching Arrow `Schema` from the
-/// described columns. Zoned timestamps and LONG/INTERVAL columns are
+/// described columns. Zoned timestamps and INTERVAL columns are
 /// wrapped (`SYS_EXTRACT_UTC(...)`, `TO_CHAR(...)`) `AS "name"`; every other
 /// column is selected verbatim. All fields are nullable.
 pub fn projected_select(cols: &[ColumnDesc], unit: TimeUnit, number_scale: i8, interval_text: bool) -> (String, Schema) {

@@ -63,9 +63,9 @@ ignored, as with every thin driver.)
 
 `DATE` and `TIMESTAMP` columns are fetched in Oracle's binary form (7 and 11
 bytes a value); the zoned timestamps are converted to UTC by the server and
-fetched the same way. `INTERVAL` (with `interval_as: text`) and `LONG` are
-rendered server-side with `TO_CHAR`. CLOBs and BLOBs are fetched whole, inline
-(any size, held in memory one batch at a time). `BFILE` is not supported (its contents are not fetched). Years
+fetched the same way. `INTERVAL` (with `interval_as: text`) is rendered
+server-side with `TO_CHAR`. CLOB, LONG and BLOB are fetched whole, inline (any
+size, held in memory one batch at a time). `BFILE` is not supported (its contents are not fetched). Years
 BC are not supported.
 
 The source streams: the query's cursor stays open and `batch_size` rows are
