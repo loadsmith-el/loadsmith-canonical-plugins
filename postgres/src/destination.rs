@@ -41,7 +41,7 @@ config_enum! {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct PostgresDestConfig {
     /// All connection-level fields (host/port/tls/keepalives/session/…), shared
     /// with the source plugin via the crate's own `conn` module.
@@ -128,6 +128,9 @@ impl PostgresDestPlugin {
 
 #[async_trait]
 impl DestinationPlugin for PostgresDestPlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<PostgresDestConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-destination-postgres"
     }

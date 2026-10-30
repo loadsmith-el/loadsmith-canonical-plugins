@@ -4,6 +4,19 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-30 — every plugin publishes its config schema
+
+The plugins move to the SDK of loadsmith `81244f1`. Every plugin now prints
+the JSON Schema (draft 2020-12) of its `config:` block with `--config-schema`,
+generated from the type it parses, and the release publishes it as
+`<name>-<version>-<kind>.config-schema.json`, referenced from the manifest's
+`provides[].config_schema`. No config changes: every plugin accepts exactly
+what it accepted before.
+
+aws-secrets-manager 0.1.1, csv 0.1.1, excel 0.1.1, file 0.2.1, jsonl 0.3.1,
+local-copy 0.3.1, mysql 0.3.1, null 0.2.1, oracle 0.9.3, parquet 0.5.1,
+postgres 0.8.2, s3 0.2.2, sharepoint 0.2.2.
+
 ## 2026-10-30 — aws-secrets-manager 0.1.0; s3 0.2.1 on the shared AWS crate
 
 The plugins move to the SDK of loadsmith `5359444`, which adds the

@@ -25,14 +25,14 @@ use tabular::excel::{read_workbook, Sheet};
 use tabular::table::{build_array, Table};
 use tabular::typed::{declared_schema, header_names, text_batch};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 enum RawSheet {
     Index(usize),
     Name(String),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RawOptions {
     sheet: Option<RawSheet>,
     #[serde(default = "default_true")]
@@ -192,6 +192,9 @@ pub struct ExcelParser {
 
 #[async_trait]
 impl ParserPlugin for ExcelParser {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<RawOptions>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-parser-excel"
     }

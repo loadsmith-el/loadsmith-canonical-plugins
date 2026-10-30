@@ -54,7 +54,7 @@ config_enum! {
     retired {}
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct MysqlDestConfig {
     #[serde(flatten)]
     conn: ConnectionConfig,
@@ -146,6 +146,9 @@ impl MysqlDestPlugin {
 
 #[async_trait]
 impl DestinationPlugin for MysqlDestPlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<MysqlDestConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-destination-mysql"
     }

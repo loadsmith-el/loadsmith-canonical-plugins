@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 /// The connection-level config shared by both mysql plugins. Embed it with
 /// `#[serde(flatten)]` alongside plugin-specific fields (query/target_table/…).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConnectionConfig {
     #[serde(default = "default_host")]
     pub host: String,

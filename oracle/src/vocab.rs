@@ -48,6 +48,17 @@ macro_rules! config_enum {
             }
         }
 
+        // The published schema lists the accepted spellings (not the retired
+        // ones: they fail with a hint).
+        impl schemars::JsonSchema for $name {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($name).into()
+            }
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({ "type": "string", "enum": [$($spelling),+] })
+            }
+        }
+
         impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 $crate::vocab::deserialize_choice(d, Self::OPTION, Self::VALUES, Self::RETIRED)
@@ -235,7 +246,7 @@ config_enum! {
 /// The `tls` block every database connector takes. The same shape as
 /// `loadsmith_tls::TlsConfig`, parsed here so `mode` gets the "did you mean"
 /// treatment of the other enum options.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct TlsBlock {
     #[serde(default)]
     pub mode: TlsMode,

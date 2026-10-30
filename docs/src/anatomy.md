@@ -59,6 +59,15 @@ copy) — *not* a merged read/write driver. This was considered and rejected in
 the engine's *Rejected Ideas*; don't re-derive it. `postgres` is the reference
 implementation of the pattern.
 
+### Every config type publishes its schema
+
+Config types derive `schemars::JsonSchema` next to `Deserialize`, and each
+plugin returns `config_schema::schema_for::<TheConfig>()` from its trait's
+`config_schema` — the type `configure` parses, so the published schema can
+never drift from what the plugin accepts. The `config_enum!` vocabularies
+implement it by hand (their spellings as a string enum). A new type with a
+hand-written `Deserialize` needs a hand-written `JsonSchema` that matches it.
+
 ### English only
 
 All artifacts committed here — code, comments, commit messages, identifiers —

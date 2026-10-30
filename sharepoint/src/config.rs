@@ -53,7 +53,7 @@ pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
 }
 
 /// Top-level source config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SharepointConfig {
     pub tenant_id: String,
     pub client_id: String,
@@ -99,7 +99,7 @@ pub struct SharepointConfig {
 
 /// How data is obtained from the source: a file download (then parsed) or a
 /// SharePoint List read.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum InputConfig {
     /// Download a file from the drive at `file` (a path like `/folder/sheet.xlsx`)
@@ -110,7 +110,7 @@ pub enum InputConfig {
 }
 
 /// Bytes → table parser (file mode only).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ParserConfig {
     Excel {
@@ -131,7 +131,7 @@ pub enum ParserConfig {
 
 /// One transform step. The `kind` tag is the compiled "registry": each variant
 /// maps to a `Transform` impl in [`crate::transform`].
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TransformConfig {
     /// Keep rows matching a structured predicate (see [`crate::transform::filter`]).

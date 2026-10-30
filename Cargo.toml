@@ -36,18 +36,20 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Pinned Loadsmith SDK (one rev for all five; see the note at the top).
-loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
-loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
-loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "81244f1ee892d1595559ad5e4dbb3dcada22db3b" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "81244f1ee892d1595559ad5e4dbb3dcada22db3b" }
+loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "81244f1ee892d1595559ad5e4dbb3dcada22db3b" }
 # The wire vocabulary (declared `columns:` of the tabular parsers).
-loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
+loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "81244f1ee892d1595559ad5e4dbb3dcada22db3b" }
 # AWS credential chain, SigV4 and a minimal S3 client (s3, aws-secrets-manager).
-loadsmith-aws        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
+loadsmith-aws        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "81244f1ee892d1595559ad5e4dbb3dcada22db3b" }
 
 # Common deps (versions mirror the loadsmith workspace).
 tokio          = { version = "1", features = ["full"] }
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
+# The published config schema of every plugin (`--config-schema`).
+schemars       = "1"
 serde_yaml     = "0.9"
 anyhow         = "1"
 tracing        = "0.1"

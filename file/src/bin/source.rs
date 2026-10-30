@@ -21,7 +21,7 @@ use glob::{MatchOptions, Pattern};
 use loadsmith_plugin_sdk::ObjectSourcePlugin;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SourceConfig {
     /// The directory to list.
     path: PathBuf,
@@ -143,6 +143,9 @@ struct FileSource {
 
 #[async_trait]
 impl ObjectSourcePlugin for FileSource {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<SourceConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-source-file"
     }

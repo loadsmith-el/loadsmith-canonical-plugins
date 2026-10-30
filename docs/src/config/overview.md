@@ -23,6 +23,26 @@ see the engine's [Pipeline YAML
 reference](https://loadsmith-el.github.io/loadsmith/reference/pipeline-yaml.html).
 These pages cover only what goes *inside* each plugin's `config:`.
 
+## Config schemas
+
+Each plugin also publishes the JSON Schema (draft 2020-12) of its `config:`
+block, generated from the types it parses: `<binary> --config-schema`,
+`loadsmith plugin schema <name>:<kind>` for an installed plugin, or the release
+asset its manifest points to (`provides[].config_schema.url`). A pipeline
+generator can check a block against it without running the plugin:
+
+- an unknown key fails, at any depth, like the engine's default unknown-keys
+  policy; free-form parts (a `labels` map, a `columns:` entry, …) stay as
+  open as the plugin is;
+- a destination's `path` is optional, because the core supplies a staging
+  directory when a sink is attached;
+- `{{ … }}` templates validate as the strings they are, except in a field
+  limited to fixed spellings (`sslmode`, `compression`, …), which only the
+  rendered value satisfies.
+
+The schema checks shape, not meaning: a query that does not parse or a host
+that does not answer still fails at `configure`.
+
 ## Per-plugin pages
 
 | Plugin | Role(s) | Config page |

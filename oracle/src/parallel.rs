@@ -46,7 +46,7 @@ use crate::types::{self, fold_ident};
 use crate::vocab::config_enum;
 
 /// `parallel:` of the source config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ParallelConfig {
     /// Connections reading at once.
     pub workers: usize,

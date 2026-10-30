@@ -38,10 +38,15 @@ The `release-plugin.yml` workflow then:
   holding **every** binary the plugin's `provides` lists (`ci/release.py bins`):
   a multi-kind package such as `file` (provider + source) ships both in one
   archive, and the installer's `:<kind>` selector picks among them;
+- runs every amd64 binary with `--config-schema` and keeps each printed
+  schema as `<name>-<version>-<kind>.config-schema.json` (a binary that
+  publishes none exits `2` and is skipped; any other failure fails the
+  release);
 - generates the published `loadsmith-plugin.yaml` (artifact URLs + checksums
-  filled in) — the generator is `ci/release.py` (stdlib-only);
-- publishes a per-plugin **GitHub Release** with the archives + sha256 and the
-  generated `loadsmith-plugin.yaml` attached as an asset;
+  filled in, and a `config_schema: {url, sha256}` on each provided binary
+  that has a schema) — the generator is `ci/release.py` (stdlib-only);
+- publishes a per-plugin **GitHub Release** with the archives + sha256, the
+  config schemas and the generated `loadsmith-plugin.yaml` attached as assets;
 - updates the canonical `index.json` that `loadsmith plugin install` reads — its
   entries link to that release asset.
 
@@ -82,3 +87,8 @@ engine's installer reads the index to find the version's published manifest,
 checks the protocol range, then downloads the right per-arch archive and
 verifies its sha256 against the manifest. See
 [Installing Plugins](./installing.md).
+
+Tools that write pipelines read the same chain one step further: index →
+manifest → `provides[].config_schema.url`, a JSON Schema (draft 2020-12) of
+that binary's `config:` block to validate against before anything runs (see
+[Configuration Reference](./config/overview.md#config-schemas)).

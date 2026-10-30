@@ -35,7 +35,7 @@ const INVALID_REF: &str = "INVALID_REF";
 const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const RESOLVE_FAILED: &str = "RESOLVE_FAILED";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Config {
     /// Default `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `us-east-1`.
@@ -264,6 +264,9 @@ fn select(text: &str, segments: &[&str], id: &str) -> Result<String, ResolveFail
 
 #[async_trait]
 impl ProviderPlugin for SecretsManagerProvider {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<Config>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-provider-aws-secrets-manager"
     }

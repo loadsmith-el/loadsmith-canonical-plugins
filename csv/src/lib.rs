@@ -51,6 +51,9 @@ pub struct CsvParser {
 
 #[async_trait]
 impl ParserPlugin for CsvParser {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<crate::options::RawOptions>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-parser-csv"
     }

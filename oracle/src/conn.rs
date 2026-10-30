@@ -47,7 +47,7 @@ pub const FMT_TIMESTAMP_TZ_IN: &str = "YYYY-MM-DD HH24:MI:SS.FF TZH:TZM";
 
 /// Connection-level config shared by both oracle plugins. Embed it with
 /// `#[serde(flatten)]` alongside plugin-specific fields (query/target_table/…).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConnectionConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -74,7 +74,7 @@ pub struct ConnectionConfig {
 /// A stale pre-0.3 block (`enabled`/`wallet_dir`) has only unknown keys, so
 /// `PluginConfig::parse` rejects it (by default) instead of it silently
 /// reading as `mode: disable` (plaintext).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 pub struct TlsConfig {
     #[serde(default)]
     pub mode: TlsMode,

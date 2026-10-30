@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use loadsmith_plugin_sdk::DestinationPlugin;
 
 /// The (empty) config block.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct NullConfig {}
 
 /// A destination that discards every batch, counting rows only.
@@ -25,6 +25,9 @@ impl NullPlugin {
 
 #[async_trait]
 impl DestinationPlugin for NullPlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<NullConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-destination-null"
     }

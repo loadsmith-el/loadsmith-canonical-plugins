@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-sharepoint"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license.workspace = true
 
@@ -30,6 +30,7 @@ serde                = { workspace = true }
 # preserve_order: keep list-item field order as Graph returns it (source-faithful
 # column order) instead of serde_json's default alphabetical Map.
 serde_json           = { workspace = true, features = ["preserve_order"] }
+schemars             = { workspace = true }
 async-trait          = { workspace = true }
 arrow                = { workspace = true }
 arrow-array          = { workspace = true }

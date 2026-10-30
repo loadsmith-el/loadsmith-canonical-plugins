@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
-struct RawOptions {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RawOptions {
     #[serde(default = "default_delimiter")]
     delimiter: String,
     encoding: Option<String>,

@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-postgres"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license.workspace = true
 
@@ -33,6 +33,7 @@ anyhow                         = { workspace = true }
 tracing                        = { workspace = true }
 serde                          = { workspace = true }
 serde_json                     = { workspace = true }
+schemars = { workspace = true }
 async-trait                    = { workspace = true }
 arrow                          = { workspace = true }
 arrow-array                    = { workspace = true }

@@ -64,6 +64,25 @@ jobs:
               echo "::error::$b is dynamically linked"; exit 1
             fi
           done
+      - name: Config schemas
+        # `<bin> --config-schema` prints the JSON Schema of its config block
+        # (exit 2: the binary publishes none). Same on both arches: taken
+        # from the amd64 build only.
+        if: matrix.arch == 'amd64'
+        run: |
+          name="${{ needs.meta.outputs.name }}"
+          version="${{ needs.meta.outputs.version }}"
+          python3 ci/release.py provides "$name" | while read -r kind bin; do
+            file="$(python3 ci/release.py schema-file "$name" "$version" "$kind")"
+            if "target/release/$bin" --config-schema < /dev/null > "$file"; then
+              python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$file"
+              echo "$bin: $file"
+            else
+              code=$?; rm -f "$file"
+              [ "$code" -eq 2 ] || { echo "::error::$bin --config-schema failed ($code)"; exit 1; }
+              echo "$bin publishes no config schema"
+            fi
+          done
       - name: Package
         id: pkg
         run: |
@@ -81,6 +100,7 @@ jobs:
           path: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.tarball }}.sha256
+            *.config-schema.json
           retention-days: 1
 
   release:
@@ -104,7 +124,7 @@ jobs:
           python3 ci/release.py manifest "$name" "${GITHUB_REF_NAME}" \
             "dist/${name}-${version}-linux-amd64.tar.gz" \
             "dist/${name}-${version}-linux-arm64.tar.gz" \
-            "dist/loadsmith-plugin.yaml"
+            "dist/loadsmith-plugin.yaml" dist
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -112,7 +132,8 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "${{ needs.meta.outputs.name }} v${{ needs.meta.outputs.version }}" \
             --notes "Loadsmith plugin \`${{ needs.meta.outputs.name }}\` v${{ needs.meta.outputs.version }} (linux amd64+arm64). Install: \`loadsmith plugin install ${{ needs.meta.outputs.name }}\`." \
-            dist/*.tar.gz dist/*.sha256 dist/loadsmith-plugin.yaml
+            dist/*.tar.gz dist/*.sha256 dist/loadsmith-plugin.yaml \
+            $(ls dist/*.config-schema.json 2>/dev/null)
       - name: Update index.json
         run: |
           name="${{ needs.meta.outputs.name }}"

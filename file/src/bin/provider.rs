@@ -28,7 +28,7 @@ const INVALID_REF: &str = "INVALID_REF";
 const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const RESOLVE_FAILED: &str = "RESOLVE_FAILED";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct FileConfig {
     /// Directory that relative reference paths resolve against.
     base_dir: Option<PathBuf>,
@@ -41,6 +41,9 @@ struct FileProvider {
 
 #[async_trait]
 impl ProviderPlugin for FileProvider {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<FileConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-provider-file"
     }

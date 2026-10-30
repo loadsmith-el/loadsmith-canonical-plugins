@@ -59,7 +59,7 @@ impl CompressionKind {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ParquetConfig {
     /// Output directory, created when missing. Files are created inside it.
     path: PathBuf,
@@ -332,6 +332,9 @@ impl ParquetPlugin {
 
 #[async_trait]
 impl DestinationPlugin for ParquetPlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<ParquetConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-destination-parquet"
     }

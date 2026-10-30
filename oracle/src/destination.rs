@@ -43,7 +43,7 @@ config_enum! {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct OracleDestConfig {
     #[serde(flatten)]
     conn: ConnectionConfig,
@@ -182,6 +182,9 @@ impl OracleDestPlugin {
 
 #[async_trait]
 impl DestinationPlugin for OracleDestPlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<OracleDestConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-destination-oracle"
     }

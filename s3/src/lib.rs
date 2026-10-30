@@ -40,7 +40,7 @@ const MAX_PARTS: u64 = 10_000;
 /// How long a presigned request URL stays valid (each request signs anew).
 const SIGNATURE_TTL: Duration = Duration::from_secs(3600);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 enum UrlStyleConfig {
     /// `https://<bucket>.<host>/<key>` — AWS's default.
@@ -49,7 +49,7 @@ enum UrlStyleConfig {
     Path,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct S3Config {
     bucket: String,
     /// Default `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `us-east-1`.
@@ -323,6 +323,9 @@ fn rusty(c: &loadsmith_aws::Credentials) -> Credentials {
 
 #[async_trait]
 impl SinkPlugin for S3SinkPlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<S3Config>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-sink-s3"
     }

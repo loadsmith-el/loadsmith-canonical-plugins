@@ -18,7 +18,7 @@ use crate::vocab::TimestampUnit;
 /// Incremental load. The core persists the high watermark of `cursor_column`
 /// and hands it back on the next run; the source resumes reading strictly after
 /// it. `cursor_column` should be an ordered, monotonically-advancing column.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct IncrementalConfig {
     cursor_column: String,
     /// Watermark to use on the very first run (no persisted state yet).
@@ -26,7 +26,7 @@ struct IncrementalConfig {
     initial_value: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct MysqlConfig {
     /// Connection-level fields, shared with the destination via `conn`.
     #[serde(flatten)]
@@ -153,6 +153,9 @@ impl MysqlSourcePlugin {
 
 #[async_trait]
 impl SourcePlugin for MysqlSourcePlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<MysqlConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-source-mysql"
     }

@@ -3,11 +3,19 @@
 
 Two steps the release workflow calls:
 
-  manifest <plugin-dir> <tag> <amd64.tar.gz> <arm64.tar.gz> <out.yaml>
+  manifest <plugin-dir> <tag> <amd64.tar.gz> <arm64.tar.gz> <out.yaml> [<schema-dir>]
       Reads the plugin's [package.metadata.loadsmith] + [package] version and
       emits the PUBLISHED loadsmith-plugin.yaml — the same fields the author
       wrote, plus a runtime.artifacts block with the per-arch release-asset URLs
-      and their sha256 (computed from the built tarballs).
+      and their sha256 (computed from the built tarballs). A provided binary
+      whose config schema is in <schema-dir> (see `schema-file`) gets a
+      `config_schema: {url, sha256}`.
+
+  provides <plugin-dir>
+      Prints `<kind> <bin>` per provided binary.
+
+  schema-file <name> <version> <kind>
+      Prints the release-asset file name of that binary's config schema.
 
   index <name> <version> <manifest-url> <index.json>
       Adds/updates the entry in the index that `loadsmith plugin install` reads.
@@ -41,7 +49,11 @@ def load_meta(plugin_dir: str):
     return pkg["version"], meta
 
 
-def cmd_manifest(plugin_dir, tag, amd64_tar, arm64_tar, out):
+def schema_file(name, version, kind):
+    return f"{name}-{version}-{kind}.config-schema.json"
+
+
+def cmd_manifest(plugin_dir, tag, amd64_tar, arm64_tar, out, schema_dir=None):
     version, meta = load_meta(plugin_dir)
     base = f"https://github.com/{REPO}/releases/download/{tag}"
     artifacts = [
@@ -61,7 +73,11 @@ def cmd_manifest(plugin_dir, tag, amd64_tar, arm64_tar, out):
     lines.append(f"protocol: {json.dumps(meta['protocol'])}")
     lines.append("provides:")
     for p in meta["provides"]:
-        lines.append(f"  - {{ kind: {p['kind']}, bin: {p['bin']} }}")
+        entry = f"kind: {p['kind']}, bin: {p['bin']}"
+        schema = schema_dir and pathlib.Path(schema_dir) / schema_file(meta["name"], version, p["kind"])
+        if schema and schema.exists():
+            entry += f', config_schema: {{ url: "{base}/{schema.name}", sha256: "{sha256(schema)}" }}'
+        lines.append(f"  - {{ {entry} }}")
     lines += ["runtime:", "  type: binary", "  artifacts:"]
     for arch, fname, digest in artifacts:
         lines.append(
@@ -77,6 +93,13 @@ def cmd_bins(plugin_dir):
     _, meta = load_meta(plugin_dir)
     for p in meta["provides"]:
         print(p["bin"])
+
+
+def cmd_provides(plugin_dir):
+    """Print `<kind> <bin>` per provided binary (for the schema step)."""
+    _, meta = load_meta(plugin_dir)
+    for p in meta["provides"]:
+        print(p["kind"], p["bin"])
 
 
 def cmd_check(plugin_dir, tag):
@@ -111,6 +134,10 @@ def main():
         cmd_bins(*args)
     elif cmd == "check":
         cmd_check(*args)
+    elif cmd == "provides":
+        cmd_provides(*args)
+    elif cmd == "schema-file":
+        print(schema_file(*args))
     else:
         sys.exit(f"unknown command {cmd!r}")
 

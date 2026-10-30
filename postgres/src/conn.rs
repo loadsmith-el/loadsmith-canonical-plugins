@@ -40,7 +40,7 @@ config_enum! {
     retired {}
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TcpKeepalives {
     pub idle: Option<String>,
     pub interval: Option<String>,
@@ -48,7 +48,7 @@ pub struct TcpKeepalives {
 }
 
 /// Accepts either a single host string or a list of hosts for multi-node clusters.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum HostSpec {
     One(String),
@@ -63,7 +63,7 @@ impl Default for HostSpec {
 
 /// The connection-level config shared by both postgres plugins. Embed it with
 /// `#[serde(flatten)]` alongside plugin-specific fields (query/table/etc.).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConnectionConfig {
     #[serde(default)]
     pub host: HostSpec,

@@ -66,6 +66,9 @@ impl SharepointSourcePlugin {
 
 #[async_trait]
 impl SourcePlugin for SharepointSourcePlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<crate::config::SharepointConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-source-sharepoint"
     }

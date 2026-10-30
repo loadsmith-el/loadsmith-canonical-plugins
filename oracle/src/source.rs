@@ -17,7 +17,7 @@ use crate::types::{self, quote_ident, typed_expr};
 
 /// Incremental load. The core persists the high watermark of `cursor_column` and
 /// hands it back on the next run; the source resumes reading strictly after it.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct IncrementalConfig {
     cursor_column: String,
     /// Watermark to use on the very first run (no persisted state yet).
@@ -25,7 +25,7 @@ struct IncrementalConfig {
     initial_value: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct OracleConfig {
     #[serde(flatten)]
     conn: ConnectionConfig,
@@ -375,6 +375,9 @@ fn fetch_loop(
 
 #[async_trait]
 impl SourcePlugin for OracleSourcePlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<OracleConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-source-oracle"
     }

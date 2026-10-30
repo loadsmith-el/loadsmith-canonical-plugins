@@ -18,7 +18,7 @@ use loadsmith_plugin_sdk::{telemetry, ObjectKey, RunInfo, SinkPlugin};
 use tracing::Span;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct LocalCopyConfig {
     /// Destination directory, created when missing.
     dest: PathBuf,
@@ -128,6 +128,9 @@ fn copy_atomic(src: &Path, target: &Path, file_name: &std::ffi::OsStr) -> Result
 
 #[async_trait]
 impl SinkPlugin for LocalCopyPlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<LocalCopyConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-sink-local-copy"
     }

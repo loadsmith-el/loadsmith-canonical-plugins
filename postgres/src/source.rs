@@ -45,7 +45,7 @@ config_enum! {
 /// and hands it back on the next run; the source resumes reading strictly after
 /// it. `cursor_column` should be an ordered, monotonically-advancing column
 /// (e.g. an `updated_at` timestamp) — see the at-least-once caveat in the docs.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct IncrementalConfig {
     cursor_column: String,
     /// Watermark to use on the very first run (no persisted state yet). Omit to
@@ -54,7 +54,7 @@ struct IncrementalConfig {
     initial_value: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct PostgresConfig {
     /// All connection-level fields (host/port/tls/keepalives/session/…), shared
     /// with the destination plugin via the crate's own `conn` module.
@@ -420,6 +420,9 @@ async fn fetch_ahead(client: Arc<Client>, mut gate: FlowGate, read: Read, tx: mp
 
 #[async_trait]
 impl SourcePlugin for PostgresSourcePlugin {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<PostgresConfig>())
+    }
     fn plugin_name(&self) -> &str {
         "loadsmith-source-postgres"
     }
