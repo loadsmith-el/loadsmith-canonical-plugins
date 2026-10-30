@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-sink-s3"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license.workspace = true
 
@@ -28,6 +28,7 @@ serde_json           = { workspace = true }
 async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { workspace = true }
 loadsmith-tls        = { workspace = true }
+loadsmith-aws        = { workspace = true }
 mimalloc             = { workspace = true }
 chrono               = { version = "0.4", default-features = false, features = ["std", "clock"] }
 # SigV4 signing (presigned URLs) with the RustCrypto hmac/sha2 — pure Rust, no

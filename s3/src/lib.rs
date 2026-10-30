@@ -28,7 +28,7 @@ use reqwest::{Client, StatusCode};
 use rusty_s3::actions::S3Action;
 use rusty_s3::{Bucket, Credentials, UrlStyle};
 
-mod creds;
+use loadsmith_aws::{s3::error_message as s3_error, s3::xml_element, Explicit, Provider};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tracing::Span;
@@ -70,7 +70,7 @@ struct S3Config {
     /// `{pipeline}`.
     #[serde(default = "default_key")]
     key: String,
-    /// Default: the AWS credential chain ([`creds`]).
+    /// Default: the AWS credential chain ([`loadsmith_aws::credentials`]).
     #[serde(default)]
     access_key_id: Option<String>,
     #[serde(default)]
@@ -106,7 +106,7 @@ fn default_max_attempts() -> u32 {
 /// Everything a configured sink needs to upload.
 struct Target {
     bucket: Bucket,
-    credentials: creds::Provider,
+    credentials: Provider,
     keys: ObjectKey,
     run: Option<RunInfo>,
     part_size: u64,
@@ -131,10 +131,6 @@ impl Default for S3SinkPlugin {
     }
 }
 
-fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
 impl Target {
     async fn from_config(cfg: S3Config, run: Option<RunInfo>) -> Result<Self> {
         if cfg.bucket.trim().is_empty() {
@@ -147,12 +143,7 @@ impl Target {
             bail!("`max_attempts` must be at least 1");
         }
         let keys = ObjectKey::parse(cfg.prefix.as_deref(), &cfg.key, run.as_ref())?;
-        let region = cfg
-            .region
-            .clone()
-            .or_else(|| env_var("AWS_REGION"))
-            .or_else(|| env_var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|| "us-east-1".to_string());
+        let region = loadsmith_aws::region(cfg.region.as_deref());
         let (endpoint, default_style) = match &cfg.endpoint {
             Some(e) => (e.clone(), UrlStyleConfig::Path),
             None => (format!("https://s3.{region}.amazonaws.com"), UrlStyleConfig::VirtualHost),
@@ -166,12 +157,12 @@ impl Target {
             .map_err(|e| anyhow::anyhow!("bucket {:?} at {endpoint}: {e}", cfg.bucket))?;
 
         loadsmith_tls::install_provider();
-        let explicit = creds::Explicit {
+        let explicit = Explicit {
             access_key_id: cfg.access_key_id.as_deref(),
             secret_access_key: cfg.secret_access_key.as_deref(),
             session_token: cfg.session_token.as_deref(),
         };
-        let credentials = creds::Provider::resolve(explicit, &region).await?;
+        let credentials = Provider::resolve(explicit, &region).await?;
         let http = Client::builder()
             .tls_backend_preconfigured(loadsmith_tls::public_web_config(&[b"h2", b"http/1.1"])?)
             .timeout(Duration::from_secs(cfg.request_timeout_seconds))
@@ -194,7 +185,7 @@ impl Target {
     async fn send(&self, what: &str, build: impl Fn(&Credentials) -> reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let mut attempt = 1;
         loop {
-            let credentials = self.credentials.get().await?;
+            let credentials = rusty(&self.credentials.get().await?);
             let outcome = build(&credentials).send().await;
             let retryable = match &outcome {
                 Ok(r) if r.status().is_success() => return Ok(outcome.expect("checked Ok")),
@@ -253,7 +244,7 @@ impl Target {
         if completed.is_err() {
             // Best effort: an incomplete upload keeps its parts (and their
             // storage cost) until aborted or expired by a lifecycle rule.
-            let aborted = match self.credentials.get().await {
+            let aborted = match self.credentials.get().await.map(|c| rusty(&c)) {
                 Ok(c) => {
                     let abort = self.bucket.abort_multipart_upload(Some(&c), key, &upload_id);
                     self.http.delete(abort.sign(SIGNATURE_TTL)).send().await.map(drop).map_err(anyhow::Error::from)
@@ -322,21 +313,11 @@ impl Target {
     }
 }
 
-/// The text of the first `<name>…</name>` element of an S3 XML body.
-fn xml_element(body: &str, name: &str) -> Option<String> {
-    let open = format!("<{name}>");
-    let start = body.find(&open)? + open.len();
-    let end = body[start..].find(&format!("</{name}>"))? + start;
-    Some(body[start..end].trim().to_string())
-}
-
-/// The `Code: Message` of an S3 XML error body, or the body itself (trimmed).
-fn s3_error(body: &str) -> String {
-    let tag = |name: &str| xml_element(body, name);
-    match (tag("Code"), tag("Message")) {
-        (Some(code), Some(msg)) => format!("{code}: {msg}"),
-        (Some(code), None) => code,
-        _ => body.trim().chars().take(300).collect(),
+/// The credentials in `rusty-s3`'s type, which signs the presigned URLs.
+fn rusty(c: &loadsmith_aws::Credentials) -> Credentials {
+    match c.session_token() {
+        Some(token) => Credentials::new_with_token(c.access_key_id(), c.secret_access_key(), token),
+        None => Credentials::new(c.access_key_id(), c.secret_access_key()),
     }
 }
 
