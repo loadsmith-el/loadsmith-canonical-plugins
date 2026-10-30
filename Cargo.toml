@@ -7,7 +7,7 @@
 # checksums) into the index that `loadsmith plugin install` reads.
 #
 # The SDK crates come from the loadsmith repo as **git deps pinned by rev**
-# (they stay 0.x, off crates.io). The four entries below must share one rev;
+# (they stay 0.x, off crates.io). The five entries below must share one rev;
 # to re-pin every plugin it is a single substitution:
 #   sed -i 's/<old-rev>/<new-rev>/' Cargo.toml && cargo update -p loadsmith-plugin-sdk
 
@@ -28,18 +28,21 @@ members = [
     "csv",
     "excel",
     "s3",
+    "aws-secrets-manager",
 ]
 
 [workspace.package]
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# Pinned Loadsmith SDK (one rev for all four; see the note at the top).
-loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "de670cb450f93050519b10a657389cd79f7ef4ec" }
-loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "de670cb450f93050519b10a657389cd79f7ef4ec" }
-loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "de670cb450f93050519b10a657389cd79f7ef4ec" }
+# Pinned Loadsmith SDK (one rev for all five; see the note at the top).
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
+loadsmith-tls        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
 # The wire vocabulary (declared `columns:` of the tabular parsers).
-loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "de670cb450f93050519b10a657389cd79f7ef4ec" }
+loadsmith-protocol   = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
+# AWS credential chain, SigV4 and a minimal S3 client (s3, aws-secrets-manager).
+loadsmith-aws        = { git = "https://github.com/loadsmith-el/loadsmith", rev = "5359444af6642b3a9fefc97cee6c1bd48d07bd27" }
 
 # Common deps (versions mirror the loadsmith workspace).
 tokio          = { version = "1", features = ["full"] }

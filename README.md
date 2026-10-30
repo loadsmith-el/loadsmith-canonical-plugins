@@ -31,6 +31,7 @@ destination). Each plugin is a self-describing directory:
 | `local-copy` | sink |
 | `s3` | sink (AWS S3 or S3-compatible; pure-Rust SigV4, TLS via rustls) |
 | `file` | source (raw: lists a local directory for a parser) + provider (`secret()` values from local files) |
+| `aws-secrets-manager` | provider (`secret()` values from AWS Secrets Manager; pure-Rust SigV4, TLS via rustls) |
 | `csv` | parser (streams CSV files into Arrow) |
 | `excel` | parser (one sheet of xlsx/xlsm/xlsb/xls/ods workbooks into Arrow) |
 

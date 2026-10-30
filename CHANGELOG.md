@@ -4,6 +4,28 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-30 — aws-secrets-manager 0.1.0; s3 0.2.1 on the shared AWS crate
+
+The plugins move to the SDK of loadsmith `5359444`, which adds the
+`loadsmith-aws` crate (the AWS credential chain, SigV4 signing, a minimal S3
+client).
+
+### aws-secrets-manager 0.1.0
+
+- **New provider**: `{{ secret('<instance>', 'secret-id[#key]') }}` resolves
+  from AWS Secrets Manager — a whole `SecretString`, or one key of a JSON
+  secret (a dotted path), each secret fetched once per run. Region, endpoint,
+  staging label and static keys are optional; the AWS credential chain is the
+  default. Errors map to `NOT_FOUND` / `ACCESS_DENIED` / `INVALID_REF` /
+  `RESOLVE_FAILED` and never contain a value.
+
+### s3 0.2.1
+
+- The credential chain now comes from `loadsmith-aws` (the same code, shared
+  with the core's `s3` state backend and the new provider). The only visible
+  change: "no S3 credentials" errors now read "no AWS credentials", and the
+  default web-identity session name is `loadsmith`.
+
 ## 2026-10-29 — postgres 0.8.1, oracle 0.9.2: partitioned loads no longer stall
 
 The plugins move to the SDK of loadsmith `de670cb`.

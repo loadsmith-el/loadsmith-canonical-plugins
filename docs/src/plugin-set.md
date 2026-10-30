@@ -16,6 +16,7 @@ destination).
 | `local-copy` | sink | Delivers staged files to a local destination directory. |
 | `s3` | sink | Delivers staged files to an S3 bucket (AWS or S3-compatible), one key prefix per run. |
 | `file` | source + provider | Raw source: lists the files of a local directory (glob, optional recursion) for a parser, read in place. Provider: resolves `secret()` values from local files (a whole file, or one key of a JSON/YAML document). |
+| `aws-secrets-manager` | provider | Resolves `secret()` values from AWS Secrets Manager: a whole secret, or one key of a JSON secret (`prod/db#password`), each secret fetched once per run; the AWS credential chain. |
 | `csv` | parser | Streams CSV files into Arrow: delimiter, encoding, header, type inference from a bounded sample or declared columns. |
 | `excel` | parser | One sheet of each xlsx/xlsm/xlsb/xls/ods workbook into Arrow: sheet by name or index, `skip_rows`, inference or declared columns. |
 

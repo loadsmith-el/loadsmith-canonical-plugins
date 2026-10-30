@@ -2493,7 +2493,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "loadsmith-arrow"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=de670cb450f93050519b10a657389cd79f7ef4ec#de670cb450f93050519b10a657389cd79f7ef4ec"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=5359444af6642b3a9fefc97cee6c1bd48d07bd27#5359444af6642b3a9fefc97cee6c1bd48d07bd27"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2502,6 +2502,40 @@ dependencies = [
  "loadsmith-protocol",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "loadsmith-aws"
+version = "0.1.0"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=5359444af6642b3a9fefc97cee6c1bd48d07bd27#5359444af6642b3a9fefc97cee6c1bd48d07bd27"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hmac 0.12.1",
+ "loadsmith-tls",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "loadsmith-aws-secrets-manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "httpmock",
+ "loadsmith-aws",
+ "loadsmith-plugin-sdk",
+ "loadsmith-tls",
+ "mimalloc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2656,7 +2690,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=de670cb450f93050519b10a657389cd79f7ef4ec#de670cb450f93050519b10a657389cd79f7ef4ec"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=5359444af6642b3a9fefc97cee6c1bd48d07bd27#5359444af6642b3a9fefc97cee6c1bd48d07bd27"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2700,7 +2734,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-protocol"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=de670cb450f93050519b10a657389cd79f7ef4ec#de670cb450f93050519b10a657389cd79f7ef4ec"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=5359444af6642b3a9fefc97cee6c1bd48d07bd27#5359444af6642b3a9fefc97cee6c1bd48d07bd27"
 dependencies = [
  "serde",
  "serde_json",
@@ -2758,12 +2792,13 @@ dependencies = [
 
 [[package]]
 name = "loadsmith-sink-s3"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "httpmock",
+ "loadsmith-aws",
  "loadsmith-plugin-sdk",
  "loadsmith-tls",
  "mimalloc",
@@ -2778,7 +2813,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-tls"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=de670cb450f93050519b10a657389cd79f7ef4ec#de670cb450f93050519b10a657389cd79f7ef4ec"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=5359444af6642b3a9fefc97cee6c1bd48d07bd27#5359444af6642b3a9fefc97cee6c1bd48d07bd27"
 dependencies = [
  "anyhow",
  "rustls",
@@ -2791,7 +2826,7 @@ dependencies = [
 [[package]]
 name = "loadsmith-transport"
 version = "0.1.0"
-source = "git+https://github.com/loadsmith-el/loadsmith?rev=de670cb450f93050519b10a657389cd79f7ef4ec#de670cb450f93050519b10a657389cd79f7ef4ec"
+source = "git+https://github.com/loadsmith-el/loadsmith?rev=5359444af6642b3a9fefc97cee6c1bd48d07bd27#5359444af6642b3a9fefc97cee6c1bd48d07bd27"
 dependencies = [
  "loadsmith-arrow",
  "loadsmith-protocol",

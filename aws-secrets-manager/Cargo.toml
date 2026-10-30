@@ -1,0 +1,36 @@
+[package]
+name    = "loadsmith-aws-secrets-manager"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[package.metadata.loadsmith]
+name     = "aws-secrets-manager"
+summary  = "AWS Secrets Manager provider — secret() values from secrets (pure-Rust SigV4 + TLS, the AWS credential chain)"
+protocol = "^1"
+provides = [
+    { kind = "provider", bin = "loadsmith-provider-aws-secrets-manager" },
+]
+
+[lib]
+name = "loadsmith_aws_secrets_manager"
+
+[[bin]]
+name = "loadsmith-provider-aws-secrets-manager"
+path = "src/main.rs"
+
+[dependencies]
+tokio                = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+async-trait          = { workspace = true }
+loadsmith-plugin-sdk = { workspace = true }
+loadsmith-tls        = { workspace = true }
+loadsmith-aws        = { workspace = true }
+mimalloc             = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls-no-provider"] }
+
+[dev-dependencies]
+httpmock = "0.7"

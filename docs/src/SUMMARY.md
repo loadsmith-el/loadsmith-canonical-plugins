@@ -25,5 +25,6 @@
 - [Local-copy sink](./config/local-copy.md)
 - [S3 sink](./config/s3.md)
 - [File (source + provider)](./config/file.md)
+- [AWS Secrets Manager (provider)](./config/aws-secrets-manager.md)
 - [CSV parser](./config/csv.md)
 - [Excel parser](./config/excel.md)
