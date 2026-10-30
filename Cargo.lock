@@ -4523,7 +4523,6 @@ dependencies = [
  "encoding_rs",
  "loadsmith-arrow",
  "loadsmith-protocol",
- "schemars",
  "serde_json",
 ]
 
