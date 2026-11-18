@@ -378,9 +378,9 @@ pub fn key_min_max(conn: &Connection, q: &TableQuery, key: &str, scn: u64) -> Re
         "SELECT TO_CHAR(MIN({key})), TO_CHAR(MAX({key})) FROM {} AS OF SCN {scn}{alias}{filter}",
         q.table_ref
     );
-    let row = conn.query_row(&sql, &[]).map_err(|e| anyhow::anyhow!("reading the range of `{key}`: {e}"))?;
-    let lo: Option<String> = row.get(0).map_err(|e| anyhow::anyhow!("reading the range of `{key}`: {e}"))?;
-    let hi: Option<String> = row.get(1).map_err(|e| anyhow::anyhow!("reading the range of `{key}`: {e}"))?;
+    let row = conn.query_row(&sql, &[]).map_err(|e| anyhow::Error::new(e).context(format!("reading the range of `{key}`")))?;
+    let lo: Option<String> = row.get(0).map_err(|e| anyhow::Error::new(e).context(format!("reading the range of `{key}`")))?;
+    let hi: Option<String> = row.get(1).map_err(|e| anyhow::Error::new(e).context(format!("reading the range of `{key}`")))?;
     match (lo, hi) {
         (Some(lo), Some(hi)) => {
             let int = |v: &str| {
@@ -508,11 +508,11 @@ pub fn sample_bounds(conn: &Connection, q: &TableQuery, pieces: usize) -> Result
             .statement(&sql)
             .and_then(|b| b.build())
             .and_then(|stmt| stmt.query(&[]))
-            .map_err(|e| anyhow::anyhow!("sampling the blocks of {}: {e}", q.table_ref))?;
+            .map_err(|e| anyhow::Error::new(e).context(format!("sampling the blocks of {}", q.table_ref)))?;
         cursor
             .map(|row| {
-                let row = row.map_err(|e| anyhow::anyhow!("sampling the blocks: {e}"))?;
-                let get = |i: usize| row.get::<i64>(i).map_err(|e| anyhow::anyhow!("sampling the blocks: {e}"));
+                let row = row.map_err(|e| anyhow::Error::new(e).context("sampling the blocks"))?;
+                let get = |i: usize| row.get::<i64>(i).map_err(|e| anyhow::Error::new(e).context("sampling the blocks"));
                 Ok((get(0)?, get(1)?, get(2)?, get(3)?))
             })
             .collect()
@@ -573,9 +573,9 @@ fn query_strings(conn: &Connection, sql: &str) -> Result<Vec<String>> {
         .statement(sql)
         .and_then(|b| b.build())
         .and_then(|stmt| stmt.query(&[]))
-        .map_err(|e| anyhow::anyhow!("building ROWID bounds: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("building ROWID bounds"))?;
     cursor
-        .map(|row| row.and_then(|r| r.get::<String>(0)).map_err(|e| anyhow::anyhow!("building ROWID bounds: {e}")))
+        .map(|row| row.and_then(|r| r.get::<String>(0)).map_err(|e| anyhow::Error::new(e).context("building ROWID bounds")))
         .collect()
 }
 
@@ -610,15 +610,15 @@ fn block_bounds(segments: &[(i64, i64, i64, i64)], pieces: usize) -> Vec<(i64, i
 /// (ORA-01466) is also below the current one.
 pub fn snapshot_scn(conn: &Connection, q: &TableQuery) -> Result<u64> {
     let row = conn.query_row("SELECT TO_CHAR(TIMESTAMP_TO_SCN(SYSTIMESTAMP)) FROM DUAL", &[]);
-    let base: String = row.and_then(|r| r.get(0)).map_err(|e| anyhow::anyhow!("reading the snapshot SCN: {e}"))?;
+    let base: String = row.and_then(|r| r.get(0)).map_err(|e| anyhow::Error::new(e).context("reading the snapshot SCN"))?;
     let base: u64 = base.trim().parse().with_context(|| format!("snapshot SCN {base:?}"))?;
     let below_current = |scn: u64| -> Result<bool> {
         let sql = format!("SELECT COUNT(*) FROM {} AS OF SCN {scn} WHERE ROWNUM = 1", q.table_ref);
         match conn.query_row(&sql, &[]) {
             Ok(_) => Ok(true),
-            Err(e) if e.to_string().contains("ORA-08181") => Ok(false),
-            Err(e) if e.to_string().contains("ORA-01466") => Ok(true),
-            Err(e) => Err(anyhow::anyhow!("probing the snapshot SCN {scn}: {e}")),
+            Err(e) if e.db_error_code() == Some(8181) => Ok(false),
+            Err(e) if e.db_error_code() == Some(1466) => Ok(true),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("probing the snapshot SCN {scn}"))),
         }
     };
     // `lo` is at most the current SCN, `hi` past it.
@@ -715,7 +715,7 @@ fn work(
             conn.statement(&sql)
                 .and_then(|b| b.fetch_array_size(fetch).prefetch_rows(fetch).build())
                 .and_then(|stmt| stmt.query(&[]))
-                .map_err(|e| anyhow::anyhow!("partition query failed: {e}"))
+                .map_err(|e| anyhow::Error::new(e).context("partition query failed"))
         })?;
         loop {
             runtime.block_on(shared.credits.take(&mut gate));
@@ -723,7 +723,7 @@ fn work(
                 .by_ref()
                 .take(shared.batch_size)
                 .collect::<std::result::Result<Vec<Row>, _>>()
-                .map_err(|e| anyhow::anyhow!("row fetch failed: {e}"));
+                .map_err(|e| anyhow::Error::new(e).context("row fetch failed"));
             let rows = match rows {
                 Ok(rows) if rows.is_empty() => {
                     // The end of this range: the credit is not used.

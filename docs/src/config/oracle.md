@@ -277,8 +277,9 @@ tls:
 
 `oracledb` is a **26.0.0 beta**; the plugin pins an exact version.
 
-- **10G password verifier.** Accounts that still carry only the legacy 10G
-  verifier fail with `ORA-01017` even with the right password. Check
+- **10G password verifier.** The 11G and 12C verifiers work (11G since
+  oracle 0.9.4); an account that carries only the legacy 10G verifier fails to
+  log in even with the right password. Check
   `SELECT password_versions FROM dba_users WHERE username = '…'` and re-set the
   password (`ALTER USER … IDENTIFIED BY …`) to issue 11G/12C verifiers
   (oracle/rust-oracledb#6).

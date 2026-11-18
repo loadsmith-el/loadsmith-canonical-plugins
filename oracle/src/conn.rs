@@ -275,7 +275,7 @@ fn connect_inner(cfg: &ConnectionConfig) -> Result<Connection> {
     let mut config = oracledb::Config::default()
         .set_credentials(&cfg.user, &cfg.password)
         .set_connect_string(&descriptor)
-        .map_err(|e| anyhow::anyhow!("invalid oracle connect descriptor: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("invalid oracle connect descriptor"))?;
     // build_descriptor validated the block: a root_cert only matters for
     // verify-full. The driver reads it at connect time; the temp dir is removed
     // when `_wallet` drops at the end of this function.
@@ -287,7 +287,7 @@ fn connect_inner(cfg: &ConnectionConfig) -> Result<Connection> {
         }
         _ => None,
     };
-    let conn = oracledb::connect(config).map_err(|e| anyhow::anyhow!("oracle connect failed: {e}"))?;
+    let conn = oracledb::connect(config).map_err(|e| anyhow::Error::new(e).context("oracle connect failed"))?;
     // Numbers cross the connector as text, so pin the decimal/group characters on
     // every session. Otherwise a comma-decimal locale (e.g. NLS_LANG=GERMAN…)
     // makes the source render `3.14` as `3,14` and/or the destination reject the
@@ -295,7 +295,7 @@ fn connect_inner(cfg: &ConnectionConfig) -> Result<Connection> {
     // canonical form the read/write paths assume. (Temporal columns already use
     // explicit TO_* formats and are unaffected.)
     conn.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'", &[])
-        .map_err(|e| anyhow::anyhow!("pinning NLS_NUMERIC_CHARACTERS failed: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("pinning NLS_NUMERIC_CHARACTERS failed"))?;
     Ok(conn)
 }
 

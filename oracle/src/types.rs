@@ -299,7 +299,7 @@ impl FetchedRow for Vec<Value<'static>> {
 pub fn read_value(row: &Row, i: usize) -> Result<Value<'_>> {
     let meta = row.columns().get(i).context("column index out of range")?;
     let t = meta.db_type();
-    let err = |e: oracledb::Error| anyhow::anyhow!("col {}: {e}", meta.name());
+    let err = |e: oracledb::Error| anyhow::Error::new(e).context(format!("col {}", meta.name()));
     Ok(if is_one_of(t, &[oracledb::DB_TYPE_NUMBER, oracledb::DB_TYPE_BINARY_INTEGER]) {
         row.get::<Option<oracledb::OracleNumber>>(i).map_err(err)?.map_or(Value::Null, Value::Number)
     } else if t == oracledb::DB_TYPE_BINARY_FLOAT {

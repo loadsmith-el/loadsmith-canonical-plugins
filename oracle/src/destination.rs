@@ -219,7 +219,7 @@ impl DestinationPlugin for OracleDestPlugin {
             let target_types = op("SELECT", ns, Some(&cfg.target_table), Some(&describe), || {
                 let rs = conn
                     .query(&describe, &[])
-                    .map_err(|e| anyhow::anyhow!("describing target table failed: {e}"))?;
+                    .map_err(|e| anyhow::Error::new(e).context("describing target table failed"))?;
                 Ok(rs.columns().iter().map(|c| (c.name().to_uppercase(), c.db_type())).collect::<HashMap<_, _>>())
             })?;
             Ok((conn, target_types))
@@ -235,7 +235,7 @@ impl DestinationPlugin for OracleDestPlugin {
                 let phase = DbOp::new("DELETE", ns, Some(&cfg.target_table), Some(&delete));
                 let span = phase.span().clone();
                 let rows = tokio::task::block_in_place(|| {
-                    phase.run(|| conn.execute(&delete, &[]).map_err(|e| anyhow::anyhow!("{delete} failed: {e}")))
+                    phase.run(|| conn.execute(&delete, &[]).map_err(|e| anyhow::Error::new(e).context(format!("{delete} failed"))))
                 })?;
                 span.record("loadsmith.db.affected_rows", rows.rows_affected());
             }
@@ -256,7 +256,7 @@ impl DestinationPlugin for OracleDestPlugin {
                 );
                 tokio::task::block_in_place(|| {
                     op("CREATE TABLE", ns, Some(&staging), Some(&create), || {
-                        conn.execute(&create, &[]).map_err(|e| anyhow::anyhow!("creating staging table failed: {e}"))
+                        conn.execute(&create, &[]).map_err(|e| anyhow::Error::new(e).context("creating staging table failed"))
                     })
                 })?;
                 staging_table = Some(staging);
@@ -322,7 +322,7 @@ impl DestinationPlugin for OracleDestPlugin {
                     rows.iter().map(|row| row.iter().map(|b| b.as_sql()).collect()).collect();
                 let slices: Vec<&[&dyn ToDbValue]> = params.iter().map(|r| r.as_slice()).collect();
                 conn.execute_batch(&sql, slices.as_slice())
-                    .map_err(|e| anyhow::anyhow!("array DML failed: {e}"))?;
+                    .map_err(|e| anyhow::Error::new(e).context("array DML failed"))?;
                 Ok(())
             })
         })?;
@@ -341,12 +341,12 @@ impl DestinationPlugin for OracleDestPlugin {
             let phase = DbOp::new("MERGE", ns, Some(&cfg.target_table), Some(&merge_sql));
             let span = phase.span().clone();
             let rows = tokio::task::block_in_place(|| {
-                phase.run(|| conn.execute(&merge_sql, &[]).map_err(|e| anyhow::anyhow!("staged MERGE failed: {e}")))
+                phase.run(|| conn.execute(&merge_sql, &[]).map_err(|e| anyhow::Error::new(e).context("staged MERGE failed")))
             })?;
             span.record("loadsmith.db.affected_rows", rows.rows_affected());
         }
         tokio::task::block_in_place(|| {
-            op("COMMIT", ns, None, None, || conn.commit().map_err(|e| anyhow::anyhow!("COMMIT failed: {e}")))
+            op("COMMIT", ns, None, None, || conn.commit().map_err(|e| anyhow::Error::new(e).context("COMMIT failed")))
         })?;
         Ok(self.rows_written)
     }

@@ -4,6 +4,29 @@ Release notes for the canonical plugins. Each plugin is versioned and released
 on its own (tag `<name>-v<version>`); entries are grouped per plugin. The
 format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-18 — oracle 0.9.4: oracledb beta.6; dependency refresh
+
+The lockfile moves every dependency to its latest compatible release (tokio
+1.54, rustls-webpki 0.103.17, aws-lc-rs 1.19, …). The networked plugins are
+released on it; the file-only ones pick it up on their next release.
+
+### oracle 0.9.4
+
+- **Driver `oracledb` 26.0.0-beta.6.** Logs in with the 11G password verifier
+  (only 12C before; 10G-only accounts still fail, #63); fixes re-executing a
+  query of more than 8 columns with repeated data (#80) and a reset initiated
+  by the database (#23).
+- **Driver errors keep their cause.** The driver no longer prints the
+  underlying error in its message (a TLS or network failure read only "TLS
+  operation failed"); the plugin now reports the whole chain, so the reason
+  (an untrusted certificate, a refused connection) is shown again.
+- The snapshot-SCN probe recognises ORA-08181 / ORA-01466 by error code
+  instead of by message text.
+
+### postgres 0.8.3, mysql 0.3.2, s3 0.2.3, sharepoint 0.2.3, aws-secrets-manager 0.1.2
+
+- Dependency refresh only (TLS stack, tokio); no behaviour change.
+
 ## 2026-10-30 — every plugin publishes its config schema
 
 The plugins move to the SDK of loadsmith `81244f1`. Every plugin now prints

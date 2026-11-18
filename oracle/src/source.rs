@@ -218,7 +218,7 @@ impl OracleSourcePlugin {
                 conn.statement(&query)
                     .and_then(|b| b.fetch_array_size(fetch).prefetch_rows(fetch).build())
                     .and_then(|stmt| stmt.query(&[]))
-                    .map_err(|e| anyhow::anyhow!("query failed: {e}"))
+                    .map_err(|e| anyhow::Error::new(e).context("query failed"))
             })
         })?;
         let batch_size = self.batch_size;
@@ -354,7 +354,7 @@ fn fetch_loop(
         let mut chunk = Vec::with_capacity(batch_size);
         let mut failed = None;
         for row in cursor.by_ref().take(batch_size) {
-            match row.map_err(|e| anyhow::anyhow!("row fetch failed: {e}")) {
+            match row.map_err(|e| anyhow::Error::new(e).context("row fetch failed")) {
                 Ok(row) => chunk.push(row),
                 Err(e) => {
                     failed = Some(e);
@@ -478,7 +478,7 @@ impl SourcePlugin for OracleSourcePlugin {
             let cols = op("SELECT", crate::conn::namespace(&cfg.conn), None, Some(&describe_sql), || {
                 let rs = conn
                     .query(&describe_sql, &[])
-                    .map_err(|e| anyhow::anyhow!("schema describe failed: {e}"))?;
+                    .map_err(|e| anyhow::Error::new(e).context("schema describe failed"))?;
                 Ok(types::describe(rs.columns()))
             })?;
             Ok((conn, cols))
